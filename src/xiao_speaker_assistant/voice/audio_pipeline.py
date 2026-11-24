@@ -175,7 +175,10 @@ class LocalSpeechPipeline:
 
         self._config = config
         models_dir = Path(config.models_dir).expanduser()
-        kw_file = generate_keywords_file(models_dir, config.local_keywords)
+        kw_file = generate_keywords_file(models_dir, config.local_keywords, filename="keywords.txt")
+        interrupt_kw_file = generate_keywords_file(
+            models_dir, config.interrupt_keywords, filename="interrupt_keywords.txt"
+        )
 
         self._kws = sherpa_onnx.KeywordSpotter(
             provider="cpu",
@@ -191,6 +194,21 @@ class LocalSpeechPipeline:
             joiner=str(models_dir / "joiner.onnx"),
         )
         self._kws_stream = self._kws.create_stream()
+
+        self._interrupt_kws = sherpa_onnx.KeywordSpotter(
+            provider="cpu",
+            num_threads=1,
+            max_active_paths=8,
+            keywords_score=2.2,
+            keywords_threshold=0.20,
+            num_trailing_blanks=0,
+            keywords_file=str(interrupt_kw_file),
+            tokens=str(models_dir / "tokens.txt"),
+            encoder=str(models_dir / "encoder.onnx"),
+            decoder=str(models_dir / "decoder.onnx"),
+            joiner=str(models_dir / "joiner.onnx"),
+        )
+        self._interrupt_kws_stream = self._interrupt_kws.create_stream()
 
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(models_dir / "silero_vad.onnx"),
@@ -249,6 +267,8 @@ class LocalSpeechPipeline:
         if not muted:
             self._vad.reset()
             self._vad_buffer = np.zeros(0, dtype=np.float32)
+        else:
+            self._interrupt_kws.reset_stream(self._interrupt_kws_stream)
 
     def mute_for(self, seconds: float) -> None:
         self._muted_until = max(self._muted_until, time.monotonic() + seconds)
@@ -263,6 +283,7 @@ class LocalSpeechPipeline:
         self._vad.reset()
         self._vad_buffer = np.zeros(0, dtype=np.float32)
         self._kws.reset_stream(self._kws_stream)
+        self._interrupt_kws.reset_stream(self._interrupt_kws_stream)
 
     def feed_pcm(
         self,
@@ -271,12 +292,12 @@ class LocalSpeechPipeline:
         on_wakeup: Callable[[str], None] | None = None,
         on_utterance: Callable[[str], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
+        on_interrupt: Callable[[str], None] | None = None,
     ) -> None:
         now = time.monotonic()
-        if self._explicit_muted or now < self._muted_until:
-            return
+        is_muted = self._explicit_muted or now < self._muted_until
 
-        if self.awake and (now - self._last_active_at) > self._config.conversation_timeout_sec:
+        if self.awake and not is_muted and (now - self._last_active_at) > self._config.conversation_timeout_sec:
             logger.info("Local conversation timed out; returning to idle")
             self.set_awake(False)
             if on_sleep:
@@ -307,6 +328,23 @@ class LocalSpeechPipeline:
                 peak,
                 self._config.capture_bits_per_sample,
             )
+
+        # While TTS is playing (muted), only run lightweight interrupt KWS so user can barge in with 退出/停止/闭嘴.
+        if is_muted:
+            if self.awake:
+                self._interrupt_kws_stream.accept_waveform(SAMPLE_RATE, samples)
+                while self._interrupt_kws.is_ready(self._interrupt_kws_stream):
+                    self._interrupt_kws.decode_stream(self._interrupt_kws_stream)
+                    hit = self._interrupt_kws.get_result(self._interrupt_kws_stream)
+                    if hit:
+                        logger.info("Barge-in interrupt keyword detected: %s", hit)
+                        self._explicit_muted = False
+                        self._muted_until = 0.0
+                        self.set_awake(False)
+                        if on_interrupt:
+                            on_interrupt(hit)
+                        return
+            return
 
         # Fast Zipformer KWS path when idle (instant trigger for Chinese wake words like 你好管家).
         if not self.awake:

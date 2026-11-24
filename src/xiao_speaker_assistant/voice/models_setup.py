@@ -43,12 +43,14 @@ def find_paraformer_dir(models_dir: Path) -> Path:
     )
 
 
-def generate_keywords_file(models_dir: Path, keywords: list[str]) -> Path:
+def generate_keywords_file(
+    models_dir: Path, keywords: list[str], filename: str = "keywords.txt"
+) -> Path:
     from sherpa_onnx import text2token
 
     tokens = models_dir / "tokens.txt"
     bpe_model = models_dir / "bpe.model"
-    output = models_dir / "keywords.txt"
+    output = models_dir / filename
     if not tokens.is_file() or not bpe_model.is_file():
         raise FileNotFoundError(
             f"Missing tokens.txt or bpe.model in {models_dir}. Run `xsa download-models`."

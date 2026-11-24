@@ -65,6 +65,8 @@ class SpeakerGateway:
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xsa-asr")
         self._last_audio_at: float = 0.0
+        self._active_reply_task: asyncio.Task[None] | None = None
+        self._interrupted: bool = False
 
     async def _audio_watchdog(self, conn: ServerConnection) -> None:
         while True:
@@ -243,6 +245,10 @@ class SpeakerGateway:
         def on_sleep() -> None:
             logger.info("Returned silently to wake-word idle")
 
+        def on_interrupt(keyword: str) -> None:
+            logger.info("Barge-in interrupt triggered (%s)", keyword)
+            loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_interrupt(conn)))
+
         await loop.run_in_executor(
             self._asr_executor,
             lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
@@ -250,8 +256,22 @@ class SpeakerGateway:
                 on_wakeup=on_wakeup,
                 on_utterance=on_utterance,
                 on_sleep=on_sleep,
+                on_interrupt=on_interrupt,
             ),
         )
+
+    async def _handle_interrupt(self, conn: ServerConnection) -> None:
+        self._interrupted = True
+        if self._active_reply_task is not None and not self._active_reply_task.done():
+            self._active_reply_task.cancel()
+        for fut in self._pending_rpc.values():
+            if not fut.done():
+                fut.cancel()
+        await self.stop_native_audio(conn)
+        if self._pipeline is not None:
+            self._pipeline.set_awake(False)
+            self._pipeline.set_muted(False)
+            self._pipeline.mute_for(0.5)
 
     async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
         if self.is_exit_command(text):
@@ -368,30 +388,41 @@ class SpeakerGateway:
 
     async def _run_query_and_speak(self, conn: ServerConnection, query: str) -> None:
         async with self._query_lock:
-            if self._on_stream_query is not None:
-                await self._run_streaming_reply(conn, query)
-                return
-            assert self._on_query is not None
-            wait_notice_task: asyncio.Task[None] | None = None
+            self._interrupted = False
+            task = asyncio.current_task()
+            self._active_reply_task = task
             try:
-                async def delayed_notice() -> None:
-                    await asyncio.sleep(3.5)
-                    await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
+                if self._on_stream_query is not None:
+                    await self._run_streaming_reply(conn, query)
+                    return
+                assert self._on_query is not None
+                wait_notice_task: asyncio.Task[None] | None = None
+                try:
+                    async def delayed_notice() -> None:
+                        await asyncio.sleep(3.5)
+                        await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
 
-                wait_notice_task = asyncio.create_task(delayed_notice())
-                reply = await self._on_query(query)
-                wait_notice_task.cancel()
-                logger.info("LLM reply: %s", reply)
-                self._mute_native_until = time.monotonic() + 6.0
-                await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
-            except Exception as exc:
-                if wait_notice_task:
+                    wait_notice_task = asyncio.create_task(delayed_notice())
+                    reply = await self._on_query(query)
                     wait_notice_task.cancel()
-                logger.exception("Error handling query %r", query)
-                await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+                    logger.info("LLM reply: %s", reply)
+                    self._mute_native_until = time.monotonic() + 6.0
+                    await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
+                except asyncio.CancelledError:
+                    if wait_notice_task:
+                        wait_notice_task.cancel()
+                    raise
+                except Exception as exc:
+                    if wait_notice_task:
+                        wait_notice_task.cancel()
+                    logger.exception("Error handling query %r", query)
+                    await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+                finally:
+                    if self._pipeline is not None and not self._interrupted:
+                        self._pipeline.refresh_activity()
             finally:
-                if self._pipeline is not None:
-                    self._pipeline.refresh_activity()
+                if self._active_reply_task is task:
+                    self._active_reply_task = None
 
     async def _run_streaming_reply(self, conn: ServerConnection, query: str) -> None:
         assert self._on_stream_query is not None
@@ -422,19 +453,23 @@ class SpeakerGateway:
         first_spoken = True
         try:
             while True:
+                if self._interrupted:
+                    break
                 sentence = await queue.get()
-                if sentence is None:
+                if sentence is None or self._interrupted:
                     break
                 logger.info("Streaming TTS sentence: %s", sentence)
                 self._mute_native_until = time.monotonic() + 6.0
                 await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
                 first_spoken = False
             await prod_task
+        except asyncio.CancelledError:
+            logger.info("Streaming reply cancelled due to barge-in")
         finally:
             notice_task.cancel()
             if not prod_task.done():
                 prod_task.cancel()
-            if self._pipeline is not None:
+            if self._pipeline is not None and not self._interrupted:
                 self._pipeline.refresh_activity()
 
     @staticmethod
