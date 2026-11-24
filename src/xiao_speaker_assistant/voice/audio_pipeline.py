@@ -71,6 +71,28 @@ def pcm_to_float32(pcm_bytes: bytes, bits_per_sample: int = 32) -> np.ndarray:
     return s16.astype(np.float32) / 32768.0
 
 
+def apply_highpass_filter(
+    samples: np.ndarray,
+    *,
+    prev_x: float = 0.0,
+    prev_y: float = 0.0,
+    alpha: float = 0.968,
+) -> tuple[np.ndarray, float, float]:
+    """First-order DC/low-rumble high-pass filter (~80 Hz at 16 kHz) preserving filter state."""
+    if len(samples) == 0:
+        return samples, prev_x, prev_y
+    out = np.empty_like(samples, dtype=np.float32)
+    x_prev = prev_x
+    y_prev = prev_y
+    for i in range(len(samples)):
+        x = float(samples[i])
+        y = alpha * (y_prev + x - x_prev)
+        out[i] = y
+        x_prev = x
+        y_prev = y
+    return out, x_prev, y_prev
+
+
 def match_wakeup_phrase(
     text: str, extra_keywords: list[str] | None = None
 ) -> tuple[str, str] | None:
@@ -180,6 +202,8 @@ class LocalSpeechPipeline:
         self._explicit_muted: bool = False
         self._vad_buffer = np.zeros(0, dtype=np.float32)
         self._logged_first_audio = False
+        self._hp_prev_x: float = 0.0
+        self._hp_prev_y: float = 0.0
 
     def set_muted(self, muted: bool) -> None:
         self._explicit_muted = muted
@@ -223,8 +247,9 @@ class LocalSpeechPipeline:
         samples = pcm_to_float32(pcm_bytes, bits_per_sample=self._config.capture_bits_per_sample)
         if len(samples) == 0:
             return
-        if len(samples) >= 160:
-            samples = samples - np.mean(samples)
+        samples, self._hp_prev_x, self._hp_prev_y = apply_highpass_filter(
+            samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
+        )
         if self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
         if not self._logged_first_audio:
