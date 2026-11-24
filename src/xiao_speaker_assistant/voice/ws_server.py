@@ -50,12 +50,14 @@ class SpeakerGateway:
         config: AppConfig,
         on_query: QueryHandler | None = None,
         on_stream_query: StreamQueryHandler | None = None,
+        on_session_reset: Callable[[], None] | None = None,
     ) -> None:
         if on_query is None and on_stream_query is None:
             raise ValueError("Either on_query or on_stream_query must be provided")
         self._config = config
         self._on_query = on_query
         self._on_stream_query = on_stream_query
+        self._on_session_reset = on_session_reset
         self._connections: set[ServerConnection] = set()
         self._seen_dialogs: set[str] = set()
         self._continuous_mode: bool = False
@@ -244,6 +246,8 @@ class SpeakerGateway:
 
         def on_sleep() -> None:
             logger.info("Returned silently to wake-word idle")
+            if self._on_session_reset is not None:
+                loop.call_soon_threadsafe(self._on_session_reset)
 
         def on_interrupt(keyword: str) -> None:
             logger.info("Barge-in interrupt triggered (%s)", keyword)
@@ -272,11 +276,15 @@ class SpeakerGateway:
             self._pipeline.set_awake(False)
             self._pipeline.set_muted(False)
             self._pipeline.mute_for(0.5)
+        if self._on_session_reset is not None:
+            self._on_session_reset()
 
     async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
         if self.is_exit_command(text):
             if self._pipeline is not None:
                 self._pipeline.set_awake(False)
+            if self._on_session_reset is not None:
+                self._on_session_reset()
             await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
@@ -366,6 +374,8 @@ class SpeakerGateway:
         if self.is_exit_command(text):
             self._continuous_mode = False
             self._mute_native_until = time.monotonic() + 6.0
+            if self._on_session_reset is not None:
+                self._on_session_reset()
             await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
 

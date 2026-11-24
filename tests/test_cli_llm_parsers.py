@@ -45,3 +45,53 @@ def test_cli_serve_wires_relay_and_asr_model_flags() -> None:
         "relay_url": "wss://relay.example.com",
         "also_serve_local": True,
     }
+
+
+def test_llm_router_tracks_opencode_session_and_resets() -> None:
+    import asyncio
+    from xiao_speaker_assistant.config import LLMConfig
+    from xiao_speaker_assistant.llm.router import LLMRouter
+
+    router = LLMRouter(LLMConfig())
+    calls = []
+
+    class FakeProc:
+        def __init__(self, sid: str, reply: str) -> None:
+            lines = [
+                json.dumps({"type": "step_start", "sessionID": sid}).encode() + b"\n",
+                json.dumps({"type": "text", "part": {"type": "text", "text": reply}}).encode() + b"\n",
+                b"",
+            ]
+            self.stdout = self
+            self.stderr = self
+            self._lines = lines
+            self.returncode = 0
+
+        async def readline(self) -> bytes:
+            return self._lines.pop(0)
+
+        async def wait(self) -> int:
+            return 0
+
+        async def read(self) -> bytes:
+            return b""
+
+    async def fake_exec(*cmd, **kwargs):
+        calls.append(list(cmd))
+        return FakeProc("ses_abc123", "北京今天晴，12度。")
+
+    async def run() -> None:
+        with patch("xiao_speaker_assistant.llm.router.resolve_binary", return_value="/usr/local/bin/opencode"), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_exec
+        ):
+            r1 = await router.ask("查一下天气")
+            r2 = await router.ask("北京")
+            assert "12度" in r1
+            assert "12度" in r2
+            assert "--archived" in calls[0]
+            assert "--session" in calls[1] and "ses_abc123" in calls[1]
+            router.reset_session()
+            assert router.opencode_session_id is None
+            assert router.history == []
+
+    asyncio.run(run())
