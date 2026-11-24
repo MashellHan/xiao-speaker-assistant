@@ -114,8 +114,8 @@ class RelayHostClient:
                         "channels": 1,
                         "bits_per_sample": bits,
                         "sample_rate": 16000,
-                        "period_size": 160,
-                        "buffer_size": 480,
+                        "period_size": 360,
+                        "buffer_size": 1440,
                     },
                 )
 

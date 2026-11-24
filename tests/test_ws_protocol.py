@@ -69,3 +69,39 @@ def test_is_exit_command_matches_short_and_phrase_exits() -> None:
     assert SpeakerGateway.is_exit_command("再见") is True
     assert SpeakerGateway.is_exit_command("我要退出对话了") is True
     assert SpeakerGateway.is_exit_command("帮我退出登录") is False
+
+
+def test_start_recording_uses_larger_oh2p_alsa_buffer() -> None:
+    import asyncio
+    from xiao_speaker_assistant.config import AppConfig
+
+    sent = []
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    async def dummy_query(q: str) -> str:
+        return q
+
+    gw = SpeakerGateway(AppConfig(), on_query=dummy_query)
+
+    async def run() -> None:
+        await gw.send_command(
+            FakeConn(),
+            "start_recording",
+            {
+                "pcm": "noop",
+                "channels": 1,
+                "bits_per_sample": 16,
+                "sample_rate": 16000,
+                "period_size": 360,
+                "buffer_size": 1440,
+            },
+        )
+
+    asyncio.run(run())
+    assert sent[0]["Request"]["payload"]["buffer_size"] == 1440
+    assert sent[0]["Request"]["payload"]["period_size"] == 360

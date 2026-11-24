@@ -64,6 +64,29 @@ class SpeakerGateway:
         self._pipeline: LocalSpeechPipeline | None = None
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xsa-asr")
+        self._last_audio_at: float = 0.0
+
+    async def _audio_watchdog(self, conn: ServerConnection) -> None:
+        while True:
+            await asyncio.sleep(3.0)
+            if self._pipeline is None:
+                return
+            if (time.monotonic() - self._last_audio_at) > 4.0:
+                logger.warning("Audio stream stalled >4s; restarting speaker recording")
+                bits = self._config.speech.capture_bits_per_sample
+                await self.send_command(
+                    conn,
+                    "start_recording",
+                    {
+                        "pcm": "noop",
+                        "channels": 1,
+                        "bits_per_sample": bits,
+                        "sample_rate": 16000,
+                        "period_size": 360,
+                        "buffer_size": 1440,
+                    },
+                )
+                self._last_audio_at = time.monotonic()
 
     async def send_command(
         self,
@@ -167,10 +190,14 @@ class SpeakerGateway:
                     "channels": 1,
                     "bits_per_sample": bits,
                     "sample_rate": 16000,
-                    "period_size": 160,
-                    "buffer_size": 480,
+                    "period_size": 360,
+                    "buffer_size": 1440,
                 },
             )
+            self._last_audio_at = time.monotonic()
+            watchdog_task = asyncio.create_task(self._audio_watchdog(conn))
+        else:
+            watchdog_task = None
 
         try:
             async for raw in conn:
@@ -181,6 +208,8 @@ class SpeakerGateway:
         except ConnectionClosed:
             logger.info("Speaker connection closed")
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
             self._connections.discard(conn)
             for fut in self._pending_rpc.values():
                 if not fut.done():
@@ -194,6 +223,7 @@ class SpeakerGateway:
         pcm = extract_record_pcm_from_binary(raw)
         if not pcm:
             return
+        self._last_audio_at = time.monotonic()
         loop = asyncio.get_running_loop()
 
         def on_wakeup(keyword: str) -> None:
