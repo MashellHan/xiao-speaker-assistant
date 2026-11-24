@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
-import re
+import subprocess
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import urlparse
 
 import httpx
 
 from xiao_speaker_assistant.config import AppConfig
+from xiao_speaker_assistant.tools.browser import (
+    async_fetch_webpage_summary,
+    extract_html_summary,
+    open_in_edge,
+    truncate_text,
+    validate_http_url,
+)
 from xiao_speaker_assistant.tools.confirmation import ConfirmationStore
+from xiao_speaker_assistant.tools.mac_local import (
+    MacLocalAccessError,
+    list_recent_files,
+    read_local_text_file,
+)
 from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 
@@ -22,45 +34,6 @@ logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "xiao-speaker-assistant", "version": "0.1.0"}
-
-_NOISE_BLOCK_RE = re.compile(
-    r"<(script|style|noscript|svg|title)\b[^>]*>[\s\S]*?</\1>|<!--[\s\S]*?-->",
-    re.IGNORECASE,
-)
-_TITLE_RE = re.compile(r"<title\b[^>]*>([\s\S]*?)</title>", re.IGNORECASE)
-_BLOCK_TAG_RE = re.compile(
-    r"</?(?:p|div|br|li|ul|ol|h[1-6]|tr|td|th|section|article|header|footer|blockquote|pre)\b[^>]*>",
-    re.IGNORECASE,
-)
-_ANY_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def truncate_text(text: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def extract_html_summary(raw_html: str, max_chars: int = 2000) -> tuple[str | None, str]:
-    """Strip scripts/styles/tags from HTML and return (title, clean_text_excerpt)."""
-    title: str | None = None
-    title_match = _TITLE_RE.search(raw_html)
-    if title_match:
-        raw_title = _ANY_TAG_RE.sub(" ", title_match.group(1))
-        cleaned_title = re.sub(r"\s+", " ", html.unescape(raw_title)).strip()
-        if cleaned_title:
-            title = cleaned_title
-
-    cleaned = _NOISE_BLOCK_RE.sub(" ", raw_html)
-    cleaned = _BLOCK_TAG_RE.sub(" ", cleaned)
-    cleaned = _ANY_TAG_RE.sub("", cleaned)
-    cleaned = html.unescape(cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return title, truncate_text(cleaned, max_chars)
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -137,6 +110,60 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "browser_open_edge",
+        "description": "Validate an HTTP/HTTPS URL and open it in Microsoft Edge on macOS.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "HTTP/HTTPS URL to open in Microsoft Edge"},
+                "dry_run": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Validate and return command without launching Edge",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "mac_list_recent_files",
+        "description": (
+            "List recent non-sensitive files inside allowed macOS user directories "
+            "(~/Desktop, ~/Downloads, ~/Documents)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "default": "~/Desktop",
+                    "description": "Target directory inside allowed user roots",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+            },
+        },
+    },
+    {
+        "name": "mac_read_text_file",
+        "description": (
+            "Read a UTF-8 text file inside allowed macOS user directories, "
+            "blocking traversal and sensitive files or keychains."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path inside allowed user roots"},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 3000},
+            },
+            "required": ["path"],
+        },
+    },
+]
+
+ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
+
 
 class McpServer:
     """Stdio JSON-RPC 2.0 MCP server for Xiao Speaker Assistant tools."""
@@ -150,6 +177,9 @@ class McpServer:
         browser_client: HttpMcpClient | None = None,
         confirmation_store: ConfirmationStore | None = None,
         http_client: httpx.AsyncClient | None = None,
+        include_local_tools: bool = False,
+        mac_allowed_roots: Sequence[str | Path] | None = None,
+        edge_dry_run: bool = False,
     ) -> None:
         self._config = config or AppConfig()
         self._outlook = outlook_client or OutlookClient(self._config.tools.outlook)
@@ -159,6 +189,9 @@ class McpServer:
         self._browser = browser_client or HttpMcpClient(self._config.tools.browser.mcp_url)
         self.confirmation_store = confirmation_store or ConfirmationStore()
         self._http_client = http_client
+        self._include_local_tools = include_local_tools
+        self._mac_allowed_roots = mac_allowed_roots
+        self._edge_dry_run = edge_dry_run
 
     @staticmethod
     def _ok(req_id: Any, result: Any) -> dict[str, Any]:
@@ -217,7 +250,16 @@ class McpServer:
         if method == "ping":
             return self._ok(req_id, {})
         if method == "tools/list":
-            return self._ok(req_id, {"tools": TOOL_DEFINITIONS})
+            tools = (
+                ALL_TOOL_DEFINITIONS
+                if (
+                    self._include_local_tools
+                    or self._config.tools.browser.enabled
+                    or self._mac_allowed_roots is not None
+                )
+                else TOOL_DEFINITIONS
+            )
+            return self._ok(req_id, {"tools": tools})
         if method == "tools/call":
             if not isinstance(params, dict):
                 return self._error(req_id, -32602, "Invalid params")
@@ -242,6 +284,12 @@ class McpServer:
             return self._ok(req_id, await self._call_xiaohongshu_detail(args))
         if name == "browser_fetch_summary":
             return self._ok(req_id, await self._call_browser_fetch_summary(args))
+        if name == "browser_open_edge":
+            return self._ok(req_id, await self._call_browser_open_edge(args))
+        if name == "mac_list_recent_files":
+            return self._ok(req_id, await self._call_mac_list_recent_files(args))
+        if name == "mac_read_text_file":
+            return self._ok(req_id, await self._call_mac_read_text_file(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -357,11 +405,12 @@ class McpServer:
         return self._tool_result(res)
 
     async def _call_browser_fetch_summary(self, args: dict[str, Any]) -> dict[str, Any]:
-        url = str(args.get("url") or "").strip()
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raw_url = str(args.get("url") or "").strip()
+        try:
+            url = validate_http_url(raw_url)
+        except ValueError as exc:
             return self._tool_result(
-                {"error": "invalid_url", "message": "A valid http:// or https:// URL is required."},
+                {"error": "invalid_url", "message": str(exc)},
                 is_error=True,
             )
         max_chars = max(100, min(20000, int(args.get("max_chars", 2000))))
@@ -376,41 +425,79 @@ class McpServer:
                 )
             return self._tool_result({"source": "browser_mcp", "url": url, "result": res})
 
-        owns_client = self._http_client is None
-        client = self._http_client or httpx.AsyncClient(
-            timeout=15.0,
-            follow_redirects=True,
-            headers={"User-Agent": "xiao-speaker-assistant/0.1"},
-        )
         try:
-            resp = await client.get(url)
-            resp.raise_for_status()
+            summary = await async_fetch_webpage_summary(
+                url,
+                max_chars=max_chars,
+                client=self._http_client,
+            )
         except Exception as exc:
             return self._tool_result(
                 {"error": "http_fetch_error", "message": str(exc), "url": url},
                 is_error=True,
             )
-        finally:
-            if owns_client:
-                await client.aclose()
+        return self._tool_result(summary)
 
-        content_type = resp.headers.get("content-type", "").lower()
-        body = resp.text
-        if "html" in content_type or (not content_type and "<html" in body.lower()):
-            title, excerpt = extract_html_summary(body, max_chars=max_chars)
-        else:
-            title = None
-            excerpt = truncate_text(re.sub(r"\s+", " ", body).strip(), max_chars)
+    async def _call_browser_open_edge(self, args: dict[str, Any]) -> dict[str, Any]:
+        raw_url = str(args.get("url") or "").strip()
+        dry_run = bool(args.get("dry_run", self._edge_dry_run))
+        try:
+            result_json = await asyncio.to_thread(open_in_edge, raw_url, dry_run=dry_run)
+        except ValueError as exc:
+            return self._tool_result(
+                {"error": "invalid_url", "message": str(exc)},
+                is_error=True,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return self._tool_result(
+                {"error": "edge_launch_error", "message": str(exc), "url": raw_url},
+                is_error=True,
+            )
+        return self._tool_result(result_json)
 
-        return self._tool_result(
-            {
-                "source": "http_fetch",
-                "url": str(resp.url),
-                "status_code": resp.status_code,
-                "title": title,
-                "excerpt": excerpt,
-            }
-        )
+    async def _call_mac_list_recent_files(self, args: dict[str, Any]) -> dict[str, Any]:
+        directory = str(args.get("directory") or "~/Desktop").strip()
+        limit = max(1, min(100, int(args.get("limit", 10))))
+        try:
+            files = await asyncio.to_thread(
+                list_recent_files,
+                directory,
+                limit,
+                allowed_roots=self._mac_allowed_roots,
+            )
+        except MacLocalAccessError as exc:
+            return self._tool_result(
+                {"error": "access_denied", "message": str(exc)},
+                is_error=True,
+            )
+        except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+            return self._tool_result(
+                {"error": "mac_local_error", "message": str(exc)},
+                is_error=True,
+            )
+        return self._tool_result({"directory": directory, "files": files, "count": len(files)})
+
+    async def _call_mac_read_text_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        path = str(args.get("path") or "").strip()
+        max_chars = max(1, min(20000, int(args.get("max_chars", 3000))))
+        try:
+            content = await asyncio.to_thread(
+                read_local_text_file,
+                path,
+                max_chars,
+                allowed_roots=self._mac_allowed_roots,
+            )
+        except MacLocalAccessError as exc:
+            return self._tool_result(
+                {"error": "access_denied", "message": str(exc)},
+                is_error=True,
+            )
+        except (FileNotFoundError, IsADirectoryError, ValueError) as exc:
+            return self._tool_result(
+                {"error": "mac_local_error", "message": str(exc)},
+                is_error=True,
+            )
+        return self._tool_result({"path": path, "content": content, "chars": len(content)})
 
     async def serve_stdio(
         self,
