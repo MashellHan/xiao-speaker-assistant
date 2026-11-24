@@ -264,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 on_query=handle_query,
                 on_stream_query=stream_query,
+                on_session_reset=router.reset_session,
             )
             asyncio.run(gateway.serve_forever())
         return 0

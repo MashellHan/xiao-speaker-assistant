@@ -121,6 +121,23 @@ class LLMRouter:
     def __init__(self, config: LLMConfig, client: httpx.AsyncClient | None = None) -> None:
         self._config = config
         self._client = client
+        self.opencode_session_id: str | None = None
+        self.history: list[tuple[str, str]] = []
+
+    def reset_session(self) -> None:
+        self.opencode_session_id = None
+        self.history.clear()
+
+    def _format_with_history(self, user_text: str) -> str:
+        if not self.history:
+            return user_text
+        recent = self.history[-6:]
+        lines = ["最近对话上下文："]
+        for u, a in recent:
+            lines.append(f"用户：{u}")
+            lines.append(f"助手：{a}")
+        lines.append(f"用户最新提问：{user_text}")
+        return "\n".join(lines)
 
     def _build_system_prompt(self) -> str:
         return (
@@ -144,18 +161,22 @@ class LLMRouter:
         if chosen == "opencode":
             raw = await self._ask_opencode_cli(system_prompt, user_text)
         elif chosen == "codex":
-            raw = await self._ask_codex_cli(system_prompt, user_text)
+            raw = await self._ask_codex_cli(system_prompt, self._format_with_history(user_text))
         elif chosen == "codex_api":
             raw = await self._ask_codex_api(
-                system_prompt, user_text, tools=tools or [], executor=executor, max_rounds=max_rounds
+                system_prompt, self._format_with_history(user_text), tools=tools or [], executor=executor, max_rounds=max_rounds
             )
         elif chosen == "gemini_api":
             raw = await self._ask_gemini_api(
-                system_prompt, user_text, tools=tools or [], executor=executor, max_rounds=max_rounds
+                system_prompt, self._format_with_history(user_text), tools=tools or [], executor=executor, max_rounds=max_rounds
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {chosen}")
-        return format_for_speech(raw, max_chars=self._config.spoken_max_chars)
+        formatted = format_for_speech(raw, max_chars=self._config.spoken_max_chars)
+        self.history.append((user_text, formatted))
+        if len(self.history) > 8:
+            self.history = self.history[-8:]
+        return formatted
 
     async def stream_ask(
         self,
@@ -172,11 +193,18 @@ class LLMRouter:
         splitter = SentenceStreamBuffer(max_total_chars=self._config.spoken_max_chars)
 
         if chosen == "opencode":
+            collected: list[str] = []
             async for piece in self._stream_opencode_cli(system_prompt, user_text):
                 for sent in splitter.feed(piece):
+                    collected.append(sent)
                     yield sent
             for sent in splitter.flush():
+                collected.append(sent)
                 yield sent
+            if collected:
+                self.history.append((user_text, "".join(collected)))
+                if len(self.history) > 8:
+                    self.history = self.history[-8:]
             return
 
         if chosen == "codex_api" and not tools:
@@ -210,18 +238,31 @@ class LLMRouter:
     async def _stream_opencode_cli(self, system_prompt: str, user_text: str) -> AsyncIterator[str]:
         cfg = self._config.providers.opencode
         binary = resolve_binary(cfg.binary)
-        prompt = f"{system_prompt}\n\n用户语音问题：{user_text}"
-        cmd = [
-            binary,
-            "run",
-            "--model",
-            cfg.model,
-            "--format",
-            "json",
-            "--archived",
-            "--title",
-            "xsa-voice",
-        ]
+        if self.opencode_session_id:
+            prompt = user_text
+            cmd = [
+                binary,
+                "run",
+                "--model",
+                cfg.model,
+                "--format",
+                "json",
+                "--session",
+                self.opencode_session_id,
+            ]
+        else:
+            prompt = f"{system_prompt}\n\n用户语音问题：{user_text}"
+            cmd = [
+                binary,
+                "run",
+                "--model",
+                cfg.model,
+                "--format",
+                "json",
+                "--archived",
+                "--title",
+                "xsa-voice",
+            ]
         if cfg.auto_approve:
             cmd.append("--auto")
         cmd.append(prompt)
@@ -249,6 +290,9 @@ class LLMRouter:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    sid = event.get("sessionID")
+                    if isinstance(sid, str) and sid.startswith("ses_"):
+                        self.opencode_session_id = sid
                     if event.get("type") == "text":
                         part = event.get("part") or {}
                         text = part.get("text")
