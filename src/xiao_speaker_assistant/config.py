@@ -27,8 +27,11 @@ class SpeechConfig(BaseModel):
         default_factory=lambda: ["退出", "停止", "闭嘴", "退下", "别说了", "再见"]
     )
     asr_provider: Literal["sense_voice", "xiaoai_asr"] = "xiaoai_asr"
-    asr_model: Literal["sense_voice", "paraformer"] = "sense_voice"
+    asr_model: Literal["sense_voice", "paraformer", "doubao_flash", "openai_whisper"] = "sense_voice"
     asr_language: str = "zh"
+    whisper_base_url: str = "https://api.openai.com/v1"
+    whisper_api_key_env: str | None = "OPENAI_API_KEY"
+    whisper_model: str = "whisper-1"
     models_dir: str = "models"
     capture_bits_per_sample: Literal[16, 32] = 16
     s32_shift: int = 16

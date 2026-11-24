@@ -91,6 +91,15 @@ def test_dynamic_agc_boosts_quiet_speech_without_clipping_loud_speech() -> None:
     loud_speech = 0.35 * np.sin(2 * np.pi * 10 * t)
     out_loud = agc.process(loud_speech)
     assert float(np.max(np.abs(out_loud))) < 1.0
+
+
+def test_speech_config_accepts_cloud_asr_models() -> None:
+    from xiao_speaker_assistant.config import SpeechConfig
+
+    cfg1 = SpeechConfig(asr_model="doubao_flash")
+    cfg2 = SpeechConfig(asr_model="openai_whisper")
+    assert cfg1.asr_model == "doubao_flash"
+    assert cfg2.asr_model == "openai_whisper"
     assert match_wakeup_phrase("Hi, Normi.") == ("hi nomi", "")
     assert match_wakeup_phrase("Hi, knowmi. Tell me a joke.") == ("hi nomi", "Tell me a joke")
     assert match_wakeup_phrase("Hi Nomi，帮我查一下邮件") == ("hi nomi", "帮我查一下邮件")
