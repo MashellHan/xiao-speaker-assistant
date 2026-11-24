@@ -61,3 +61,11 @@ def test_detects_native_speak_event() -> None:
     line = json.dumps({"header": {"namespace": "SpeechSynthesizer", "name": "Speak"}})
     event = {"Event": {"id": "evt-2", "event": "instruction", "data": {"NewLine": line}}}
     assert SpeakerGateway._is_native_speak_event(event) is True
+
+
+def test_is_exit_command_matches_short_and_phrase_exits() -> None:
+    assert SpeakerGateway.is_exit_command("退出") is True
+    assert SpeakerGateway.is_exit_command("退出。") is True
+    assert SpeakerGateway.is_exit_command("再见") is True
+    assert SpeakerGateway.is_exit_command("我要退出对话了") is True
+    assert SpeakerGateway.is_exit_command("帮我退出登录") is False

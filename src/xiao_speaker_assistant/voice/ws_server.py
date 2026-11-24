@@ -19,6 +19,20 @@ logger = logging.getLogger(__name__)
 QueryHandler = Callable[[str], Awaitable[str]]
 
 IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
+EXIT_EXACT_WORDS = {
+    "退出",
+    "退下",
+    "再见",
+    "拜拜",
+    "停止",
+    "关闭",
+    "结束",
+    "不用了",
+    "闭嘴",
+    "退出吧",
+    "结束吧",
+}
+EXIT_PHRASES = ("退出对话", "结束对话", "停止对话", "退出模式", "结束模式", "退下吧")
 
 
 class SpeakerGateway:
@@ -118,6 +132,13 @@ class SpeakerGateway:
         return text.strip(" ，。！？,.!?") in IGNORE_BARE_WORDS
 
     @staticmethod
+    def is_exit_command(text: str) -> bool:
+        cleaned = text.strip(" ，。！？,.!?")
+        if cleaned in EXIT_EXACT_WORDS:
+            return True
+        return any(phrase in cleaned for phrase in EXIT_PHRASES)
+
+    @staticmethod
     def _is_native_speak_event(msg: dict[str, Any]) -> bool:
         evt = msg.get("Event")
         if not isinstance(evt, dict) or evt.get("event") != "instruction":
@@ -136,7 +157,7 @@ class SpeakerGateway:
         return header.get("namespace") == "SpeechSynthesizer" and header.get("name") == "Speak"
 
     async def _process_utterance(self, conn: ServerConnection, text: str) -> None:
-        if any(word in text for word in ("退出对话", "结束对话", "退下吧")):
+        if self.is_exit_command(text):
             self._continuous_mode = False
             self._mute_native_until = time.monotonic() + 6.0
             await self.abort_and_speak(conn, "好的，已退出对话。")
