@@ -33,8 +33,28 @@ def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
     return bytes(data)
 
 
+def pcm_to_float32(pcm_bytes: bytes, bits_per_sample: int = 32) -> np.ndarray:
+    """Convert raw PCM bytes to normalized [-1, 1] float32 samples.
+
+    OH2P (Amlogic A113) PDM capture puts 24-bit audio in the lower 24 bits of S32_LE,
+    so shifting right by 8 recovers full-scale 16-bit amplitude.
+    """
+    if bits_per_sample == 32:
+        usable = len(pcm_bytes) - (len(pcm_bytes) % 4)
+        if usable <= 0:
+            return np.zeros(0, dtype=np.float32)
+        s32 = np.frombuffer(pcm_bytes[:usable], dtype="<i4")
+        s16 = np.clip(s32 >> 8, -32768, 32767)
+        return s16.astype(np.float32) / 32768.0
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if usable <= 0:
+        return np.zeros(0, dtype=np.float32)
+    s16 = np.frombuffer(pcm_bytes[:usable], dtype="<i2")
+    return s16.astype(np.float32) / 32768.0
+
+
 class LocalSpeechPipeline:
-    """Runs KWS (`Hi Nomi`) -> Silero VAD -> SenseVoice ASR on 16kHz int16 mono PCM."""
+    """Runs KWS (`Hi Nomi`) -> Silero VAD -> SenseVoice ASR on 16kHz mono PCM."""
 
     def __init__(self, config: SpeechConfig) -> None:
         import sherpa_onnx
@@ -88,6 +108,7 @@ class LocalSpeechPipeline:
         self._last_active_at: float = 0.0
         self._muted_until: float = 0.0
         self._vad_buffer = np.zeros(0, dtype=np.float32)
+        self._logged_first_audio = False
 
     def mute_for(self, seconds: float) -> None:
         self._muted_until = max(self._muted_until, time.monotonic() + seconds)
@@ -118,9 +139,16 @@ class LocalSpeechPipeline:
                 on_sleep()
             return
 
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        samples = pcm_to_float32(pcm_bytes, bits_per_sample=self._config.capture_bits_per_sample)
+        if len(samples) == 0:
+            return
         if self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
+        if not self._logged_first_audio:
+            self._logged_first_audio = True
+            rms = float(np.sqrt(np.mean(samples * samples)))
+            peak = float(np.max(np.abs(samples)))
+            logger.info("First audio frame received (rms=%.4f, peak=%.4f, bits=%d)", rms, peak, self._config.capture_bits_per_sample)
 
         if not self.awake:
             self._kws_stream.accept_waveform(SAMPLE_RATE, samples)

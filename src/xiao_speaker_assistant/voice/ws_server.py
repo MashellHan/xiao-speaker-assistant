@@ -97,8 +97,24 @@ class SpeakerGateway:
         self._connections.add(conn)
         logger.info("Speaker connected from %s", conn.remote_address)
         if self._pipeline is not None:
-            logger.info("Starting speaker audio stream for local KWS (`%s`) + SenseVoice", ", ".join(self._config.speech.local_keywords))
-            await self.send_command(conn, "start_recording", None)
+            bits = self._config.speech.capture_bits_per_sample
+            logger.info(
+                "Starting speaker audio stream (%d-bit) for local KWS (`%s`) + SenseVoice",
+                bits,
+                ", ".join(self._config.speech.local_keywords),
+            )
+            await self.send_command(
+                conn,
+                "start_recording",
+                {
+                    "pcm": "noop",
+                    "channels": 1,
+                    "bits_per_sample": bits,
+                    "sample_rate": 16000,
+                    "period_size": 160,
+                    "buffer_size": 480,
+                },
+            )
 
         try:
             async for raw in conn:

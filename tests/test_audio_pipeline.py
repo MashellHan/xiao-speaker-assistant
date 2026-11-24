@@ -1,8 +1,14 @@
 import json
+import struct
 from pathlib import Path
 from unittest.mock import patch
 
-from xiao_speaker_assistant.voice.audio_pipeline import extract_record_pcm_from_binary
+import numpy as np
+
+from xiao_speaker_assistant.voice.audio_pipeline import (
+    extract_record_pcm_from_binary,
+    pcm_to_float32,
+)
 from xiao_speaker_assistant.voice.models_setup import generate_keywords_file
 
 
@@ -30,3 +36,9 @@ def test_generate_keywords_file_replaces_spaces_in_tag(tmp_path: Path) -> None:
         out = generate_keywords_file(tmp_path, ["hi nomi", "你好管家"])
     lines = out.read_text(encoding="utf-8").splitlines()
     assert lines == ["▁HI ▁NO M I @hi_nomi", "你 好 管 家 @你好管家"]
+
+
+def test_pcm_to_float32_scales_a113_s32_lower_24_bits() -> None:
+    raw = struct.pack("<ii", 4456448, -2883584)
+    samples = pcm_to_float32(raw, bits_per_sample=32)
+    assert np.allclose(samples, [17408 / 32768.0, -11264 / 32768.0], atol=1e-5)
