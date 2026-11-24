@@ -37,3 +37,9 @@
 
 - Use Microsoft Edge for local previews and browser-based automation or
   verification when a desktop browser is used.
+
+## Git Workflow
+
+- Every coherent change must go through a feature branch -> Pull Request ->
+  squash merge -> `git checkout main && git pull` before starting the next change.
+
