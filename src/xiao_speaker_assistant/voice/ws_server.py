@@ -170,18 +170,22 @@ class SpeakerGateway:
                 self._pipeline.set_muted(False)
 
     async def play_wakeup_chime(self, conn: ServerConnection) -> None:
+        self._speaking_own_tts = True
         if self._pipeline is not None:
             self._pipeline.set_muted(True)
         script = (
             "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
             "mphelper pause >/dev/null 2>&1 || true; "
-            "if [ -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav ]; then "
-            "aplay -q /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav; "
-            "else /usr/sbin/tts_play.sh '在'; fi"
+            "if [ -f /usr/share/sound-vendor/XiaoMi/wakeup_wozai.wav ]; then "
+            "miplayer -f /usr/share/sound-vendor/XiaoMi/wakeup_wozai.wav >/dev/null 2>&1; "
+            "elif [ -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav ]; then "
+            "miplayer -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav >/dev/null 2>&1; "
+            "else /usr/sbin/tts_play.sh '我在'; fi"
         )
         try:
             await self.run_shell(conn, script, wait_response=True, timeout=6.0)
         finally:
+            self._speaking_own_tts = False
             if self._pipeline is not None:
                 self._pipeline.mute_for(0.25)
                 self._pipeline.set_muted(False)
@@ -481,9 +485,11 @@ class SpeakerGateway:
 
         async def delayed_notice() -> None:
             try:
-                await asyncio.wait_for(first_chunk_event.wait(), timeout=3.5)
+                await asyncio.wait_for(first_chunk_event.wait(), timeout=1.2)
             except asyncio.TimeoutError:
-                await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
+                if not self._interrupted:
+                    logger.info("Playing thinking notice: 好的，稍等。")
+                    await self.speak_sentence(conn, "好的，稍等。", interrupt=True, wait_response=True)
 
         prod_task = asyncio.create_task(producer())
         notice_task = asyncio.create_task(delayed_notice())

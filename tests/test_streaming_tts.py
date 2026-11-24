@@ -16,6 +16,13 @@ def test_sentence_stream_buffer_emits_sentences_incrementally() -> None:
     assert buf.flush() == ["最后一点"]
 
 
+def test_sentence_stream_buffer_default_avoids_tiny_split_fragments() -> None:
+    buf = SentenceStreamBuffer()
+    assert buf.feed("好的。") == []
+    out = buf.feed("太阳系一共有八大行星，围绕太阳运转。")
+    assert out == ["好的。太阳系一共有八大行星，围绕太阳运转。"]
+
+
 def test_gateway_streaming_speaks_sentences_sequentially_via_rpc() -> None:
     sent_payloads: list[dict] = []
 

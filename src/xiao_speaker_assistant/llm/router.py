@@ -45,7 +45,7 @@ def format_for_speech(text: str, max_chars: int = 220) -> str:
 class SentenceStreamBuffer:
     """Buffers incremental LLM text and emits complete spoken sentences early."""
 
-    def __init__(self, *, min_chars: int = 10, max_total_chars: int = 260) -> None:
+    def __init__(self, *, min_chars: int = 18, max_total_chars: int = 260) -> None:
         self._buf = ""
         self._min_chars = min_chars
         self._max_total = max_total_chars
@@ -56,17 +56,19 @@ class SentenceStreamBuffer:
             return []
         self._buf += chunk
         out: list[str] = []
+        search_from = 0
 
         while self._emitted_chars < self._max_total:
-            m = SENTENCE_END_RE.search(self._buf)
+            m = SENTENCE_END_RE.search(self._buf, search_from)
             if not m:
                 break
             end = m.end()
             candidate = format_for_speech(self._buf[:end], max_chars=140)
-            # Wait for a fuller clause if candidate is super tiny unless there is more buffered.
-            if len(candidate) < self._min_chars and len(self._buf) == end:
-                break
+            if len(candidate) < self._min_chars:
+                search_from = end
+                continue
             self._buf = self._buf[end:]
+            search_from = 0
             if candidate:
                 remaining = self._max_total - self._emitted_chars
                 if len(candidate) > remaining:
@@ -145,8 +147,8 @@ class LLMRouter:
             f"你可以直接调用本机工具（例如查询 Mac 磁盘空间、读取本机允许目录的文件、查询邮件、抓取网页、使用 Codex 分析）来回答问题；"
             f"不要回答“我无法访问你的电脑”或“还在学习中”。"
             f"无论用户使用中文、英文还是中英混合提问，请一律使用自然流畅的简体中文回答（专有名词可保留英文）。"
-            f"请只输出适合口语播报的纯文本，不要使用 Markdown、代码块或 URL，"
-            f"控制在 {self._config.spoken_max_chars} 字以内。"
+            f"请直接给出核心结论，简短口语化，不要使用 Markdown、代码块或 URL，"
+            f"尽量控制在 100 字以内（不超过 {self._config.spoken_max_chars} 字）。"
         )
 
     async def ask(
