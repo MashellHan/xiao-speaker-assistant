@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import shlex
@@ -13,6 +14,7 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 from websockets.asyncio.server import ServerConnection
+from websockets.exceptions import ConnectionClosed
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
 from xiao_speaker_assistant.voice.audio_pipeline import (
@@ -61,6 +63,7 @@ class SpeakerGateway:
         self._mute_native_until: float = 0.0
         self._pipeline: LocalSpeechPipeline | None = None
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xsa-asr")
 
     async def send_command(
         self,
@@ -175,6 +178,8 @@ class SpeakerGateway:
                     await self._handle_binary_message(conn, raw)
                     continue
                 await self._handle_text_message(conn, raw)
+        except ConnectionClosed:
+            logger.info("Speaker connection closed")
         finally:
             self._connections.discard(conn)
             for fut in self._pending_rpc.values():
@@ -193,20 +198,29 @@ class SpeakerGateway:
 
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
-            loop.create_task(self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True))
+            loop.call_soon_threadsafe(
+                lambda: loop.create_task(
+                    self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
+                )
+            )
 
         def on_utterance(text: str) -> None:
             logger.info("Local ASR recognized: %s", text)
-            loop.create_task(self._process_local_utterance(conn, text))
+            loop.call_soon_threadsafe(
+                lambda t=text: loop.create_task(self._process_local_utterance(conn, t))
+            )
 
         def on_sleep() -> None:
             logger.info("Returned silently to wake-word idle")
 
-        self._pipeline.feed_pcm(
-            pcm,
-            on_wakeup=on_wakeup,
-            on_utterance=on_utterance,
-            on_sleep=on_sleep,
+        await loop.run_in_executor(
+            self._asr_executor,
+            lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
+                pcm,
+                on_wakeup=on_wakeup,
+                on_utterance=on_utterance,
+                on_sleep=on_sleep,
+            ),
         )
 
     async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
@@ -437,5 +451,11 @@ class SpeakerGateway:
         host = self._config.speaker.ws_host
         port = self._config.speaker.ws_port
         logger.info("Listening for speaker WebSocket on ws://%s:%s", host, port)
-        async with websockets.serve(self._handle_connection, host, port):
+        async with websockets.serve(
+            self._handle_connection,
+            host,
+            port,
+            ping_interval=30,
+            ping_timeout=60,
+        ):
             await asyncio.Future()

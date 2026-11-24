@@ -11,6 +11,8 @@ from typing import Callable
 
 import numpy as np
 
+from pypinyin import lazy_pinyin
+
 from xiao_speaker_assistant.config import SpeechConfig
 from xiao_speaker_assistant.voice.models_setup import (
     find_paraformer_dir,
@@ -29,6 +31,10 @@ HI_NOMI_REGEX = re.compile(
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
+
+_PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a"}
+_PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao"}
+_PINYIN_THIRD = {"mi", "min", "mei"}
 
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
@@ -80,6 +86,22 @@ def match_wakeup_phrase(
     if m:
         rest = (m.group(1) or "").strip(" ，,。.!！？:：")
         return "hi nomi", rest
+
+    # Check 3-char CJK phonetic prefix (e.g. "蔡纳米", "海诺米", "嗨，糯米") via pypinyin.
+    cjk_chars: list[tuple[int, str]] = []
+    for idx, ch in enumerate(stripped):
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk_chars.append((idx, ch))
+            if len(cjk_chars) == 3:
+                break
+        elif ch not in " ,，.。!！?？:：":
+            break
+    if len(cjk_chars) == 3:
+        py = lazy_pinyin("".join(ch for _, ch in cjk_chars))
+        if len(py) == 3 and py[0] in _PINYIN_FIRST and py[1] in _PINYIN_SECOND and py[2] in _PINYIN_THIRD:
+            cut = cjk_chars[-1][0] + 1
+            rest = stripped[cut:].strip(" ，,。.!！？:：")
+            return "hi nomi", rest
 
     lowered = stripped.lower()
     for kw in extra_keywords or []:
