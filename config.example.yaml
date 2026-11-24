@@ -1,33 +1,38 @@
 # Copy to config.yaml (ignored by git) and customize.
-# Uses local `opencode` CLI (raven proxy / Gemini) and `codex` CLI — no API keys needed.
+# Uses local `opencode` (raven proxy / Gemini) and `codex` CLI — no API keys needed.
 
 speaker:
   model: OH2P
   ws_host: 0.0.0.0
   ws_port: 4399
   auth_token_env: XSA_SPEAKER_TOKEN
-  tts_provider: xiaoai # xiaoai | openai | mlx_audio
+  tts_provider: edge # edge | say | xiaoai | openai | mlx_audio
+  edge_voice: zh-CN-XiaoxiaoNeural
+  say_voice: Tingting
+  tts_sample_rate: 24000
 
 speech:
-  wakeup_keywords:
-    - 帮我
-    - 请
-    - nomi
-    - 你好管家
-    - 小助手
   local_keywords:
-    - hi nomi
-    - 你好诺米
     - 你好管家
-  asr_provider: xiaoai_asr # sense_voice (for Hi Nomi) | xiaoai_asr
+    - 你好诺米
+  interrupt_keywords:
+    - 退出
+    - 停止
+    - 闭嘴
+    - 退下
+    - 别说了
+    - 再见
+  asr_provider: sense_voice # sense_voice | xiaoai_asr
   asr_model: sense_voice # sense_voice | paraformer | doubao_flash | openai_whisper
-  asr_language: zh # zh stops ja/ko hallucinations while preserving English code-switching
+  asr_language: zh
+  capture_channels: 1
   capture_bits_per_sample: 16
   agc_enabled: true
   agc_target_rms: 0.10
   agc_max_gain: 48.0
+  aec_enabled: false
   models_dir: models
-  vad_min_silence_ms: 700
+  vad_min_silence_ms: 550
 
 llm:
   default_provider: opencode # opencode | codex | codex_api | gemini_api
@@ -37,13 +42,14 @@ llm:
       binary: opencode
       model: raven/gemini-4-hydrogen
       timeout_sec: 120
-      auto_approve: false
+      auto_approve: true
     codex:
       binary: codex
       workdir: .
       timeout_sec: 120
 
 tools:
+  mcp_http_port: 4397
   outlook:
     enabled: true
     client_id_env: OUTLOOK_CLIENT_ID

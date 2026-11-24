@@ -15,7 +15,10 @@ class SpeakerConfig(BaseModel):
     ws_host: str = "0.0.0.0"
     ws_port: int = 4399
     auth_token_env: str = "XSA_SPEAKER_TOKEN"
-    tts_provider: Literal["xiaoai", "openai", "mlx_audio"] = "xiaoai"
+    tts_provider: Literal["edge", "say", "xiaoai", "openai", "mlx_audio"] = "edge"
+    edge_voice: str = "zh-CN-XiaoxiaoNeural"
+    say_voice: str = "Tingting"
+    tts_sample_rate: int = 24000
 
 
 class SpeechConfig(BaseModel):
@@ -36,27 +39,29 @@ class SpeechConfig(BaseModel):
             "网页",
         ]
     )
-    local_keywords: list[str] = Field(default_factory=lambda: ["hi nomi", "你好诺米", "你好管家"])
+    local_keywords: list[str] = Field(default_factory=lambda: ["你好管家", "你好诺米"])
     interrupt_keywords: list[str] = Field(
         default_factory=lambda: ["退出", "停止", "闭嘴", "退下", "别说了", "再见"]
     )
-    asr_provider: Literal["sense_voice", "xiaoai_asr"] = "xiaoai_asr"
+    asr_provider: Literal["sense_voice", "xiaoai_asr"] = "sense_voice"
     asr_model: Literal["sense_voice", "paraformer", "doubao_flash", "openai_whisper"] = "sense_voice"
     asr_language: str = "zh"
     whisper_base_url: str = "https://api.openai.com/v1"
     whisper_api_key_env: str | None = "OPENAI_API_KEY"
     whisper_model: str = "whisper-1"
     models_dir: str = "models"
+    capture_channels: Literal[1, 2] = 1
     capture_bits_per_sample: Literal[16, 32] = 16
     s32_shift: int = 16
     kws_score: float = 2.5
     kws_threshold: float = 0.15
-    vad_threshold: float = 0.15
-    vad_min_silence_ms: int = 500
+    vad_threshold: float = 0.20
+    vad_min_silence_ms: int = 550
     input_gain: float = 1.0
     agc_enabled: bool = True
     agc_target_rms: float = 0.10
     agc_max_gain: float = 48.0
+    aec_enabled: bool = False
     conversation_timeout_sec: float = 25.0
 
 
@@ -65,6 +70,8 @@ class OpencodeCliConfig(BaseModel):
     model: str = "raven/gemini-4-hydrogen"
     timeout_sec: float = 120.0
     auto_approve: bool = True
+    server_url: str = "http://127.0.0.1:4096"
+    agent_home: str = "~/.local/share/xiao-speaker-assistant/agent-home"
 
 
 class CodexCliConfig(BaseModel):
@@ -122,6 +129,7 @@ class ToolsConfig(BaseModel):
             enabled=False, mcp_url="http://127.0.0.1:8931/mcp", preferred_browser="msedge"
         )
     )
+    mcp_http_port: int = 4397
 
 
 class AppConfig(BaseModel):
@@ -134,10 +142,6 @@ class AppConfig(BaseModel):
 def load_config(path: str | Path | None = None) -> AppConfig:
     target = Path(path) if path else Path("config.yaml")
     if not target.exists():
-        example = Path("config.example.yaml")
-        if path is None and example.exists():
-            data = yaml.safe_load(example.read_text(encoding="utf-8")) or {}
-            return AppConfig.model_validate(data)
         return AppConfig()
     data = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
     return AppConfig.model_validate(data)

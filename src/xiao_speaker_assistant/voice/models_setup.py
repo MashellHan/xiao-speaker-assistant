@@ -102,11 +102,12 @@ def generate_keywords_file(
     lines: list[str] = []
     for raw_kw, token_list in zip(keywords, encoded):
         joined = "".join(token_list)
-        tag = re.sub(r"\s+", "_", raw_kw.strip())
         if re.match(r"^[▁A-Z\s]+$", joined):
+            tag = re.sub(r"\s+", "_", raw_kw.strip())
             lines.append(" ".join(token_list) + f" @{tag}")
         else:
-            lines.append(" ".join(token_list) + f" @{re.sub(r'\s+', '_', joined)}")
+            tag = re.sub(r"\s+", "", joined)
+            lines.append(" ".join(token_list) + f" @{tag}")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output
 

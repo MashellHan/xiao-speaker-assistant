@@ -1,25 +1,24 @@
-"""Local KWS + Silero VAD + SenseVoice offline ASR pipeline (supports `Hi Nomi`)."""
+"""Low-CPU local KWS + Silero VAD + SenseVoice/Paraformer/Cloud ASR pipeline."""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
-
 from pypinyin import lazy_pinyin
+from scipy.signal import lfilter
 
 from xiao_speaker_assistant.config import SpeechConfig
 from xiao_speaker_assistant.voice.cloud_asr import DoubaoFlashASR, OpenAIWhisperASR
 from xiao_speaker_assistant.voice.models_setup import (
-    find_english_kws_dir,
     find_paraformer_dir,
     find_sense_voice_dir,
-    generate_english_keywords_file,
     generate_keywords_file,
 )
 
@@ -55,11 +54,7 @@ def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
 
 
 def pcm_to_float32(pcm_bytes: bytes, bits_per_sample: int = 16, s32_shift: int = 16) -> np.ndarray:
-    """Convert raw PCM bytes to normalized [-1, 1] float32 samples.
-
-    OH2P firmware 1.60.3 places 16-bit audio in the upper 16 bits of S32_LE (`s32_shift=16`),
-    whereas legacy A113 firmware used lower 24 bits (`s32_shift=8`).
-    """
+    """Convert raw PCM bytes to normalized [-1, 1] float32 samples."""
     if bits_per_sample == 32:
         usable = len(pcm_bytes) - (len(pcm_bytes) % 4)
         if usable <= 0:
@@ -81,19 +76,15 @@ def apply_highpass_filter(
     prev_y: float = 0.0,
     alpha: float = 0.968,
 ) -> tuple[np.ndarray, float, float]:
-    """First-order DC/low-rumble high-pass filter (~80 Hz at 16 kHz) preserving filter state."""
+    """Vectorized 1st-order DC/low-rumble high-pass filter (~80 Hz at 16 kHz)."""
     if len(samples) == 0:
         return samples, prev_x, prev_y
-    out = np.empty_like(samples, dtype=np.float32)
-    x_prev = prev_x
-    y_prev = prev_y
-    for i in range(len(samples)):
-        x = float(samples[i])
-        y = alpha * (y_prev + x - x_prev)
-        out[i] = y
-        x_prev = x
-        y_prev = y
-    return out, x_prev, y_prev
+    b = np.array([alpha, -alpha], dtype=np.float64)
+    a = np.array([1.0, -alpha], dtype=np.float64)
+    zi = np.array([alpha * (prev_y - prev_x)], dtype=np.float64)
+    y, _ = lfilter(b, a, samples.astype(np.float64), zi=zi)
+    out = y.astype(np.float32)
+    return out, float(samples[-1]), float(out[-1])
 
 
 class DynamicAGC:
@@ -122,7 +113,6 @@ class DynamicAGC:
             alpha = 0.35 if desired < self.gain else 0.20
             self.gain = (1.0 - alpha) * self.gain + alpha * desired
         else:
-            # Decay gently toward min_gain in silence so room noise stays well below VAD threshold.
             self.gain = 0.92 * self.gain + 0.08 * self.min_gain
         return np.tanh(samples * self.gain).astype(np.float32)
 
@@ -130,10 +120,7 @@ class DynamicAGC:
 def match_wakeup_phrase(
     text: str, extra_keywords: list[str] | None = None
 ) -> tuple[str, str] | None:
-    """Match `Hi Nomi` (with phonetic variants) or configured wake keywords.
-
-    Returns (wake_label, remaining_query) or None if not matched.
-    """
+    """Match `Hi Nomi` or punctuation-tolerant Chinese wake keywords (e.g. 你好，管家。)."""
     stripped = text.strip()
     if not stripped:
         return None
@@ -143,7 +130,6 @@ def match_wakeup_phrase(
         rest = (m.group(1) or "").strip(" ，,。.!！？:：")
         return "hi nomi", rest
 
-    # Check 3-char CJK phonetic prefix (e.g. "蔡纳米", "海诺米", "嗨，糯米") via pypinyin.
     cjk_chars: list[tuple[int, str]] = []
     for idx, ch in enumerate(stripped):
         if "\u4e00" <= ch <= "\u9fff":
@@ -159,29 +145,47 @@ def match_wakeup_phrase(
             rest = stripped[cut:].strip(" ，,。.!！？:：")
             return "hi nomi", rest
 
-    lowered = stripped.lower()
+    # Punctuation-tolerant Chinese keyword prefix match (handles "你好，管家。" from SenseVoice ITN).
+    norm_chars: list[tuple[int, str]] = []
+    for idx, ch in enumerate(stripped):
+        if ch not in " ,，.。!！?？:：":
+            norm_chars.append((idx, ch.lower()))
+    norm_str = "".join(c for _, c in norm_chars)
+
     for kw in extra_keywords or []:
-        clean_kw = kw.strip().lower()
+        clean_kw = re.sub(r"[ ,，.。!！?？:：]+", "", kw.strip().lower())
         if not clean_kw:
             continue
-        if lowered.startswith(clean_kw):
-            rest = stripped[len(clean_kw) :].strip(" ，,。.!！？:：")
+        if norm_str.startswith(clean_kw):
+            last_orig_idx = norm_chars[len(clean_kw) - 1][0]
+            rest = stripped[last_orig_idx + 1 :].strip(" ，,。.!！？:：")
             return clean_kw, rest
     return None
 
 
+def _normalize_kws_tag(raw_kw: str) -> str:
+    stripped = raw_kw.strip()
+    if any("\u4e00" <= ch <= "\u9fff" for ch in stripped):
+        return re.sub(r"\s+", "", stripped)
+    return re.sub(r"\s+", "_", stripped)
+
+
 class LocalSpeechPipeline:
-    """Runs KWS + Silero VAD + SenseVoice ASR on 16kHz mono PCM."""
+    """Runs unified KWS (wakeup + interrupt) + Silero VAD + local/cloud ASR."""
 
     def __init__(self, config: SpeechConfig) -> None:
         import sherpa_onnx
 
         self._config = config
+        self._lock = threading.RLock()
         models_dir = Path(config.models_dir).expanduser()
-        kw_file = generate_keywords_file(models_dir, config.local_keywords, filename="keywords.txt")
-        interrupt_kw_file = generate_keywords_file(
-            models_dir, config.interrupt_keywords, filename="interrupt_keywords.txt"
-        )
+
+        self._wake_set = {_normalize_kws_tag(kw) for kw in config.local_keywords if kw.strip()}
+        self._interrupt_set = {
+            _normalize_kws_tag(kw) for kw in config.interrupt_keywords if kw.strip()
+        }
+        combined_keywords = list(dict.fromkeys([*config.local_keywords, *config.interrupt_keywords]))
+        kw_file = generate_keywords_file(models_dir, combined_keywords, filename="keywords.txt")
 
         self._kws = sherpa_onnx.KeywordSpotter(
             provider="cpu",
@@ -197,42 +201,6 @@ class LocalSpeechPipeline:
             joiner=str(models_dir / "joiner.onnx"),
         )
         self._kws_stream = self._kws.create_stream()
-
-        self._interrupt_kws = sherpa_onnx.KeywordSpotter(
-            provider="cpu",
-            num_threads=1,
-            max_active_paths=8,
-            keywords_score=2.8,
-            keywords_threshold=0.12,
-            num_trailing_blanks=0,
-            keywords_file=str(interrupt_kw_file),
-            tokens=str(models_dir / "tokens.txt"),
-            encoder=str(models_dir / "encoder.onnx"),
-            decoder=str(models_dir / "decoder.onnx"),
-            joiner=str(models_dir / "joiner.onnx"),
-        )
-        self._interrupt_kws_stream = self._interrupt_kws.create_stream()
-
-        en_dir = find_english_kws_dir(models_dir)
-        self._en_kws = None
-        self._en_kws_stream = None
-        if en_dir is not None:
-            en_kw_file = generate_english_keywords_file(en_dir)
-            self._en_kws = sherpa_onnx.KeywordSpotter(
-                provider="cpu",
-                num_threads=1,
-                max_active_paths=8,
-                keywords_score=2.5,
-                keywords_threshold=config.kws_threshold,
-                num_trailing_blanks=0,
-                keywords_file=str(en_kw_file),
-                tokens=str(en_dir / "tokens.txt"),
-                encoder=str(en_dir / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
-                decoder=str(en_dir / "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
-                joiner=str(en_dir / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
-            )
-            self._en_kws_stream = self._en_kws.create_stream()
-            logger.info("Loaded English GigaSpeech KWS for `Hi Nomi`")
 
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(models_dir / "silero_vad.onnx"),
@@ -302,31 +270,51 @@ class LocalSpeechPipeline:
         )
 
     def set_muted(self, muted: bool) -> None:
-        self._explicit_muted = muted
-        if not muted:
-            self._vad.reset()
-            self._vad_buffer = np.zeros(0, dtype=np.float32)
-        else:
-            self._interrupt_kws.reset_stream(self._interrupt_kws_stream)
+        with self._lock:
+            self._explicit_muted = muted
+            if not muted:
+                self._vad.reset()
+                self._vad_buffer = np.zeros(0, dtype=np.float32)
+            else:
+                self._kws.reset_stream(self._kws_stream)
 
     def mute_for(self, seconds: float) -> None:
-        self._muted_until = max(self._muted_until, time.monotonic() + seconds)
+        with self._lock:
+            self._muted_until = max(self._muted_until, time.monotonic() + seconds)
 
     def refresh_activity(self) -> None:
-        if self.awake:
-            self._last_active_at = time.monotonic()
+        with self._lock:
+            if self.awake:
+                self._last_active_at = time.monotonic()
 
-    def set_awake(self, awake: bool) -> None:
-        self.awake = awake
-        self._last_active_at = time.monotonic() if awake else 0.0
-        self._vad.reset()
-        self._vad_buffer = np.zeros(0, dtype=np.float32)
-        self._kws.reset_stream(self._kws_stream)
-        self._interrupt_kws.reset_stream(self._interrupt_kws_stream)
-        if self._en_kws is not None and self._en_kws_stream is not None:
-            self._en_kws.reset_stream(self._en_kws_stream)
+    def set_awake(self, awake: bool, *, preserve_vad: bool = False) -> None:
+        with self._lock:
+            self.awake = awake
+            self._last_active_at = time.monotonic() if awake else 0.0
+            if not preserve_vad:
+                self._vad.reset()
+                self._vad_buffer = np.zeros(0, dtype=np.float32)
+            self._kws.reset_stream(self._kws_stream)
 
     def feed_pcm(
+        self,
+        pcm_bytes: bytes,
+        *,
+        on_wakeup: Callable[[str], None] | None = None,
+        on_utterance: Callable[[str], None] | None = None,
+        on_sleep: Callable[[], None] | None = None,
+        on_interrupt: Callable[[str], None] | None = None,
+    ) -> None:
+        with self._lock:
+            self._feed_pcm_locked(
+                pcm_bytes,
+                on_wakeup=on_wakeup,
+                on_utterance=on_utterance,
+                on_sleep=on_sleep,
+                on_interrupt=on_interrupt,
+            )
+
+    def _feed_pcm_locked(
         self,
         pcm_bytes: bytes,
         *,
@@ -370,51 +358,32 @@ class LocalSpeechPipeline:
                 self._config.capture_bits_per_sample,
             )
 
-        # Always run lightweight interrupt KWS while awake (even while thinking or speaking)
-        # so 退出/停止/别说了/闭嘴 works immediately without waiting for VAD silence.
-        if self.awake:
-            self._interrupt_kws_stream.accept_waveform(SAMPLE_RATE, samples)
-            while self._interrupt_kws.is_ready(self._interrupt_kws_stream):
-                self._interrupt_kws.decode_stream(self._interrupt_kws_stream)
-                hit = self._interrupt_kws.get_result(self._interrupt_kws_stream)
-                if hit:
-                    logger.info("Barge-in interrupt keyword detected: %s", hit)
-                    self._explicit_muted = False
-                    self._muted_until = 0.0
-                    self.set_awake(False)
-                    if on_interrupt:
-                        on_interrupt(hit)
-                    return
+        # Unified single KeywordSpotter handles both idle wakeup and awake interrupt.
+        self._kws_stream.accept_waveform(SAMPLE_RATE, samples)
+        while self._kws.is_ready(self._kws_stream):
+            self._kws.decode_stream(self._kws_stream)
+            hit = self._kws.get_result(self._kws_stream)
+            if not hit:
+                continue
+            if self.awake and hit in self._interrupt_set:
+                logger.info("Barge-in interrupt keyword detected: %s", hit)
+                self._explicit_muted = False
+                self._muted_until = 0.0
+                self.set_awake(False)
+                if on_interrupt:
+                    on_interrupt(hit)
+                return
+            if not self.awake and hit in self._wake_set:
+                # Preserve VAD buffer so one-shot phrases right after the wake word aren't clipped.
+                self.set_awake(True, preserve_vad=True)
+                logger.info("KWS triggered: %s", hit)
+                if on_wakeup:
+                    on_wakeup(hit)
+                break
 
         if is_muted:
             return
 
-        # Fast Zipformer KWS paths when idle (Chinese + English GigaSpeech for `Hi Nomi`).
-        if not self.awake:
-            if self._en_kws is not None and self._en_kws_stream is not None:
-                self._en_kws_stream.accept_waveform(SAMPLE_RATE, samples)
-                while self._en_kws.is_ready(self._en_kws_stream):
-                    self._en_kws.decode_stream(self._en_kws_stream)
-                    en_hit = self._en_kws.get_result(self._en_kws_stream)
-                    if en_hit:
-                        self.set_awake(True)
-                        logger.info("English KWS triggered: %s", en_hit)
-                        if on_wakeup:
-                            on_wakeup(en_hit)
-                        return
-
-            self._kws_stream.accept_waveform(SAMPLE_RATE, samples)
-            while self._kws.is_ready(self._kws_stream):
-                self._kws.decode_stream(self._kws_stream)
-                keyword = self._kws.get_result(self._kws_stream)
-                if keyword:
-                    self.set_awake(True)
-                    logger.info("KWS triggered: %s", keyword)
-                    if on_wakeup:
-                        on_wakeup(keyword)
-                    return
-
-        # Feed Silero VAD continuously so both `Hi Nomi` wakeup and full utterances work smoothly.
         self._vad_buffer = np.concatenate([self._vad_buffer, samples])
         while len(self._vad_buffer) >= VAD_WINDOW_SAMPLES:
             chunk = self._vad_buffer[:VAD_WINDOW_SAMPLES]
@@ -436,7 +405,7 @@ class LocalSpeechPipeline:
                     logger.info("Idle speech (ignored): %s", text)
                     continue
                 wake_label, rest = matched
-                logger.info("SenseVoice wake matched (%s): %s", wake_label, text)
+                logger.info("ASR wake matched (%s): %s", wake_label, text)
                 self.set_awake(True)
                 if rest:
                     if on_utterance:
