@@ -180,7 +180,6 @@ async def stream_edge_tts_pcm(
                 del buf[:chunk_bytes]
                 yield piece
         if buf:
-            # Pad final partial sample cleanly
             if len(buf) % 2 == 1:
                 buf.append(0)
             yield bytes(buf)
@@ -189,11 +188,19 @@ async def stream_edge_tts_pcm(
         if proc.returncode != 0:
             err = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
             raise RuntimeError(f"edge-tts ffmpeg failed: {err}")
-    except asyncio.CancelledError:
-        feeder.cancel()
+    finally:
+        if not feeder.done():
+            feeder.cancel()
+            try:
+                await feeder
+            except BaseException:
+                pass
         if proc.returncode is None:
-            proc.kill()
-        raise
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
 
 
 async def synthesize_tts_pcm_stream(

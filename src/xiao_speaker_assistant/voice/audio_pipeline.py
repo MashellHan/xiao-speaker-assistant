@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -162,6 +163,13 @@ def match_wakeup_phrase(
     return None
 
 
+def _normalize_kws_tag(raw_kw: str) -> str:
+    stripped = raw_kw.strip()
+    if any("\u4e00" <= ch <= "\u9fff" for ch in stripped):
+        return re.sub(r"\s+", "", stripped)
+    return re.sub(r"\s+", "_", stripped)
+
+
 class LocalSpeechPipeline:
     """Runs unified KWS (wakeup + interrupt) + Silero VAD + local/cloud ASR."""
 
@@ -169,11 +177,12 @@ class LocalSpeechPipeline:
         import sherpa_onnx
 
         self._config = config
+        self._lock = threading.RLock()
         models_dir = Path(config.models_dir).expanduser()
 
-        self._wake_set = {re.sub(r"\s+", "_", kw.strip()) for kw in config.local_keywords if kw.strip()}
+        self._wake_set = {_normalize_kws_tag(kw) for kw in config.local_keywords if kw.strip()}
         self._interrupt_set = {
-            re.sub(r"\s+", "_", kw.strip()) for kw in config.interrupt_keywords if kw.strip()
+            _normalize_kws_tag(kw) for kw in config.interrupt_keywords if kw.strip()
         }
         combined_keywords = list(dict.fromkeys([*config.local_keywords, *config.interrupt_keywords]))
         kw_file = generate_keywords_file(models_dir, combined_keywords, filename="keywords.txt")
@@ -261,29 +270,51 @@ class LocalSpeechPipeline:
         )
 
     def set_muted(self, muted: bool) -> None:
-        self._explicit_muted = muted
-        if not muted:
-            self._vad.reset()
-            self._vad_buffer = np.zeros(0, dtype=np.float32)
-        else:
-            self._kws.reset_stream(self._kws_stream)
+        with self._lock:
+            self._explicit_muted = muted
+            if not muted:
+                self._vad.reset()
+                self._vad_buffer = np.zeros(0, dtype=np.float32)
+            else:
+                self._kws.reset_stream(self._kws_stream)
 
     def mute_for(self, seconds: float) -> None:
-        self._muted_until = max(self._muted_until, time.monotonic() + seconds)
+        with self._lock:
+            self._muted_until = max(self._muted_until, time.monotonic() + seconds)
 
     def refresh_activity(self) -> None:
-        if self.awake:
-            self._last_active_at = time.monotonic()
+        with self._lock:
+            if self.awake:
+                self._last_active_at = time.monotonic()
 
     def set_awake(self, awake: bool, *, preserve_vad: bool = False) -> None:
-        self.awake = awake
-        self._last_active_at = time.monotonic() if awake else 0.0
-        if not preserve_vad:
-            self._vad.reset()
-            self._vad_buffer = np.zeros(0, dtype=np.float32)
-        self._kws.reset_stream(self._kws_stream)
+        with self._lock:
+            self.awake = awake
+            self._last_active_at = time.monotonic() if awake else 0.0
+            if not preserve_vad:
+                self._vad.reset()
+                self._vad_buffer = np.zeros(0, dtype=np.float32)
+            self._kws.reset_stream(self._kws_stream)
 
     def feed_pcm(
+        self,
+        pcm_bytes: bytes,
+        *,
+        on_wakeup: Callable[[str], None] | None = None,
+        on_utterance: Callable[[str], None] | None = None,
+        on_sleep: Callable[[], None] | None = None,
+        on_interrupt: Callable[[str], None] | None = None,
+    ) -> None:
+        with self._lock:
+            self._feed_pcm_locked(
+                pcm_bytes,
+                on_wakeup=on_wakeup,
+                on_utterance=on_utterance,
+                on_sleep=on_sleep,
+                on_interrupt=on_interrupt,
+            )
+
+    def _feed_pcm_locked(
         self,
         pcm_bytes: bytes,
         *,

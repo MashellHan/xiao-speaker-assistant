@@ -86,3 +86,54 @@ def test_sense_voice_mode_suppresses_native_speak_while_awake() -> None:
     assert len(sent) == 1
     assert "player_wakeup" in sent[0]["Request"]["payload"]
     assert "killall miplayer" in sent[0]["Request"]["payload"]
+
+
+def test_playback_controller_cancel_epoch_aborts_queued_waiters_and_chime_skips_mute() -> None:
+    sent_text: list[dict] = []
+    sent_binary: list[dict] = []
+    run_shells: list[str] = []
+    states: list[bool] = []
+    spoken_texts: list[str] = []
+    first_started = asyncio.Event()
+
+    async def fake_send_text(t: str) -> None:
+        sent_text.append(json.loads(t))
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary.append(json.loads(b.decode("utf-8")))
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        run_shells.append(script)
+        return {"code": 0}
+
+    async def slow_stream(text: str, cfg: SpeakerConfig):
+        spoken_texts.append(text)
+        first_started.set()
+        await asyncio.sleep(0.2)
+        yield b"\x01\x00" * 1200
+
+    pb = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        on_playback_state=states.append,
+    )
+
+    async def run() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", slow_stream):
+            await pb.play_chime()
+            # Chime must NOT call on_playback_state (which would wipe VAD during one-shot wakeup)
+            assert states == []
+
+            t1 = asyncio.create_task(pb.speak("第一句", interrupt_native=True))
+            await first_started.wait()
+            t2 = asyncio.create_task(pb.speak("不该播放的第二句", interrupt_native=False))
+            await asyncio.sleep(0.01)
+            await pb.stop_playback(stop_native=True)
+            await asyncio.gather(t1, t2)
+
+    asyncio.run(run())
+    assert spoken_texts == ["第一句"]
+    assert any(m["Request"]["command"] == "stop_play" for m in sent_text)
+    assert any("player_wakeup" in s for s in run_shells)

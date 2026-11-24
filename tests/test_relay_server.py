@@ -260,7 +260,9 @@ def test_relay_host_client_reconnects_with_backoff() -> None:
         port = probe.bound_port
         await probe.close()
 
-        gateway = SpeakerGateway(AppConfig(), on_query=on_query)
+        cfg = AppConfig()
+        cfg.speech.asr_provider = "xiaoai_asr"
+        gateway = SpeakerGateway(cfg, on_query=on_query)
         client = RelayHostClient(
             gateway,
             f"ws://127.0.0.1:{port}/ws/host",

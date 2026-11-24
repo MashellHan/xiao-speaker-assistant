@@ -315,6 +315,7 @@ class SpeakerGateway:
     async def _yield_to_native_xiaoai(self, conn: ServerConnection) -> None:
         logger.info("Native XiaoAI activated; yielding control cleanly to avoid crosstalk")
         self._interrupted = True
+        self._mute_native_until = 0.0
         if self._active_reply_task is not None and not self._active_reply_task.done():
             self._active_reply_task.cancel()
         for fut in self._pending_rpc.get(conn, {}).values():
@@ -381,7 +382,14 @@ class SpeakerGateway:
                 await self._yield_to_native_xiaoai(conn)
                 return
 
-            if is_nomi_active and self._is_native_speak_event(msg):
+            is_playing_own_xiaoai = (
+                self._config.speaker.tts_provider == "xiaoai" and pb is not None and pb.is_playing
+            )
+            if (
+                not is_playing_own_xiaoai
+                and (is_nomi_active or time.monotonic() < self._mute_native_until)
+                and self._is_native_speak_event(msg)
+            ):
                 logger.info("Suppressing stray native XiaoAI Speak event while Nomi is active")
                 asyncio.create_task(self.stop_native_audio(conn))
                 return
