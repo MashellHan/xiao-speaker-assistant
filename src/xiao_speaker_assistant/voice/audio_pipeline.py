@@ -12,7 +12,11 @@ from typing import Callable
 import numpy as np
 
 from xiao_speaker_assistant.config import SpeechConfig
-from xiao_speaker_assistant.voice.models_setup import find_sense_voice_dir, generate_keywords_file
+from xiao_speaker_assistant.voice.models_setup import (
+    find_paraformer_dir,
+    find_sense_voice_dir,
+    generate_keywords_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +25,7 @@ VAD_WINDOW_SAMPLES = 512
 
 HI_NOMI_REGEX = re.compile(
     r"^\s*(?:hi|hey|hello|can|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
-    r"(?:nomi|normi|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米)"
+    r"(?:nomi|normi|nami|hnomi|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米)"
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -129,15 +133,24 @@ class LocalSpeechPipeline:
         )
         self._vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=30.0)
 
-        sv_dir = find_sense_voice_dir(models_dir)
-        self._asr = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(sv_dir / "model.int8.onnx"),
-            tokens=str(sv_dir / "tokens.txt"),
-            num_threads=2,
-            language="auto",
-            use_itn=True,
-            provider="cpu",
-        )
+        if config.asr_model == "paraformer":
+            pf_dir = find_paraformer_dir(models_dir)
+            self._asr = sherpa_onnx.OfflineRecognizer.from_paraformer(
+                paraformer=str(pf_dir / "model.int8.onnx"),
+                tokens=str(pf_dir / "tokens.txt"),
+                num_threads=2,
+                provider="cpu",
+            )
+        else:
+            sv_dir = find_sense_voice_dir(models_dir)
+            self._asr = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=str(sv_dir / "model.int8.onnx"),
+                tokens=str(sv_dir / "tokens.txt"),
+                num_threads=2,
+                language=config.asr_language,
+                use_itn=True,
+                provider="cpu",
+            )
 
         self.awake: bool = False
         self._last_active_at: float = 0.0
@@ -181,6 +194,8 @@ class LocalSpeechPipeline:
         samples = pcm_to_float32(pcm_bytes, bits_per_sample=self._config.capture_bits_per_sample)
         if len(samples) == 0:
             return
+        if len(samples) >= 160:
+            samples = samples - np.mean(samples)
         if self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
         if not self._logged_first_audio:

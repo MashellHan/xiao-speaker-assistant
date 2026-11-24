@@ -24,6 +24,8 @@ class SpeechConfig(BaseModel):
     )
     local_keywords: list[str] = Field(default_factory=lambda: ["hi nomi", "你好管家"])
     asr_provider: Literal["sense_voice", "xiaoai_asr"] = "xiaoai_asr"
+    asr_model: Literal["sense_voice", "paraformer"] = "sense_voice"
+    asr_language: str = "zh"
     models_dir: str = "models"
     capture_bits_per_sample: Literal[16, 32] = 32
     kws_score: float = 2.5
