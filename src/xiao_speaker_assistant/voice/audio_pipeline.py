@@ -16,8 +16,10 @@ from pypinyin import lazy_pinyin
 from xiao_speaker_assistant.config import SpeechConfig
 from xiao_speaker_assistant.voice.cloud_asr import DoubaoFlashASR, OpenAIWhisperASR
 from xiao_speaker_assistant.voice.models_setup import (
+    find_english_kws_dir,
     find_paraformer_dir,
     find_sense_voice_dir,
+    generate_english_keywords_file,
     generate_keywords_file,
 )
 
@@ -200,8 +202,8 @@ class LocalSpeechPipeline:
             provider="cpu",
             num_threads=1,
             max_active_paths=8,
-            keywords_score=2.2,
-            keywords_threshold=0.20,
+            keywords_score=2.8,
+            keywords_threshold=0.12,
             num_trailing_blanks=0,
             keywords_file=str(interrupt_kw_file),
             tokens=str(models_dir / "tokens.txt"),
@@ -210,6 +212,27 @@ class LocalSpeechPipeline:
             joiner=str(models_dir / "joiner.onnx"),
         )
         self._interrupt_kws_stream = self._interrupt_kws.create_stream()
+
+        en_dir = find_english_kws_dir(models_dir)
+        self._en_kws = None
+        self._en_kws_stream = None
+        if en_dir is not None:
+            en_kw_file = generate_english_keywords_file(en_dir)
+            self._en_kws = sherpa_onnx.KeywordSpotter(
+                provider="cpu",
+                num_threads=1,
+                max_active_paths=8,
+                keywords_score=2.5,
+                keywords_threshold=config.kws_threshold,
+                num_trailing_blanks=0,
+                keywords_file=str(en_kw_file),
+                tokens=str(en_dir / "tokens.txt"),
+                encoder=str(en_dir / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                decoder=str(en_dir / "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                joiner=str(en_dir / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+            )
+            self._en_kws_stream = self._en_kws.create_stream()
+            logger.info("Loaded English GigaSpeech KWS for `Hi Nomi`")
 
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(models_dir / "silero_vad.onnx"),
@@ -300,6 +323,8 @@ class LocalSpeechPipeline:
         self._vad_buffer = np.zeros(0, dtype=np.float32)
         self._kws.reset_stream(self._kws_stream)
         self._interrupt_kws.reset_stream(self._interrupt_kws_stream)
+        if self._en_kws is not None and self._en_kws_stream is not None:
+            self._en_kws.reset_stream(self._en_kws_stream)
 
     def feed_pcm(
         self,
@@ -362,8 +387,20 @@ class LocalSpeechPipeline:
                         return
             return
 
-        # Fast Zipformer KWS path when idle (instant trigger for Chinese wake words like 你好管家).
+        # Fast Zipformer KWS paths when idle (Chinese + English GigaSpeech for `Hi Nomi`).
         if not self.awake:
+            if self._en_kws is not None and self._en_kws_stream is not None:
+                self._en_kws_stream.accept_waveform(SAMPLE_RATE, samples)
+                while self._en_kws.is_ready(self._en_kws_stream):
+                    self._en_kws.decode_stream(self._en_kws_stream)
+                    en_hit = self._en_kws.get_result(self._en_kws_stream)
+                    if en_hit:
+                        self.set_awake(True)
+                        logger.info("English KWS triggered: %s", en_hit)
+                        if on_wakeup:
+                            on_wakeup(en_hit)
+                        return
+
             self._kws_stream.accept_waveform(SAMPLE_RATE, samples)
             while self._kws.is_ready(self._kws_stream):
                 self._kws.decode_stream(self._kws_stream)

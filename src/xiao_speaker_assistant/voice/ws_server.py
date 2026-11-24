@@ -31,17 +31,21 @@ IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
 EXIT_EXACT_WORDS = {
     "退出",
     "退下",
+    "退一下",
     "再见",
     "拜拜",
     "停止",
+    "停下",
     "关闭",
     "结束",
     "不用了",
     "闭嘴",
+    "算了",
     "退出吧",
     "结束吧",
 }
-EXIT_PHRASES = ("退出对话", "结束对话", "停止对话", "退出模式", "结束模式", "退下吧")
+EXIT_PHRASES = ("退出对话", "结束对话", "停止对话", "退出模式", "结束模式", "退下吧", "别说了")
+SHORT_EXIT_SUBSTRINGS = ("退出", "退下", "退一下", "闭嘴", "停止", "停下", "别说了", "再见", "拜拜")
 
 
 class SpeakerGateway:
@@ -69,6 +73,7 @@ class SpeakerGateway:
         self._last_audio_at: float = 0.0
         self._active_reply_task: asyncio.Task[None] | None = None
         self._interrupted: bool = False
+        self._speaking_own_tts: bool = False
 
     async def _audio_watchdog(self, conn: ServerConnection) -> None:
         while True:
@@ -145,6 +150,7 @@ class SpeakerGateway:
         interrupt: bool = True,
         wait_response: bool = True,
     ) -> None:
+        self._speaking_own_tts = True
         if self._pipeline is not None:
             self._pipeline.set_muted(True)
         quoted = shlex.quote(text)
@@ -158,8 +164,26 @@ class SpeakerGateway:
         try:
             await self.run_shell(conn, script, wait_response=wait_response, timeout=25.0)
         finally:
+            self._speaking_own_tts = False
             if self._pipeline is not None:
                 self._pipeline.mute_for(0.4)
+                self._pipeline.set_muted(False)
+
+    async def play_wakeup_chime(self, conn: ServerConnection) -> None:
+        if self._pipeline is not None:
+            self._pipeline.set_muted(True)
+        script = (
+            "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
+            "mphelper pause >/dev/null 2>&1 || true; "
+            "if [ -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav ]; then "
+            "aplay -q /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav; "
+            "else /usr/sbin/tts_play.sh '在'; fi"
+        )
+        try:
+            await self.run_shell(conn, script, wait_response=True, timeout=6.0)
+        finally:
+            if self._pipeline is not None:
+                self._pipeline.mute_for(0.25)
                 self._pipeline.set_muted(False)
 
     async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
@@ -233,9 +257,7 @@ class SpeakerGateway:
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
             loop.call_soon_threadsafe(
-                lambda: loop.create_task(
-                    self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
-                )
+                lambda: loop.create_task(self.play_wakeup_chime(conn))
             )
 
         def on_utterance(text: str) -> None:
@@ -281,11 +303,8 @@ class SpeakerGateway:
 
     async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
         if self.is_exit_command(text):
-            if self._pipeline is not None:
-                self._pipeline.set_awake(False)
-            if self._on_session_reset is not None:
-                self._on_session_reset()
-            await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
+            await self._handle_interrupt(conn)
+            await self.speak_sentence(conn, "好的，已退出。", interrupt=True, wait_response=True)
             return
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
@@ -318,7 +337,11 @@ class SpeakerGateway:
         if self._pipeline is not None:
             return
 
-        if time.monotonic() < self._mute_native_until and self._is_native_speak_event(msg):
+        if (
+            not self._speaking_own_tts
+            and time.monotonic() < self._mute_native_until
+            and self._is_native_speak_event(msg)
+        ):
             logger.debug("Suppressing native XiaoAI Speak event")
             asyncio.create_task(self.stop_native_audio(conn))
             return
@@ -350,7 +373,11 @@ class SpeakerGateway:
         cleaned = text.strip(" ，。！？,.!?")
         if cleaned in EXIT_EXACT_WORDS:
             return True
-        return any(phrase in cleaned for phrase in EXIT_PHRASES)
+        if any(phrase in cleaned for phrase in EXIT_PHRASES):
+            return True
+        if len(cleaned) <= 7 and "登录" not in cleaned and "账号" not in cleaned:
+            return any(sub in cleaned for sub in SHORT_EXIT_SUBSTRINGS)
+        return False
 
     @staticmethod
     def _is_native_speak_event(msg: dict[str, Any]) -> bool:
@@ -379,7 +406,7 @@ class SpeakerGateway:
             await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
 
-        matched_kw = next((kw for kw in self._config.speech.wakeup_keywords if text.startswith(kw)), None)
+        matched_kw = next((kw for kw in self._config.speech.wakeup_keywords if kw in text), None)
         if not matched_kw and not self._continuous_mode:
             return
 
@@ -387,7 +414,7 @@ class SpeakerGateway:
         await self.stop_native_audio(conn)
 
         query = text
-        if matched_kw:
+        if matched_kw and text.startswith(matched_kw):
             query = text[len(matched_kw) :].lstrip(" ，,：:")
             if not query:
                 self._continuous_mode = True

@@ -20,7 +20,21 @@ class SpeakerConfig(BaseModel):
 
 class SpeechConfig(BaseModel):
     wakeup_keywords: list[str] = Field(
-        default_factory=lambda: ["帮我", "请", "nomi", "你好管家", "小助手"]
+        default_factory=lambda: [
+            "帮我",
+            "请",
+            "nomi",
+            "你好管家",
+            "小助手",
+            "看一下",
+            "查一下",
+            "我电脑",
+            "电脑",
+            "邮件",
+            "邮箱",
+            "小红书",
+            "网页",
+        ]
     )
     local_keywords: list[str] = Field(default_factory=lambda: ["hi nomi", "你好诺米", "你好管家"])
     interrupt_keywords: list[str] = Field(
@@ -50,7 +64,7 @@ class OpencodeCliConfig(BaseModel):
     binary: str = "opencode"
     model: str = "raven/gemini-4-hydrogen"
     timeout_sec: float = 120.0
-    auto_approve: bool = False
+    auto_approve: bool = True
 
 
 class CodexCliConfig(BaseModel):

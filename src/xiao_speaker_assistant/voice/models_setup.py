@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,11 @@ MODELS_URL = (
     "vad-kws-asr-models/models.zip"
 )
 MODELS_ZIP_SHA256 = "8e8a709d6ea011f644f3c5055f536d5e6eb363eeafba53cc3232398fd636d273"
+EN_KWS_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
+    "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2"
+)
+EN_KWS_DIRNAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 
 
 def sha256_file(path: Path) -> str:
@@ -41,6 +47,33 @@ def find_paraformer_dir(models_dir: Path) -> Path:
     raise FileNotFoundError(
         f"Paraformer model directory not found under {models_dir}. Run `xsa download-models`."
     )
+
+
+def find_english_kws_dir(models_dir: Path) -> Path | None:
+    candidate = models_dir / EN_KWS_DIRNAME
+    if (
+        candidate.is_dir()
+        and (candidate / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx").is_file()
+        and (candidate / "tokens.txt").is_file()
+        and (candidate / "bpe.model").is_file()
+    ):
+        return candidate
+    return None
+
+
+def generate_english_keywords_file(en_dir: Path, keywords: list[str] | None = None) -> Path:
+    from sherpa_onnx import text2token
+
+    phrases = keywords or ["HI NOMI", "HI NAOMI", "HI KNOW ME", "HI NO ME", "HEY NOMI"]
+    encoded = text2token(
+        [p.strip().upper() for p in phrases if p.strip()],
+        tokens=str(en_dir / "tokens.txt"),
+        tokens_type="bpe",
+        bpe_model=str(en_dir / "bpe.model"),
+    )
+    out = en_dir / "keywords.txt"
+    out.write_text("\n".join(" ".join(t) + " @hi_nomi" for t in encoded) + "\n", encoding="utf-8")
+    return out
 
 
 def generate_keywords_file(
@@ -112,5 +145,21 @@ def download_models(models_dir: Path, keywords: list[str]) -> Path:
                 item.rename(dest)
 
     kw_path = generate_keywords_file(models_dir, keywords)
+
+    en_dir = find_english_kws_dir(models_dir)
+    if en_dir is None:
+        tar_path = models_dir / f"{EN_KWS_DIRNAME}.tar.bz2"
+        print(f"Downloading English KWS model (~18 MB) to {tar_path}...", flush=True)
+        subprocess.run(
+            ["curl", "--fail", "--location", "--progress-bar", EN_KWS_URL, "--output", str(tar_path)],
+            check=True,
+        )
+        with tarfile.open(tar_path, "r:bz2") as tf:
+            tf.extractall(models_dir)
+        tar_path.unlink(missing_ok=True)
+        en_dir = find_english_kws_dir(models_dir)
+    if en_dir is not None:
+        generate_english_keywords_file(en_dir)
+
     print(f"OK: models ready in {models_dir}, keywords generated at {kw_path}")
     return kw_path

@@ -66,9 +66,40 @@ def test_detects_native_speak_event() -> None:
 def test_is_exit_command_matches_short_and_phrase_exits() -> None:
     assert SpeakerGateway.is_exit_command("退出") is True
     assert SpeakerGateway.is_exit_command("退出。") is True
+    assert SpeakerGateway.is_exit_command("退一下") is True
+    assert SpeakerGateway.is_exit_command("好了退出") is True
     assert SpeakerGateway.is_exit_command("再见") is True
     assert SpeakerGateway.is_exit_command("我要退出对话了") is True
     assert SpeakerGateway.is_exit_command("帮我退出登录") is False
+
+
+def test_does_not_suppress_own_tts_while_speaking() -> None:
+    import asyncio, time
+    from xiao_speaker_assistant.config import AppConfig
+
+    sent = []
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    async def dummy(q: str) -> str:
+        return q
+
+    gw = SpeakerGateway(AppConfig(), on_query=dummy)
+    gw._mute_native_until = time.monotonic() + 10.0
+    gw._speaking_own_tts = True
+    line = json.dumps({"header": {"namespace": "SpeechSynthesizer", "name": "Speak"}})
+    event = json.dumps({"Event": {"id": "evt-3", "event": "instruction", "data": {"NewLine": line}}})
+
+    async def run() -> None:
+        await gw._handle_text_message(FakeConn(), event)
+        await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+    assert sent == []
 
 
 def test_start_recording_uses_larger_oh2p_alsa_buffer() -> None:
