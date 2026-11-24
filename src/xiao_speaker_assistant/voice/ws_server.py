@@ -17,6 +17,7 @@ from xiao_speaker_assistant.config import AppConfig, read_env_secret
 from xiao_speaker_assistant.voice.audio_pipeline import (
     LocalSpeechPipeline,
     extract_record_pcm_from_binary,
+    match_wakeup_phrase,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ class SpeakerGateway:
             loop.create_task(self._process_local_utterance(conn, text))
 
         def on_sleep() -> None:
-            loop.create_task(self.abort_and_speak(conn, "超时未说话，有需要再叫我。"))
+            logger.info("Returned silently to wake-word idle")
 
         self._pipeline.feed_pcm(
             pcm,
@@ -158,6 +159,15 @@ class SpeakerGateway:
                 self._pipeline.set_awake(False)
             await self.abort_and_speak(conn, "好的，已退出对话。")
             return
+        matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
+        if matched:
+            _, rest = matched
+            if not rest:
+                await self.abort_and_speak(conn, "我在，请讲。")
+                if self._pipeline is not None:
+                    self._pipeline.refresh_activity()
+                return
+            text = rest
         await self._run_query_and_speak(conn, text)
 
     async def _handle_text_message(self, conn: ServerConnection, raw: str) -> None:
@@ -265,11 +275,15 @@ class SpeakerGateway:
                 logger.info("LLM reply: %s", reply)
                 self._mute_native_until = time.monotonic() + 6.0
                 await self.abort_and_speak(conn, reply)
+                if self._pipeline is not None:
+                    self._pipeline.refresh_activity()
             except Exception as exc:
                 if wait_notice_task:
                     wait_notice_task.cancel()
                 logger.exception("Error handling query %r", query)
                 await self.abort_and_speak(conn, f"处理出错了：{exc}")
+                if self._pipeline is not None:
+                    self._pipeline.refresh_activity()
 
     @staticmethod
     def _extract_final_asr(msg: dict[str, Any]) -> tuple[str, str] | None:

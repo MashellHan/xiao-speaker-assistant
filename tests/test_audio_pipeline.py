@@ -48,6 +48,7 @@ def test_pcm_to_float32_scales_a113_s32_lower_24_bits() -> None:
 def test_match_wakeup_phrase_handles_hi_nomi_variants_and_inline_queries() -> None:
     assert match_wakeup_phrase("Hi, Nomi.") == ("hi nomi", "")
     assert match_wakeup_phrase("H nomi.") == ("hi nomi", "")
+    assert match_wakeup_phrase("Can know me.") == ("hi nomi", "")
     assert match_wakeup_phrase("Hi, Normi.") == ("hi nomi", "")
     assert match_wakeup_phrase("Hi, knowmi. Tell me a joke.") == ("hi nomi", "Tell me a joke")
     assert match_wakeup_phrase("Hi Nomi，帮我查一下邮件") == ("hi nomi", "帮我查一下邮件")
