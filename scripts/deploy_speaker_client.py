@@ -84,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install BusyBox-compatible /data/xiaoai-agent/boot.sh on the speaker.",
     )
     parser.add_argument(
+        "--install-aec-alsa",
+        action="store_true",
+        help="Install /data/xiaoai-agent/asound_xsa.conf exposing 2ch (mic + ch3 loopback) pcm.xsa_aec.",
+    )
+    parser.add_argument(
         "--client-bin",
         type=Path,
         help="Upload local open-xiaoai client binary to /data/xiaoai-agent/client.",
@@ -142,6 +147,7 @@ def main(
         [
             args.client_bin is not None,
             args.install_boot,
+            args.install_aec_alsa,
             args.server_url is not None,
             args.restart,
             args.status,
@@ -149,7 +155,7 @@ def main(
     )
     if not has_action:
         parser.error(
-            "Specify at least one action: --server-url, --install-boot, --client-bin, --restart, --status, or --print-boot-script."
+            "Specify at least one action: --server-url, --install-boot, --install-aec-alsa, --client-bin, --restart, --status, or --print-boot-script."
         )
 
     if not args.host:
@@ -178,6 +184,8 @@ def main(
         steps.append(("upload-client", lambda: deployer.upload_client(args.client_bin)))
     if args.install_boot:
         steps.append(("install-boot", deployer.install_boot_script))
+    if args.install_aec_alsa:
+        steps.append(("install-aec-alsa", deployer.install_aec_alsa))
     if args.server_url is not None:
         steps.append(("update-server-url", lambda: deployer.update_server_url(args.server_url)))
     if args.restart:

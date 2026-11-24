@@ -91,6 +91,9 @@ while true; do
     fi
 
     echo "$(date): starting {binary_name} -> $SERVER_URL" >> "$LOG_FILE"
+    if [ -f "$AGENT_DIR/asound_xsa.conf" ]; then
+        export ALSA_CONFIG_PATH="$AGENT_DIR/asound_xsa.conf"
+    fi
     "$CLIENT_BIN" "$SERVER_URL" >> "$LOG_FILE" 2>&1
     EXIT_CODE=$?
     echo "$(date): {binary_name} exited ($EXIT_CODE), restarting in {restart_delay}s" >> "$LOG_FILE"
@@ -154,6 +157,39 @@ def build_update_server_url_command(
     return (
         f"mkdir -p {q_dir} && "
         f"printf '%s\\n' {q_url} > {q_file} && "
+        f"chmod 644 {q_file}"
+    )
+
+
+def build_asound_xsa_conf() -> str:
+    """Return ALSA config defining `pcm.xsa_aec` (ch0=mic, ch1=hw:0,3 ch3 speaker loopback)."""
+    return """</etc/asound.conf>
+
+pcm.xsa_aec {
+    type plug
+    slave {
+        pcm "Capture"
+        channels 4
+    }
+    ttable.0.0 1
+    ttable.1.3 1
+}
+"""
+
+
+def build_deploy_asound_command(
+    *,
+    remote_dir: str = DEFAULT_REMOTE_DIR,
+) -> str:
+    conf = build_asound_xsa_conf()
+    marker = "__XSA_ASOUND_EOF__"
+    q_dir = shlex.quote(remote_dir)
+    q_file = shlex.quote(f"{remote_dir}/asound_xsa.conf")
+    return (
+        f"mkdir -p {q_dir} && "
+        f"cat <<'{marker}' > {q_file}\n"
+        f"{conf}"
+        f"{marker}\n"
         f"chmod 644 {q_file}"
     )
 
@@ -323,6 +359,9 @@ class SpeakerDeployer:
         return self.run_remote(
             build_deploy_boot_script_command(boot_script, remote_dir=self.remote_dir)
         )
+
+    def install_aec_alsa(self) -> DeployResult:
+        return self.run_remote(build_deploy_asound_command(remote_dir=self.remote_dir))
 
     def upload_client(self, local_binary: Path) -> DeployResult:
         binary_path = local_binary.expanduser()

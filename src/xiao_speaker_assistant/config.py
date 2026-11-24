@@ -50,6 +50,7 @@ class SpeechConfig(BaseModel):
     whisper_api_key_env: str | None = "OPENAI_API_KEY"
     whisper_model: str = "whisper-1"
     models_dir: str = "models"
+    capture_pcm: str = "noop"
     capture_channels: Literal[1, 2] = 1
     capture_bits_per_sample: Literal[16, 32] = 16
     s32_shift: int = 16
