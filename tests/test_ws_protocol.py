@@ -102,6 +102,33 @@ def test_does_not_suppress_own_tts_while_speaking() -> None:
     assert sent == []
 
 
+def test_ignores_short_filler_noise_in_local_utterance() -> None:
+    import asyncio
+    from xiao_speaker_assistant.config import AppConfig
+
+    called = []
+
+    async def fake_query(q: str) -> str:
+        called.append(q)
+        return "ok"
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw: str) -> None:
+            pass
+
+    gw = SpeakerGateway(AppConfig(), on_query=fake_query)
+
+    async def run() -> None:
+        await gw._process_local_utterance(FakeConn(), "嗯。")
+        await gw._process_local_utterance(FakeConn(), "读在。")
+        await gw._process_local_utterance(FakeConn(), "我有未读邮件吗？")
+
+    asyncio.run(run())
+    assert called == ["我有未读邮件吗？"]
+
+
 def test_start_recording_uses_larger_oh2p_alsa_buffer() -> None:
     import asyncio
     from xiao_speaker_assistant.config import AppConfig
