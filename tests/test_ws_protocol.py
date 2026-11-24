@@ -82,21 +82,26 @@ def test_does_not_suppress_own_tts_while_speaking() -> None:
     class FakeConn:
         remote_address = ("127.0.0.1", 9999)
 
-        async def send(self, raw: str) -> None:
-            sent.append(json.loads(raw))
+        async def send(self, raw) -> None:
+            if isinstance(raw, str):
+                sent.append(json.loads(raw))
 
     async def dummy(q: str) -> str:
         return q
 
-    gw = SpeakerGateway(AppConfig(), on_query=dummy)
+    cfg = AppConfig()
+    cfg.speech.asr_provider = "xiaoai_asr"
+    gw = SpeakerGateway(cfg, on_query=dummy)
+    conn = FakeConn()
     gw._mute_native_until = time.monotonic() + 10.0
-    gw._speaking_own_tts = True
+    pb = gw._get_playback(conn)
     line = json.dumps({"header": {"namespace": "SpeechSynthesizer", "name": "Speak"}})
     event = json.dumps({"Event": {"id": "evt-3", "event": "instruction", "data": {"NewLine": line}}})
 
     async def run() -> None:
-        await gw._handle_text_message(FakeConn(), event)
-        await asyncio.sleep(0.01)
+        async with pb._lock:
+            await gw._handle_text_message(conn, event)
+            await asyncio.sleep(0.01)
 
     asyncio.run(run())
     assert sent == []
@@ -140,8 +145,9 @@ def test_yields_to_native_xiaoai_without_killing_playback() -> None:
     class FakeConn:
         remote_address = ("127.0.0.1", 9999)
 
-        async def send(self, raw: str) -> None:
-            sent.append(json.loads(raw))
+        async def send(self, raw) -> None:
+            if isinstance(raw, str):
+                sent.append(json.loads(raw))
 
     async def dummy(q: str) -> str:
         return q
@@ -152,11 +158,28 @@ def test_yields_to_native_xiaoai_without_killing_playback() -> None:
     fake_pipeline.awake = True
     gw._pipeline = fake_pipeline
 
-    line = json.dumps({"header": {"namespace": "SpeechRecognizer", "name": "RecognizeResult"}})
-    event = json.dumps({"Event": {"id": "evt-4", "event": "instruction", "data": {"NewLine": line}}})
+    # Non-XiaoAI RecognizeResult ("你好管家") or StopCapture must NOT yield/kill Nomi!
+    non_xiaoai_line = json.dumps(
+        {
+            "header": {"namespace": "SpeechRecognizer", "name": "RecognizeResult"},
+            "payload": {"results": [{"text": "你好管家"}]},
+        }
+    )
+    non_xiaoai_evt = json.dumps(
+        {"Event": {"id": "evt-4a", "event": "instruction", "data": {"NewLine": non_xiaoai_line}}}
+    )
+    # Explicit SpeechWakeup.Wakeup or "小爱..." DOES yield to native XiaoAI.
+    xiaoai_line = json.dumps({"header": {"namespace": "SpeechWakeup", "name": "Wakeup"}})
+    xiaoai_evt = json.dumps(
+        {"Event": {"id": "evt-4b", "event": "instruction", "data": {"NewLine": xiaoai_line}}}
+    )
 
     async def run() -> None:
-        await gw._handle_text_message(FakeConn(), event)
+        await gw._handle_text_message(FakeConn(), non_xiaoai_evt)
+        assert reset_called == []
+        fake_pipeline.set_awake.assert_not_called()
+
+        await gw._handle_text_message(FakeConn(), xiaoai_evt)
 
     asyncio.run(run())
     fake_pipeline.set_awake.assert_called_once_with(False)

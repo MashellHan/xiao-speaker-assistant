@@ -9,13 +9,18 @@ def test_default_config_targets_oh2p_opencode_and_outlook() -> None:
     assert cfg.tools.outlook.require_voice_confirmation_for_send is True
 
 
-def test_load_config_falls_back_to_example(tmp_path, monkeypatch) -> None:
+def test_load_config_ignores_example_and_uses_code_defaults(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.example.yaml").write_text(
         "llm:\n  default_provider: codex\n", encoding="utf-8"
     )
     cfg = load_config()
-    assert cfg.llm.default_provider == "codex"
+    assert cfg.llm.default_provider == "opencode"
+
+    custom = tmp_path / "custom.yaml"
+    custom.write_text("llm:\n  default_provider: codex\n", encoding="utf-8")
+    cfg2 = load_config(custom)
+    assert cfg2.llm.default_provider == "codex"
 
 
 def test_format_for_speech_strips_markdown_and_urls() -> None:

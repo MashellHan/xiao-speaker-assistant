@@ -1,4 +1,4 @@
-"""WebSocket server (:4399) speaking open-xiaoai protocol with streaming sentence TTS."""
+"""WebSocket server (:4399) speaking open-xiaoai protocol with PlaybackController & clean arbitration."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
-import shlex
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -22,6 +21,7 @@ from xiao_speaker_assistant.voice.audio_pipeline import (
     extract_record_pcm_from_binary,
     match_wakeup_phrase,
 )
+from xiao_speaker_assistant.voice.playback import PlaybackController
 
 logger = logging.getLogger(__name__)
 QueryHandler = Callable[[str], Awaitable[str]]
@@ -69,34 +69,38 @@ class SpeakerGateway:
         self._query_lock = asyncio.Lock()
         self._mute_native_until: float = 0.0
         self._pipeline: LocalSpeechPipeline | None = None
-        self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_rpc: dict[Any, dict[str, asyncio.Future[dict[str, Any]]]] = {}
+        self._playbacks: dict[Any, PlaybackController] = {}
         self._asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xsa-asr")
         self._last_audio_at: float = 0.0
         self._active_reply_task: asyncio.Task[None] | None = None
         self._interrupted: bool = False
-        self._speaking_own_tts: bool = False
 
-    async def _audio_watchdog(self, conn: ServerConnection) -> None:
-        while True:
-            await asyncio.sleep(3.0)
+    def _get_playback(self, conn: ServerConnection) -> PlaybackController:
+        pb = self._playbacks.get(conn)
+        if pb is not None:
+            return pb
+
+        def on_state(playing: bool) -> None:
             if self._pipeline is None:
                 return
-            if (time.monotonic() - self._last_audio_at) > 4.0:
-                logger.warning("Audio stream stalled >4s; restarting speaker recording")
-                bits = self._config.speech.capture_bits_per_sample
-                await self.send_command(
-                    conn,
-                    "start_recording",
-                    {
-                        "pcm": "noop",
-                        "channels": 1,
-                        "bits_per_sample": bits,
-                        "sample_rate": 16000,
-                        "period_size": 360,
-                        "buffer_size": 1440,
-                    },
-                )
-                self._last_audio_at = time.monotonic()
+            if playing:
+                self._pipeline.set_muted(True)
+            else:
+                self._pipeline.mute_for(0.25)
+                self._pipeline.set_muted(False)
+
+        pb = PlaybackController(
+            self._config.speaker,
+            send_text=lambda text: conn.send(text),
+            send_binary=lambda data: conn.send(data),
+            run_shell=lambda script, wait, timeout: self.run_shell(
+                conn, script, wait_response=wait, timeout=timeout
+            ),
+            on_playback_state=on_state,
+        )
+        self._playbacks[conn] = pb
+        return pb
 
     async def send_command(
         self,
@@ -108,10 +112,11 @@ class SpeakerGateway:
         timeout: float = 20.0,
     ) -> dict[str, Any] | None:
         req_id = str(uuid.uuid4())
+        conn_rpcs = self._pending_rpc.setdefault(conn, {})
         fut: asyncio.Future[dict[str, Any]] | None = None
         if wait_response:
             fut = asyncio.get_running_loop().create_future()
-            self._pending_rpc[req_id] = fut
+            conn_rpcs[req_id] = fut
 
         cmd = {
             "Request": {
@@ -128,7 +133,7 @@ class SpeakerGateway:
         except asyncio.TimeoutError:
             return None
         finally:
-            self._pending_rpc.pop(req_id, None)
+            conn_rpcs.pop(req_id, None)
 
     async def run_shell(
         self, conn: ServerConnection, script: str, *, wait_response: bool = False, timeout: float = 25.0
@@ -140,8 +145,14 @@ class SpeakerGateway:
     async def stop_native_audio(self, conn: ServerConnection) -> None:
         await self.run_shell(
             conn,
-            "killall miplayer tts_play.sh >/dev/null 2>&1 || true; mphelper pause >/dev/null 2>&1 || true",
+            "ubus -t 2 call mediaplayer player_wakeup '{\"action\":\"stop\"}' >/dev/null 2>&1 || true; "
+            "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
+            "mphelper pause >/dev/null 2>&1 || true",
         )
+
+    async def play_wakeup_chime(self, conn: ServerConnection) -> None:
+        pb = self._get_playback(conn)
+        await pb.play_chime()
 
     async def speak_sentence(
         self,
@@ -151,51 +162,37 @@ class SpeakerGateway:
         interrupt: bool = True,
         wait_response: bool = True,
     ) -> None:
-        self._speaking_own_tts = True
-        if self._pipeline is not None:
-            self._pipeline.set_muted(True)
-        quoted = shlex.quote(text)
-        prefix = (
-            "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
-            "mphelper pause >/dev/null 2>&1 || true; "
-            if interrupt
-            else ""
-        )
-        script = f"{prefix}/usr/sbin/tts_play.sh {quoted}"
-        try:
-            await self.run_shell(conn, script, wait_response=wait_response, timeout=25.0)
-        finally:
-            self._speaking_own_tts = False
-            if self._pipeline is not None:
-                self._pipeline.mute_for(0.4)
-                self._pipeline.set_muted(False)
-
-    async def play_wakeup_chime(self, conn: ServerConnection) -> None:
-        self._speaking_own_tts = True
-        if self._pipeline is not None:
-            self._pipeline.set_muted(True)
-        script = (
-            "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
-            "mphelper pause >/dev/null 2>&1 || true; "
-            "if [ -f /usr/share/sound-vendor/XiaoMi/wakeup_wozai.wav ]; then "
-            "miplayer -f /usr/share/sound-vendor/XiaoMi/wakeup_wozai.wav >/dev/null 2>&1; "
-            "elif [ -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav ]; then "
-            "miplayer -f /usr/share/sound-vendor/XiaoMi/wakeup_zai_01.wav >/dev/null 2>&1; "
-            "else /usr/sbin/tts_play.sh '我在'; fi"
-        )
-        try:
-            await self.run_shell(conn, script, wait_response=True, timeout=6.0)
-        finally:
-            self._speaking_own_tts = False
-            if self._pipeline is not None:
-                self._pipeline.mute_for(0.25)
-                self._pipeline.set_muted(False)
+        pb = self._get_playback(conn)
+        await pb.speak(text, interrupt_native=interrupt)
 
     async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
 
     async def send_tts(self, conn: ServerConnection, text: str) -> None:
         await self.abort_and_speak(conn, text)
+
+    async def _audio_watchdog(self, conn: ServerConnection) -> None:
+        while True:
+            await asyncio.sleep(3.0)
+            if self._pipeline is None:
+                return
+            if (time.monotonic() - self._last_audio_at) > 4.0:
+                logger.warning("Audio stream stalled >4s; restarting speaker recording")
+                bits = self._config.speech.capture_bits_per_sample
+                ch = self._config.speech.capture_channels
+                await self.send_command(
+                    conn,
+                    "start_recording",
+                    {
+                        "pcm": "noop",
+                        "channels": ch,
+                        "bits_per_sample": bits,
+                        "sample_rate": 16000,
+                        "period_size": 1600,
+                        "buffer_size": 3200,
+                    },
+                )
+                self._last_audio_at = time.monotonic()
 
     async def _handle_connection(self, conn: ServerConnection) -> None:
         expected_token = read_env_secret(self._config.speaker.auth_token_env)
@@ -206,11 +203,16 @@ class SpeakerGateway:
                 return
 
         self._connections.add(conn)
+        self._pending_rpc.setdefault(conn, {})
+        self._get_playback(conn)
         logger.info("Speaker connected from %s", conn.remote_address)
+
         if self._pipeline is not None:
             bits = self._config.speech.capture_bits_per_sample
+            ch = self._config.speech.capture_channels
             logger.info(
-                "Starting speaker audio stream (%d-bit) for local KWS (`%s`) + %s",
+                "Starting speaker audio stream (%dch, %d-bit) for local KWS (`%s`) + %s",
+                ch,
                 bits,
                 ", ".join(self._config.speech.local_keywords),
                 self._config.speech.asr_model,
@@ -220,15 +222,15 @@ class SpeakerGateway:
                 "start_recording",
                 {
                     "pcm": "noop",
-                    "channels": 1,
+                    "channels": ch,
                     "bits_per_sample": bits,
                     "sample_rate": 16000,
-                    "period_size": 360,
-                    "buffer_size": 1440,
+                    "period_size": 1600,
+                    "buffer_size": 3200,
                 },
             )
             self._last_audio_at = time.monotonic()
-            watchdog_task = asyncio.create_task(self._audio_watchdog(conn))
+            watchdog_task: asyncio.Task[None] | None = asyncio.create_task(self._audio_watchdog(conn))
         else:
             watchdog_task = None
 
@@ -244,10 +246,11 @@ class SpeakerGateway:
             if watchdog_task is not None:
                 watchdog_task.cancel()
             self._connections.discard(conn)
-            for fut in self._pending_rpc.values():
+            self._playbacks.pop(conn, None)
+            conn_rpcs = self._pending_rpc.pop(conn, {})
+            for fut in conn_rpcs.values():
                 if not fut.done():
                     fut.cancel()
-            self._pending_rpc.clear()
             logger.info("Speaker disconnected")
 
     async def _handle_binary_message(self, conn: ServerConnection, raw: bytes) -> None:
@@ -261,9 +264,8 @@ class SpeakerGateway:
 
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
-            loop.call_soon_threadsafe(
-                lambda: loop.create_task(self.play_wakeup_chime(conn))
-            )
+            self._mute_native_until = time.monotonic() + 8.0
+            loop.call_soon_threadsafe(lambda: loop.create_task(self.play_wakeup_chime(conn)))
 
         def on_utterance(text: str) -> None:
             logger.info("Local ASR recognized: %s", text)
@@ -295,10 +297,14 @@ class SpeakerGateway:
         self._interrupted = True
         if self._active_reply_task is not None and not self._active_reply_task.done():
             self._active_reply_task.cancel()
-        for fut in self._pending_rpc.values():
+        for fut in self._pending_rpc.get(conn, {}).values():
             if not fut.done():
                 fut.cancel()
-        await self.stop_native_audio(conn)
+        pb = self._playbacks.get(conn)
+        if pb is not None:
+            await pb.stop_playback(stop_native=True)
+        else:
+            await self.stop_native_audio(conn)
         if self._pipeline is not None:
             self._pipeline.set_awake(False)
             self._pipeline.set_muted(False)
@@ -306,14 +312,18 @@ class SpeakerGateway:
         if self._on_session_reset is not None:
             self._on_session_reset()
 
-    async def _yield_to_native_xiaoai(self) -> None:
+    async def _yield_to_native_xiaoai(self, conn: ServerConnection) -> None:
         logger.info("Native XiaoAI activated; yielding control cleanly to avoid crosstalk")
         self._interrupted = True
         if self._active_reply_task is not None and not self._active_reply_task.done():
             self._active_reply_task.cancel()
-        for fut in self._pending_rpc.values():
+        for fut in self._pending_rpc.get(conn, {}).values():
             if not fut.done():
                 fut.cancel()
+        pb = self._playbacks.get(conn)
+        if pb is not None:
+            # Stop only our Stream("play") audio, never kill native XiaoAI's playback.
+            await pb.stop_playback(stop_native=False)
         if self._pipeline is not None:
             self._pipeline.set_awake(False)
             self._pipeline.set_muted(False)
@@ -336,11 +346,12 @@ class SpeakerGateway:
         if matched:
             _, rest = matched
             if not rest:
-                await self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
+                await self.play_wakeup_chime(conn)
                 if self._pipeline is not None:
                     self._pipeline.refresh_activity()
                 return
             text = rest
+        self._mute_native_until = time.monotonic() + 10.0
         await self._run_query_and_speak(conn, text)
 
     async def _handle_text_message(self, conn: ServerConnection, raw: str) -> None:
@@ -354,22 +365,31 @@ class SpeakerGateway:
             resp = msg["Response"]
             if isinstance(resp, dict):
                 req_id = resp.get("id")
-                fut = self._pending_rpc.get(req_id) if isinstance(req_id, str) else None
+                fut = self._pending_rpc.get(conn, {}).get(req_id) if isinstance(req_id, str) else None
                 if fut is not None and not fut.done():
                     fut.set_result(resp)
             logger.debug("Speaker command response: %s", resp)
             return
 
         if self._pipeline is not None:
-            if self._is_native_speech_recognizer_event(msg) and (
-                self._pipeline.awake
-                or (self._active_reply_task is not None and not self._active_reply_task.done())
-            ):
-                await self._yield_to_native_xiaoai()
+            pb = self._playbacks.get(conn)
+            is_nomi_active = self._pipeline.awake or (
+                self._active_reply_task is not None and not self._active_reply_task.done()
+            ) or (pb is not None and pb.is_playing)
+
+            if self._is_explicit_native_xiaoai_wakeup(msg) and is_nomi_active:
+                await self._yield_to_native_xiaoai(conn)
+                return
+
+            if is_nomi_active and self._is_native_speak_event(msg):
+                logger.info("Suppressing stray native XiaoAI Speak event while Nomi is active")
+                asyncio.create_task(self.stop_native_audio(conn))
+                return
             return
 
+        pb = self._playbacks.get(conn)
         if (
-            not self._speaking_own_tts
+            (pb is None or not pb.is_playing)
             and time.monotonic() < self._mute_native_until
             and self._is_native_speak_event(msg)
         ):
@@ -411,40 +431,52 @@ class SpeakerGateway:
         return False
 
     @staticmethod
-    def _is_native_speech_recognizer_event(msg: dict[str, Any]) -> bool:
+    def _parse_instruction_log(msg: dict[str, Any]) -> dict[str, Any] | None:
         evt = msg.get("Event")
         if not isinstance(evt, dict) or evt.get("event") != "instruction":
-            return False
+            return None
         data = evt.get("data")
         if not isinstance(data, dict):
-            return False
+            return None
         line = data.get("NewLine")
         if not isinstance(line, str):
-            return False
+            return None
         try:
-            log_msg = json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError:
-            return False
-        header = log_msg.get("header") or {}
-        return header.get("namespace") == "SpeechRecognizer"
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
-    @staticmethod
-    def _is_native_speak_event(msg: dict[str, Any]) -> bool:
-        evt = msg.get("Event")
-        if not isinstance(evt, dict) or evt.get("event") != "instruction":
-            return False
-        data = evt.get("data")
-        if not isinstance(data, dict):
-            return False
-        line = data.get("NewLine")
-        if not isinstance(line, str):
-            return False
-        try:
-            log_msg = json.loads(line)
-        except json.JSONDecodeError:
+    @classmethod
+    def _is_explicit_native_xiaoai_wakeup(cls, msg: dict[str, Any]) -> bool:
+        """True only on genuine XiaoAI wake events (never VoiceprintIdle/StopCapture/你好管家)."""
+        log_msg = cls._parse_instruction_log(msg)
+        if not log_msg:
             return False
         header = log_msg.get("header") or {}
-        return header.get("namespace") == "SpeechSynthesizer" and header.get("name") == "Speak"
+        ns = header.get("namespace")
+        name = header.get("name")
+        if ns == "SpeechWakeup" and name == "Wakeup":
+            return True
+        if ns == "SpeechRecognizer" and name == "RecognizeResult":
+            payload = log_msg.get("payload") or {}
+            for item in payload.get("results") or []:
+                if isinstance(item, dict):
+                    txt = (item.get("text") or "").strip()
+                    if txt.startswith("小爱"):
+                        return True
+        return False
+
+    @classmethod
+    def _is_native_speak_event(cls, msg: dict[str, Any]) -> bool:
+        log_msg = cls._parse_instruction_log(msg)
+        if not log_msg:
+            return False
+        header = log_msg.get("header") or {}
+        return header.get("namespace") == "SpeechSynthesizer" and header.get("name") in {
+            "Speak",
+            "SpeakStream",
+        }
 
     async def _process_utterance(self, conn: ServerConnection, text: str) -> None:
         if self.is_exit_command(text):
@@ -482,62 +514,38 @@ class SpeakerGateway:
                     await self._run_streaming_reply(conn, query)
                     return
                 assert self._on_query is not None
-                wait_notice_task: asyncio.Task[None] | None = None
-                try:
-                    async def delayed_notice() -> None:
-                        await asyncio.sleep(3.5)
-                        await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
-
-                    wait_notice_task = asyncio.create_task(delayed_notice())
-                    reply = await self._on_query(query)
-                    wait_notice_task.cancel()
-                    logger.info("LLM reply: %s", reply)
-                    self._mute_native_until = time.monotonic() + 6.0
-                    await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
-                except asyncio.CancelledError:
-                    if wait_notice_task:
-                        wait_notice_task.cancel()
-                    raise
-                except Exception as exc:
-                    if wait_notice_task:
-                        wait_notice_task.cancel()
-                    logger.exception("Error handling query %r", query)
-                    await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
-                finally:
-                    if self._pipeline is not None and not self._interrupted:
-                        self._pipeline.refresh_activity()
+                reply = await self._on_query(query)
+                logger.info("LLM reply: %s", reply)
+                self._mute_native_until = time.monotonic() + 8.0
+                await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
+            except asyncio.CancelledError:
+                logger.info("Reply task cancelled due to interrupt")
+                raise
+            except Exception as exc:
+                logger.exception("Error handling query %r", query)
+                await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
             finally:
+                if self._pipeline is not None and not self._interrupted:
+                    self._pipeline.refresh_activity()
                 if self._active_reply_task is task:
                     self._active_reply_task = None
 
     async def _run_streaming_reply(self, conn: ServerConnection, query: str) -> None:
         assert self._on_stream_query is not None
         queue: asyncio.Queue[str | None] = asyncio.Queue()
-        first_chunk_event = asyncio.Event()
 
         async def producer() -> None:
             try:
                 async for sentence in self._on_stream_query(query):
                     if sentence:
-                        first_chunk_event.set()
                         await queue.put(sentence)
             except Exception as exc:
                 logger.exception("Streaming error for %r", query)
-                first_chunk_event.set()
                 await queue.put(f"处理出错了：{exc}")
             finally:
                 await queue.put(None)
 
-        async def delayed_notice() -> None:
-            try:
-                await asyncio.wait_for(first_chunk_event.wait(), timeout=1.2)
-            except asyncio.TimeoutError:
-                if not self._interrupted:
-                    logger.info("Playing thinking notice: 好的，稍等。")
-                    await self.speak_sentence(conn, "好的，稍等。", interrupt=True, wait_response=True)
-
         prod_task = asyncio.create_task(producer())
-        notice_task = asyncio.create_task(delayed_notice())
         first_spoken = True
         try:
             while True:
@@ -547,14 +555,13 @@ class SpeakerGateway:
                 if sentence is None or self._interrupted:
                     break
                 logger.info("Streaming TTS sentence: %s", sentence)
-                self._mute_native_until = time.monotonic() + 6.0
+                self._mute_native_until = time.monotonic() + 8.0
                 await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
                 first_spoken = False
             await prod_task
         except asyncio.CancelledError:
             logger.info("Streaming reply cancelled due to barge-in")
         finally:
-            notice_task.cancel()
             if not prod_task.done():
                 prod_task.cancel()
             if self._pipeline is not None and not self._interrupted:

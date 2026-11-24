@@ -170,6 +170,8 @@ def test_relay_host_client_forwards_frames_to_speaker_gateway() -> None:
 
     async def scenario() -> None:
         config = AppConfig()
+        config.speaker.tts_provider = "xiaoai"
+        config.speech.asr_provider = "xiaoai_asr"
         gateway = SpeakerGateway(config, on_query=on_query)
 
         orig_binary_handler = gateway._handle_binary_message
