@@ -1,4 +1,4 @@
-"""WebSocket server (:4399) speaking the exact open-xiaoai Rust client protocol."""
+"""WebSocket server (:4399) speaking open-xiaoai protocol with streaming sentence TTS."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import logging
 import shlex
 import time
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -22,6 +23,7 @@ from xiao_speaker_assistant.voice.audio_pipeline import (
 
 logger = logging.getLogger(__name__)
 QueryHandler = Callable[[str], Awaitable[str]]
+StreamQueryHandler = Callable[[str], AsyncIterator[str]]
 
 IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
 EXIT_EXACT_WORDS = {
@@ -41,30 +43,63 @@ EXIT_PHRASES = ("退出对话", "结束对话", "停止对话", "退出模式", 
 
 
 class SpeakerGateway:
-    def __init__(self, config: AppConfig, on_query: QueryHandler) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        on_query: QueryHandler | None = None,
+        on_stream_query: StreamQueryHandler | None = None,
+    ) -> None:
+        if on_query is None and on_stream_query is None:
+            raise ValueError("Either on_query or on_stream_query must be provided")
         self._config = config
         self._on_query = on_query
+        self._on_stream_query = on_stream_query
         self._connections: set[ServerConnection] = set()
         self._seen_dialogs: set[str] = set()
         self._continuous_mode: bool = False
         self._query_lock = asyncio.Lock()
         self._mute_native_until: float = 0.0
         self._pipeline: LocalSpeechPipeline | None = None
+        self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     async def send_command(
-        self, conn: ServerConnection, command: str, payload: Any = None
-    ) -> None:
+        self,
+        conn: ServerConnection,
+        command: str,
+        payload: Any = None,
+        *,
+        wait_response: bool = False,
+        timeout: float = 20.0,
+    ) -> dict[str, Any] | None:
+        req_id = str(uuid.uuid4())
+        fut: asyncio.Future[dict[str, Any]] | None = None
+        if wait_response:
+            fut = asyncio.get_running_loop().create_future()
+            self._pending_rpc[req_id] = fut
+
         cmd = {
             "Request": {
-                "id": str(uuid.uuid4()),
+                "id": req_id,
                 "command": command,
                 "payload": payload,
             }
         }
         await conn.send(json.dumps(cmd, ensure_ascii=False))
+        if not wait_response or fut is None:
+            return None
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending_rpc.pop(req_id, None)
 
-    async def run_shell(self, conn: ServerConnection, script: str) -> None:
-        await self.send_command(conn, "run_shell", script)
+    async def run_shell(
+        self, conn: ServerConnection, script: str, *, wait_response: bool = False, timeout: float = 25.0
+    ) -> dict[str, Any] | None:
+        return await self.send_command(
+            conn, "run_shell", script, wait_response=wait_response, timeout=timeout
+        )
 
     async def stop_native_audio(self, conn: ServerConnection) -> None:
         await self.run_shell(
@@ -72,17 +107,33 @@ class SpeakerGateway:
             "killall miplayer tts_play.sh >/dev/null 2>&1 || true; mphelper pause >/dev/null 2>&1 || true",
         )
 
-    async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
+    async def speak_sentence(
+        self,
+        conn: ServerConnection,
+        text: str,
+        *,
+        interrupt: bool = True,
+        wait_response: bool = True,
+    ) -> None:
         if self._pipeline is not None:
-            # Avoid hearing our own TTS while playing.
-            self._pipeline.mute_for(max(2.0, min(18.0, len(text) * 0.22)))
+            self._pipeline.set_muted(True)
         quoted = shlex.quote(text)
-        script = (
+        prefix = (
             "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
             "mphelper pause >/dev/null 2>&1 || true; "
-            f"/usr/sbin/tts_play.sh {quoted}"
+            if interrupt
+            else ""
         )
-        await self.run_shell(conn, script)
+        script = f"{prefix}/usr/sbin/tts_play.sh {quoted}"
+        try:
+            await self.run_shell(conn, script, wait_response=wait_response, timeout=25.0)
+        finally:
+            if self._pipeline is not None:
+                self._pipeline.mute_for(0.4)
+                self._pipeline.set_muted(False)
+
+    async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
+        await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
 
     async def send_tts(self, conn: ServerConnection, text: str) -> None:
         await self.abort_and_speak(conn, text)
@@ -100,9 +151,10 @@ class SpeakerGateway:
         if self._pipeline is not None:
             bits = self._config.speech.capture_bits_per_sample
             logger.info(
-                "Starting speaker audio stream (%d-bit) for local KWS (`%s`) + SenseVoice",
+                "Starting speaker audio stream (%d-bit) for local KWS (`%s`) + %s",
                 bits,
                 ", ".join(self._config.speech.local_keywords),
+                self._config.speech.asr_model,
             )
             await self.send_command(
                 conn,
@@ -125,6 +177,10 @@ class SpeakerGateway:
                 await self._handle_text_message(conn, raw)
         finally:
             self._connections.discard(conn)
+            for fut in self._pending_rpc.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending_rpc.clear()
             logger.info("Speaker disconnected")
 
     async def _handle_binary_message(self, conn: ServerConnection, raw: bytes) -> None:
@@ -137,10 +193,10 @@ class SpeakerGateway:
 
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
-            loop.create_task(self.abort_and_speak(conn, "我在，请讲。"))
+            loop.create_task(self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True))
 
         def on_utterance(text: str) -> None:
-            logger.info("SenseVoice recognized: %s", text)
+            logger.info("Local ASR recognized: %s", text)
             loop.create_task(self._process_local_utterance(conn, text))
 
         def on_sleep() -> None:
@@ -157,13 +213,13 @@ class SpeakerGateway:
         if self.is_exit_command(text):
             if self._pipeline is not None:
                 self._pipeline.set_awake(False)
-            await self.abort_and_speak(conn, "好的，已退出对话。")
+            await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
             _, rest = matched
             if not rest:
-                await self.abort_and_speak(conn, "我在，请讲。")
+                await self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
                 if self._pipeline is not None:
                     self._pipeline.refresh_activity()
                 return
@@ -178,11 +234,16 @@ class SpeakerGateway:
             return
 
         if "Response" in msg:
-            logger.debug("Speaker command response: %s", msg["Response"])
+            resp = msg["Response"]
+            if isinstance(resp, dict):
+                req_id = resp.get("id")
+                fut = self._pending_rpc.get(req_id) if isinstance(req_id, str) else None
+                if fut is not None and not fut.done():
+                    fut.set_result(resp)
+            logger.debug("Speaker command response: %s", resp)
             return
 
         if self._pipeline is not None:
-            # In local SenseVoice mode, ignore native XiaoAI logs so `小爱同学` remains native.
             return
 
         if time.monotonic() < self._mute_native_until and self._is_native_speak_event(msg):
@@ -241,7 +302,7 @@ class SpeakerGateway:
         if self.is_exit_command(text):
             self._continuous_mode = False
             self._mute_native_until = time.monotonic() + 6.0
-            await self.abort_and_speak(conn, "好的，已退出对话。")
+            await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
 
         matched_kw = next((kw for kw in self._config.speech.wakeup_keywords if text.startswith(kw)), None)
@@ -256,34 +317,81 @@ class SpeakerGateway:
             query = text[len(matched_kw) :].lstrip(" ，,：:")
             if not query:
                 self._continuous_mode = True
-                await self.abort_and_speak(conn, "我在，请讲。")
+                await self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
                 return
 
         await self._run_query_and_speak(conn, query)
 
     async def _run_query_and_speak(self, conn: ServerConnection, query: str) -> None:
         async with self._query_lock:
+            if self._on_stream_query is not None:
+                await self._run_streaming_reply(conn, query)
+                return
+            assert self._on_query is not None
             wait_notice_task: asyncio.Task[None] | None = None
             try:
                 async def delayed_notice() -> None:
                     await asyncio.sleep(3.5)
-                    await self.abort_and_speak(conn, "正在思考，请稍等。")
+                    await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
 
                 wait_notice_task = asyncio.create_task(delayed_notice())
                 reply = await self._on_query(query)
                 wait_notice_task.cancel()
                 logger.info("LLM reply: %s", reply)
                 self._mute_native_until = time.monotonic() + 6.0
-                await self.abort_and_speak(conn, reply)
-                if self._pipeline is not None:
-                    self._pipeline.refresh_activity()
+                await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
             except Exception as exc:
                 if wait_notice_task:
                     wait_notice_task.cancel()
                 logger.exception("Error handling query %r", query)
-                await self.abort_and_speak(conn, f"处理出错了：{exc}")
+                await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+            finally:
                 if self._pipeline is not None:
                     self._pipeline.refresh_activity()
+
+    async def _run_streaming_reply(self, conn: ServerConnection, query: str) -> None:
+        assert self._on_stream_query is not None
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        first_chunk_event = asyncio.Event()
+
+        async def producer() -> None:
+            try:
+                async for sentence in self._on_stream_query(query):
+                    if sentence:
+                        first_chunk_event.set()
+                        await queue.put(sentence)
+            except Exception as exc:
+                logger.exception("Streaming error for %r", query)
+                first_chunk_event.set()
+                await queue.put(f"处理出错了：{exc}")
+            finally:
+                await queue.put(None)
+
+        async def delayed_notice() -> None:
+            try:
+                await asyncio.wait_for(first_chunk_event.wait(), timeout=3.5)
+            except asyncio.TimeoutError:
+                await self.speak_sentence(conn, "正在思考，请稍等。", interrupt=True, wait_response=True)
+
+        prod_task = asyncio.create_task(producer())
+        notice_task = asyncio.create_task(delayed_notice())
+        first_spoken = True
+        try:
+            while True:
+                sentence = await queue.get()
+                if sentence is None:
+                    break
+                logger.info("Streaming TTS sentence: %s", sentence)
+                self._mute_native_until = time.monotonic() + 6.0
+                await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
+                first_spoken = False
+            await prod_task
+        finally:
+            notice_task.cancel()
+            if not prod_task.done():
+                prod_task.cancel()
+            if self._pipeline is not None:
+                self._pipeline.refresh_activity()
 
     @staticmethod
     def _extract_final_asr(msg: dict[str, Any]) -> tuple[str, str] | None:
@@ -322,7 +430,7 @@ class SpeakerGateway:
 
     async def serve_forever(self) -> None:
         if self._config.speech.asr_provider == "sense_voice":
-            logger.info("Loading local KWS + VAD + SenseVoice models...")
+            logger.info("Loading local KWS + VAD + %s models...", self._config.speech.asr_model)
             self._pipeline = LocalSpeechPipeline(self._config.speech)
             logger.info("Local speech pipeline ready!")
 

@@ -155,8 +155,15 @@ class LocalSpeechPipeline:
         self.awake: bool = False
         self._last_active_at: float = 0.0
         self._muted_until: float = 0.0
+        self._explicit_muted: bool = False
         self._vad_buffer = np.zeros(0, dtype=np.float32)
         self._logged_first_audio = False
+
+    def set_muted(self, muted: bool) -> None:
+        self._explicit_muted = muted
+        if not muted:
+            self._vad.reset()
+            self._vad_buffer = np.zeros(0, dtype=np.float32)
 
     def mute_for(self, seconds: float) -> None:
         self._muted_until = max(self._muted_until, time.monotonic() + seconds)
@@ -181,7 +188,7 @@ class LocalSpeechPipeline:
         on_sleep: Callable[[], None] | None = None,
     ) -> None:
         now = time.monotonic()
-        if now < self._muted_until:
+        if self._explicit_muted or now < self._muted_until:
             return
 
         if self.awake and (now - self._last_active_at) > self._config.conversation_timeout_sec:
