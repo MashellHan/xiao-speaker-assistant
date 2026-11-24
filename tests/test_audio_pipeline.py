@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from xiao_speaker_assistant.voice.audio_pipeline import (
+    DynamicAGC,
     apply_highpass_filter,
     extract_record_pcm_from_binary,
     match_wakeup_phrase,
@@ -68,6 +69,28 @@ def test_apply_highpass_filter_removes_dc_offset() -> None:
     dc = np.full(1600, 0.25, dtype=np.float32)
     filtered, _, _ = apply_highpass_filter(dc)
     assert abs(float(filtered[-1])) < 1e-4
+
+
+def test_dynamic_agc_boosts_quiet_speech_without_clipping_loud_speech() -> None:
+    agc = DynamicAGC(target_rms=0.10, min_gain=2.0, max_gain=48.0, noise_floor_rms=0.0012)
+
+    # Quiet room noise stays very low
+    quiet = np.full(480, 0.0004, dtype=np.float32)
+    out_quiet = agc.process(quiet)
+    assert float(np.max(np.abs(out_quiet))) < 0.005
+
+    # Soft speech (rms ~ 0.005) gets boosted cleanly toward ~0.08-0.12
+    t = np.linspace(0, 1, 480, dtype=np.float32)
+    soft_speech = 0.007 * np.sin(2 * np.pi * 10 * t)
+    for _ in range(15):
+        out_soft = agc.process(soft_speech)
+    soft_rms = float(np.sqrt(np.mean(out_soft * out_soft)))
+    assert 0.06 <= soft_rms <= 0.14
+
+    # Loud speech never hard-clips beyond 1.0
+    loud_speech = 0.35 * np.sin(2 * np.pi * 10 * t)
+    out_loud = agc.process(loud_speech)
+    assert float(np.max(np.abs(out_loud))) < 1.0
     assert match_wakeup_phrase("Hi, Normi.") == ("hi nomi", "")
     assert match_wakeup_phrase("Hi, knowmi. Tell me a joke.") == ("hi nomi", "Tell me a joke")
     assert match_wakeup_phrase("Hi Nomi，帮我查一下邮件") == ("hi nomi", "帮我查一下邮件")

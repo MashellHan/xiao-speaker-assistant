@@ -23,7 +23,9 @@ speech:
   asr_model: sense_voice # sense_voice | paraformer
   asr_language: zh # zh stops ja/ko hallucinations while preserving English code-switching
   capture_bits_per_sample: 16
-  input_gain: 4.0
+  agc_enabled: true
+  agc_target_rms: 0.10
+  agc_max_gain: 48.0
   models_dir: models
   vad_min_silence_ms: 700
 

@@ -31,9 +31,12 @@ class SpeechConfig(BaseModel):
     s32_shift: int = 16
     kws_score: float = 2.5
     kws_threshold: float = 0.15
-    vad_threshold: float = 0.2
+    vad_threshold: float = 0.15
     vad_min_silence_ms: int = 500
-    input_gain: float = 4.0
+    input_gain: float = 1.0
+    agc_enabled: bool = True
+    agc_target_rms: float = 0.10
+    agc_max_gain: float = 48.0
     conversation_timeout_sec: float = 25.0
 
 
