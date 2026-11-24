@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
@@ -14,6 +15,7 @@ from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import HttpMcpClient, OutlookClient, PendingEmailDraft
 from xiao_speaker_assistant.voice import SpeakerGateway
+from xiao_speaker_assistant.voice.models_setup import download_models
 
 
 def build_tool_registry(config: AppConfig) -> tuple[list[ToolDefinition], dict[str, Any]]:
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Check config and local CLI backends")
     sub.add_parser("outlook-login", help="Sign in to Outlook using device code + private file cache")
+    sub.add_parser("download-models", help="Download VAD + KWS + SenseVoice models for `Hi Nomi` wakeup")
 
     ask_p = sub.add_parser("ask", help="Test a single question via opencode or codex CLI")
     ask_p.add_argument("prompt", help="Question text")
@@ -130,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     serve_p = sub.add_parser("serve", help="Run the speaker WebSocket gateway")
     serve_p.add_argument("--host", help="Override WebSocket listen host")
     serve_p.add_argument("--port", type=int, help="Override WebSocket listen port")
+    serve_p.add_argument(
+        "--asr",
+        choices=["sense_voice", "xiaoai_asr"],
+        help="Override speech recognition backend (`sense_voice` enables `Hi Nomi` local wakeup)",
+    )
     serve_p.add_argument(
         "--provider",
         choices=["opencode", "codex", "codex_api", "gemini_api"],
@@ -146,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
         OutlookClient(config.tools.outlook).login_device_flow()
         print("OK: Outlook token saved to private file cache.")
         return 0
+    if args.command == "download-models":
+        download_models(Path(config.speech.models_dir).expanduser(), config.speech.local_keywords)
+        return 0
     if args.command == "ask":
         router = LLMRouter(config.llm)
         reply = asyncio.run(router.ask(args.prompt, provider=args.provider))
@@ -156,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             config.speaker.ws_host = args.host
         if args.port:
             config.speaker.ws_port = args.port
+        if args.asr:
+            config.speech.asr_provider = args.asr
         router = LLMRouter(config.llm)
         tools, clients = build_tool_registry(config)
 

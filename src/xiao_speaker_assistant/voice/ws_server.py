@@ -14,6 +14,10 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
+from xiao_speaker_assistant.voice.audio_pipeline import (
+    LocalSpeechPipeline,
+    extract_record_pcm_from_binary,
+)
 
 logger = logging.getLogger(__name__)
 QueryHandler = Callable[[str], Awaitable[str]]
@@ -44,16 +48,22 @@ class SpeakerGateway:
         self._continuous_mode: bool = False
         self._query_lock = asyncio.Lock()
         self._mute_native_until: float = 0.0
+        self._pipeline: LocalSpeechPipeline | None = None
 
-    async def run_shell(self, conn: ServerConnection, script: str) -> None:
+    async def send_command(
+        self, conn: ServerConnection, command: str, payload: Any = None
+    ) -> None:
         cmd = {
             "Request": {
                 "id": str(uuid.uuid4()),
-                "command": "run_shell",
-                "payload": script,
+                "command": command,
+                "payload": payload,
             }
         }
         await conn.send(json.dumps(cmd, ensure_ascii=False))
+
+    async def run_shell(self, conn: ServerConnection, script: str) -> None:
+        await self.send_command(conn, "run_shell", script)
 
     async def stop_native_audio(self, conn: ServerConnection) -> None:
         await self.run_shell(
@@ -62,6 +72,9 @@ class SpeakerGateway:
         )
 
     async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
+        if self._pipeline is not None:
+            # Avoid hearing our own TTS while playing.
+            self._pipeline.mute_for(max(2.0, min(18.0, len(text) * 0.22)))
         quoted = shlex.quote(text)
         script = (
             "killall miplayer tts_play.sh >/dev/null 2>&1 || true; "
@@ -83,15 +96,53 @@ class SpeakerGateway:
 
         self._connections.add(conn)
         logger.info("Speaker connected from %s", conn.remote_address)
+        if self._pipeline is not None:
+            logger.info("Starting speaker audio stream for local KWS (`%s`) + SenseVoice", ", ".join(self._config.speech.local_keywords))
+            await self.send_command(conn, "start_recording", None)
+
         try:
             async for raw in conn:
                 if isinstance(raw, bytes):
-                    # Binary Stream frames from open-xiaoai-client (for local VAD/KWS/ASR).
+                    await self._handle_binary_message(conn, raw)
                     continue
                 await self._handle_text_message(conn, raw)
         finally:
             self._connections.discard(conn)
             logger.info("Speaker disconnected")
+
+    async def _handle_binary_message(self, conn: ServerConnection, raw: bytes) -> None:
+        if self._pipeline is None:
+            return
+        pcm = extract_record_pcm_from_binary(raw)
+        if not pcm:
+            return
+        loop = asyncio.get_running_loop()
+
+        def on_wakeup(keyword: str) -> None:
+            logger.info("Local wake word detected: %s", keyword)
+            loop.create_task(self.abort_and_speak(conn, "我在，请讲。"))
+
+        def on_utterance(text: str) -> None:
+            logger.info("SenseVoice recognized: %s", text)
+            loop.create_task(self._process_local_utterance(conn, text))
+
+        def on_sleep() -> None:
+            loop.create_task(self.abort_and_speak(conn, "超时未说话，有需要再叫我。"))
+
+        self._pipeline.feed_pcm(
+            pcm,
+            on_wakeup=on_wakeup,
+            on_utterance=on_utterance,
+            on_sleep=on_sleep,
+        )
+
+    async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
+        if self.is_exit_command(text):
+            if self._pipeline is not None:
+                self._pipeline.set_awake(False)
+            await self.abort_and_speak(conn, "好的，已退出对话。")
+            return
+        await self._run_query_and_speak(conn, text)
 
     async def _handle_text_message(self, conn: ServerConnection, raw: str) -> None:
         try:
@@ -102,6 +153,10 @@ class SpeakerGateway:
 
         if "Response" in msg:
             logger.debug("Speaker command response: %s", msg["Response"])
+            return
+
+        if self._pipeline is not None:
+            # In local SenseVoice mode, ignore native XiaoAI logs so `小爱同学` remains native.
             return
 
         if time.monotonic() < self._mute_native_until and self._is_native_speak_event(msg):
@@ -178,6 +233,9 @@ class SpeakerGateway:
                 await self.abort_and_speak(conn, "我在，请讲。")
                 return
 
+        await self._run_query_and_speak(conn, query)
+
+    async def _run_query_and_speak(self, conn: ServerConnection, query: str) -> None:
         async with self._query_lock:
             wait_notice_task: asyncio.Task[None] | None = None
             try:
@@ -233,6 +291,11 @@ class SpeakerGateway:
         return None
 
     async def serve_forever(self) -> None:
+        if self._config.speech.asr_provider == "sense_voice":
+            logger.info("Loading local KWS + VAD + SenseVoice models...")
+            self._pipeline = LocalSpeechPipeline(self._config.speech)
+            logger.info("Local speech pipeline ready!")
+
         host = self._config.speaker.ws_host
         port = self._config.speaker.ws_port
         logger.info("Listening for speaker WebSocket on ws://%s:%s", host, port)
