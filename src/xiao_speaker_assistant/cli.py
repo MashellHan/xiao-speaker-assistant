@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import secrets
 import shutil
 import stat
 import subprocess
@@ -214,6 +215,7 @@ def cmd_doctor(config: AppConfig) -> int:
 
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     confirmations = ConfirmationStore()
+    mcp_token = secrets.token_urlsafe(24)
     mcp_server = McpServer(
         config,
         confirmation_store=confirmations,
@@ -222,13 +224,14 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     mcp_runner, mcp_port = await mcp_server.start_http_server(
         host="127.0.0.1",
         port=config.tools.mcp_http_port,
+        auth_token=mcp_token,
     )
     mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
-    router = LLMRouter(config.llm, mcp_url=mcp_url)
+    router = LLMRouter(config.llm, mcp_url=mcp_url, mcp_auth_token=mcp_token)
     effective_provider = args.provider or config.llm.default_provider
     if effective_provider == "opencode":
-        await router.start(mcp_url=mcp_url)
+        await router.start(mcp_url=mcp_url, mcp_auth_token=mcp_token)
 
     tools, clients = build_tool_registry(config, confirmation_store=confirmations)
     outlook_client = clients.get("outlook") or OutlookClient(config.tools.outlook)
@@ -360,11 +363,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "ask":
         async def _ask_once() -> str:
+            effective = args.provider or config.llm.default_provider
             router = LLMRouter(config.llm)
+            mcp_runner = None
             try:
+                if (
+                    effective == "opencode"
+                    and config.llm.providers.opencode.server_url.strip()
+                    and not await router.is_opencode_server_healthy()
+                ):
+                    mcp_token = secrets.token_urlsafe(24)
+                    mcp_srv = McpServer(config, include_local_tools=True)
+                    mcp_runner, mcp_port = await mcp_srv.start_http_server(
+                        host="127.0.0.1",
+                        port=0,
+                        auth_token=mcp_token,
+                    )
+                    await router.start(
+                        mcp_url=f"http://127.0.0.1:{mcp_port}/mcp",
+                        mcp_auth_token=mcp_token,
+                    )
                 return await router.ask(args.prompt, provider=args.provider)
             finally:
                 await router.close()
+                if mcp_runner is not None:
+                    await mcp_runner.cleanup()
 
         print(asyncio.run(_ask_once()))
         return 0

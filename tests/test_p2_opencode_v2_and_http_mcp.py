@@ -15,8 +15,10 @@ from xiao_speaker_assistant.config import (
     ToolsConfig,
 )
 from xiao_speaker_assistant.llm.opencode_server import (
+    OpenCodeServerManager,
     build_opencode_v2_config,
     ensure_agent_home,
+    load_or_create_server_password,
     parse_model_ref,
 )
 from xiao_speaker_assistant.llm.router import LLMRouter
@@ -44,12 +46,16 @@ def test_parse_model_ref_and_ensure_agent_home(tmp_path: Path) -> None:
         cfg,
         mcp_url="http://127.0.0.1:4397/mcp",
         system_prompt="你是语音助手 Nomi",
+        mcp_auth_token="secret-mcp-tok",
     )
     assert home.is_dir()
     written = json.loads((home / "opencode.jsonc").read_text(encoding="utf-8"))
     assert written["default_agent"] == "nomi"
     assert written["snapshots"] is False
     assert written["mcp"]["servers"]["xsa_tools"]["url"] == "http://127.0.0.1:4397/mcp"
+    assert written["mcp"]["servers"]["xsa_tools"]["headers"] == {
+        "Authorization": "Bearer secret-mcp-tok"
+    }
     assert written["mcp"]["servers"]["xsa_tools"]["codemode"] is False
     assert written["mcp"]["servers"]["xsa_tools"]["oauth"] is False
     perms = {(p["action"], p["effect"]) for p in written["agents"]["nomi"]["permissions"]}
@@ -57,6 +63,11 @@ def test_parse_model_ref_and_ensure_agent_home(tmp_path: Path) -> None:
     assert ("shell", "deny") in perms
     assert ("edit", "deny") in perms
     assert ("write", "deny") in perms
+
+    pw1 = load_or_create_server_password(home, "XSA_TEST_UNSET_PW")
+    pw2 = load_or_create_server_password(home, "XSA_TEST_UNSET_PW")
+    assert pw1 == pw2 and len(pw1) >= 16
+    assert ((home / "server.token").stat().st_mode & 0o777) == 0o600
 
 
 def test_llm_router_opencode_v2_streams_sse_and_recovers_stale_session(tmp_path: Path) -> None:
@@ -207,14 +218,36 @@ def test_http_mcp_server_shares_confirmation_store_and_exposes_codex_and_disk(tm
             Path(self._out_path).write_text("代码结构清晰，未发现严重问题。", encoding="utf-8")
             return b"", b""
 
+    codex_cmds: list[list[str]] = []
+
     async def fake_codex_exec(*cmd, **kwargs):
+        codex_cmds.append(list(cmd))
         out_idx = list(cmd).index("-o") + 1
         return FakeCodexProc(cmd[out_idx])
 
     async def run() -> None:
-        runner, port = await server.start_http_server(host="127.0.0.1", port=0)
+        runner, port = await server.start_http_server(
+            host="127.0.0.1", port=0, auth_token="mcp-bearer-secret"
+        )
         try:
-            client = HttpMcpClient(f"http://127.0.0.1:{port}/mcp")
+            # Unauthenticated and cross-origin requests must be rejected
+            async with httpx.AsyncClient() as raw_http:
+                unauth = await raw_http.post(
+                    f"http://127.0.0.1:{port}/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                )
+                assert unauth.status_code == 401
+                csrf = await raw_http.post(
+                    f"http://127.0.0.1:{port}/mcp",
+                    headers={"Origin": "https://evil.example", "Authorization": "Bearer mcp-bearer-secret"},
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                )
+                assert csrf.status_code == 403
+
+            client = HttpMcpClient(
+                f"http://127.0.0.1:{port}/mcp",
+                auth_token="mcp-bearer-secret",
+            )
             tools = await client.list_tools()
             names = {t["name"] for t in tools}
             assert "outlook_prepare_email" in names
@@ -254,6 +287,7 @@ def test_http_mcp_server_shares_confirmation_store_and_exposes_codex_and_disk(tm
             codex_data = json.loads(codex_res["content"][0]["text"])
             assert codex_data["status"] == "ok"
             assert "代码结构清晰" in codex_data["analysis"]
+            assert "-s" in codex_cmds[0] and "read-only" in codex_cmds[0]
         finally:
             await runner.cleanup()
 

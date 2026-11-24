@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -592,6 +593,8 @@ class McpServer:
                 "exec",
                 "--skip-git-repo-check",
                 "--ephemeral",
+                "-s",
+                "read-only",
                 "-C",
                 str(workdir_path),
                 "-o",
@@ -635,11 +638,40 @@ class McpServer:
                 pass
 
     async def start_http_server(
-        self, host: str = "127.0.0.1", port: int = 4397
+        self,
+        host: str = "127.0.0.1",
+        port: int = 4397,
+        *,
+        auth_token: str | None = None,
     ) -> tuple[web.AppRunner, int]:
         """Start an in-process Streamable-HTTP MCP endpoint on `/mcp`."""
 
+        def _check_security(request: web.Request) -> web.Response | None:
+            # Reject any browser cross-origin / no-cors simple requests immediately.
+            if request.headers.get("Origin"):
+                return web.json_response(
+                    {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
+                    status=403,
+                )
+            if auth_token:
+                auth_header = request.headers.get("Authorization", "")
+                if not auth_header.startswith("Bearer "):
+                    return web.json_response(
+                        {"error": "unauthorized", "message": "Missing Bearer token"},
+                        status=401,
+                    )
+                supplied = auth_header[7:].strip()
+                if not hmac.compare_digest(supplied, auth_token):
+                    return web.json_response(
+                        {"error": "unauthorized", "message": "Invalid Bearer token"},
+                        status=401,
+                    )
+            return None
+
         async def handle_mcp_post(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
             try:
                 raw_body = await request.text()
                 message = json.loads(raw_body)
@@ -659,10 +691,16 @@ class McpServer:
                 return web.Response(status=202, headers=headers)
             return web.json_response(response, status=200, headers=headers)
 
-        async def handle_mcp_get(_request: web.Request) -> web.Response:
+        async def handle_mcp_get(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
             return web.Response(status=405, headers={"Allow": "POST, DELETE"})
 
         async def handle_mcp_delete(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
             session_id = request.headers.get("Mcp-Session-Id")
             if session_id:
                 self._http_sessions.discard(session_id)

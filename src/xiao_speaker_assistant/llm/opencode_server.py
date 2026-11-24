@@ -40,8 +40,19 @@ def build_opencode_v2_config(
     *,
     mcp_url: str,
     system_prompt: str,
+    mcp_auth_token: str | None = None,
 ) -> dict[str, Any]:
     """Generate isolated OpenCode V2 `opencode.jsonc` config for the `nomi` voice agent."""
+    mcp_entry: dict[str, Any] = {
+        "type": "remote",
+        "url": mcp_url,
+        "oauth": False,
+        "codemode": False,
+        "protocol": "legacy",
+    }
+    if mcp_auth_token:
+        mcp_entry["headers"] = {"Authorization": f"Bearer {mcp_auth_token}"}
+
     return {
         "$schema": "https://opencode.ai/config.json",
         "model": opencode_cfg.model,
@@ -66,13 +77,7 @@ def build_opencode_v2_config(
         },
         "mcp": {
             "servers": {
-                "xsa_tools": {
-                    "type": "remote",
-                    "url": mcp_url,
-                    "oauth": False,
-                    "codemode": False,
-                    "protocol": "legacy",
-                }
+                "xsa_tools": mcp_entry,
             }
         },
     }
@@ -83,6 +88,7 @@ def ensure_agent_home(
     *,
     mcp_url: str,
     system_prompt: str,
+    mcp_auth_token: str | None = None,
 ) -> Path:
     """Create the isolated agent-home directory and write its `opencode.jsonc`."""
     home = Path(opencode_cfg.agent_home).expanduser().resolve()
@@ -91,12 +97,38 @@ def ensure_agent_home(
         opencode_cfg,
         mcp_url=mcp_url,
         system_prompt=system_prompt,
+        mcp_auth_token=mcp_auth_token,
     )
     (home / "opencode.jsonc").write_text(
         json.dumps(cfg_payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return home
+
+
+def load_or_create_server_password(agent_home: Path, password_env: str) -> str:
+    """Read password from env, or persist/reuse a `0600` token file inside `agent_home`."""
+    env_pw = read_env_secret(password_env)
+    if env_pw:
+        return env_pw
+
+    agent_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(agent_home, 0o700)
+    token_path = agent_home / "server.token"
+    if token_path.exists():
+        existing = token_path.read_text(encoding="utf-8").strip()
+        if existing:
+            os.chmod(token_path, 0o600)
+            return existing
+
+    token = secrets.token_urlsafe(24)
+    fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (token + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(token_path, 0o600)
+    return token
 
 
 class OpenCodeV2Client:
@@ -273,6 +305,21 @@ class OpenCodeServerManager:
             return self._agent_home
         return Path(self._config.agent_home).expanduser().resolve()
 
+    def has_dead_process(self) -> bool:
+        return self._proc is not None and self._proc.returncode is not None
+
+    async def is_healthy(self, password: str | None = None) -> bool:
+        base_url = self._config.server_url.rstrip("/")
+        pw = password if password is not None else self._get_or_load_password()
+        return await self._is_healthy(base_url, pw)
+
+    def _get_or_load_password(self) -> str:
+        if self._password:
+            return self._password
+        home = self.agent_home
+        self._password = load_or_create_server_password(home, self._config.password_env)
+        return self._password
+
     async def _is_healthy(self, base_url: str, password: str | None) -> bool:
         auth = ("opencode", password) if password else None
         try:
@@ -287,32 +334,34 @@ class OpenCodeServerManager:
         *,
         mcp_url: str,
         system_prompt: str,
+        mcp_auth_token: str | None = None,
         binary_resolver: Any = None,
     ) -> tuple[str, str | None]:
         base_url = self._config.server_url.rstrip("/")
-        self._agent_home = ensure_agent_home(
-            self._config,
-            mcp_url=mcp_url,
-            system_prompt=system_prompt,
-        )
+        password = self._get_or_load_password()
 
         if self._proc is not None and self._proc.returncode is None:
-            if await self._is_healthy(base_url, self._password):
-                return base_url, self._password
+            if await self._is_healthy(base_url, password):
+                return base_url, password
 
-        # Reuse an externally started server on this explicit URL if healthy.
-        if await self._is_healthy(base_url, self._password):
-            return base_url, self._password
+        # Reuse an externally started or already-running server (e.g. `xsa serve` while running `xsa ask`)
+        # without clobbering its active `opencode.jsonc` / MCP auth token.
+        if await self._is_healthy(base_url, password):
+            return base_url, password
 
         if not self._config.auto_start_server:
             raise RuntimeError(f"OpenCode V2 server is not reachable at {base_url}")
 
+        self._agent_home = ensure_agent_home(
+            self._config,
+            mcp_url=mcp_url,
+            system_prompt=system_prompt,
+            mcp_auth_token=mcp_auth_token,
+        )
+
         parsed = urlparse(base_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 4396
-
-        if not self._password:
-            self._password = secrets.token_urlsafe(24)
 
         if binary_resolver is not None:
             binary = binary_resolver(self._config.binary)
@@ -324,32 +373,41 @@ class OpenCodeServerManager:
         env = {
             **os.environ,
             "OPENCODE_DB": str(self._agent_home / "opencode.db"),
-            "OPENCODE_PASSWORD": self._password,
-            "OPENCODE_SERVER_PASSWORD": self._password,
+            "OPENCODE_PASSWORD": password,
+            "OPENCODE_SERVER_PASSWORD": password,
         }
+        log_path = self._agent_home / "opencode-serve.log"
         logger.info("Starting isolated OpenCode V2 server on %s (home=%s)", base_url, self._agent_home)
-        self._proc = await asyncio.create_subprocess_exec(
-            binary,
-            "serve",
-            "--hostname",
-            host,
-            "--port",
-            str(port),
-            cwd=str(self._agent_home),
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
+
+        # Redirect to a log file rather than an unread PIPE to avoid 64 KB buffer deadlocks.
+        log_fh = open(log_path, "ab")
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                binary,
+                "serve",
+                "--hostname",
+                host,
+                "--port",
+                str(port),
+                cwd=str(self._agent_home),
+                env=env,
+                stdout=log_fh,
+                stderr=log_fh,
+            )
+        finally:
+            log_fh.close()
 
         deadline = asyncio.get_running_loop().time() + 15.0
         while asyncio.get_running_loop().time() < deadline:
             if self._proc.returncode is not None:
-                err = ""
-                if self._proc.stderr is not None:
-                    err = (await self._proc.stderr.read()).decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"OpenCode V2 server exited ({self._proc.returncode}): {err[-400:]}")
-            if await self._is_healthy(base_url, self._password):
-                return base_url, self._password
+                err_tail = ""
+                if log_path.exists():
+                    err_tail = log_path.read_text(encoding="utf-8", errors="replace")[-400:]
+                raise RuntimeError(
+                    f"OpenCode V2 server exited ({self._proc.returncode}): {err_tail.strip()}"
+                )
+            if await self._is_healthy(base_url, password):
+                return base_url, password
             await asyncio.sleep(0.15)
 
         await self.stop()

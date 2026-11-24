@@ -24,10 +24,10 @@ def test_cli_serve_wires_relay_and_asr_model_flags() -> None:
         async def cleanup(self) -> None:
             pass
 
-    async def fake_start_http(self, host="127.0.0.1", port=4397):
+    async def fake_start_http(self, host="127.0.0.1", port=4397, *, auth_token=None):
         return FakeRunner(), 14397
 
-    async def fake_router_start(self, *, mcp_url=None) -> None:
+    async def fake_router_start(self, *, mcp_url=None, mcp_auth_token=None) -> None:
         captured["mcp_url"] = mcp_url
 
     async def fake_router_close(self) -> None:

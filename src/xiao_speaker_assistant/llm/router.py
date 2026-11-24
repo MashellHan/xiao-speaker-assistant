@@ -131,18 +131,32 @@ class LLMRouter:
         client: httpx.AsyncClient | None = None,
         *,
         mcp_url: str = "http://127.0.0.1:4397/mcp",
+        mcp_auth_token: str | None = None,
     ) -> None:
         self._config = config
         self._client = client
         self._mcp_url = mcp_url
+        self._mcp_auth_token = mcp_auth_token
         self._opencode_mgr = OpenCodeServerManager(config.providers.opencode)
         self._opencode_v2: OpenCodeV2Client | None = None
         self.opencode_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
 
-    async def start(self, *, mcp_url: str | None = None) -> None:
+    async def is_opencode_server_healthy(self) -> bool:
+        if self._client is not None:
+            return True
+        return await self._opencode_mgr.is_healthy()
+
+    async def start(
+        self,
+        *,
+        mcp_url: str | None = None,
+        mcp_auth_token: str | None = None,
+    ) -> None:
         if mcp_url:
             self._mcp_url = mcp_url
+        if mcp_auth_token is not None:
+            self._mcp_auth_token = mcp_auth_token
         cfg = self._config.providers.opencode
         if self._config.default_provider != "opencode" or not cfg.server_url.strip():
             return
@@ -154,6 +168,7 @@ class LLMRouter:
         base_url, password = await self._opencode_mgr.ensure_running(
             mcp_url=self._mcp_url,
             system_prompt=self._build_system_prompt(),
+            mcp_auth_token=self._mcp_auth_token,
         )
         self._opencode_v2 = OpenCodeV2Client(
             base_url, password=password, timeout_sec=cfg.timeout_sec
@@ -293,6 +308,9 @@ class LLMRouter:
             yield sent
 
     async def _ensure_v2_client(self, system_prompt: str) -> OpenCodeV2Client:
+        if self._client is None and self._opencode_mgr.has_dead_process():
+            self._opencode_v2 = None
+            self.opencode_session_id = None
         if self._opencode_v2 is not None:
             return self._opencode_v2
         cfg = self._config.providers.opencode
@@ -304,6 +322,7 @@ class LLMRouter:
         base_url, password = await self._opencode_mgr.ensure_running(
             mcp_url=self._mcp_url,
             system_prompt=system_prompt,
+            mcp_auth_token=self._mcp_auth_token,
         )
         self._opencode_v2 = OpenCodeV2Client(
             base_url, password=password, timeout_sec=cfg.timeout_sec
@@ -312,9 +331,9 @@ class LLMRouter:
 
     async def _stream_opencode_v2(self, system_prompt: str, user_text: str) -> AsyncIterator[str]:
         cfg = self._config.providers.opencode
-        v2 = await self._ensure_v2_client(system_prompt)
 
         for attempt in range(2):
+            v2 = await self._ensure_v2_client(system_prompt)
             if not self.opencode_session_id:
                 self.opencode_session_id = await v2.create_session(
                     model=cfg.model,
@@ -332,12 +351,14 @@ class LLMRouter:
                 if not got_text:
                     yield "抱歉，这次没有拿到回复。"
                 return
-            except SessionNotFoundError:
+            except (SessionNotFoundError, httpx.TransportError):
                 self.opencode_session_id = None
+                if self._client is None:
+                    self._opencode_v2 = None
                 if attempt == 0:
                     continue
                 raise
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
                 asyncio.create_task(v2.interrupt(sid))
                 raise
 
