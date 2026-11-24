@@ -93,6 +93,37 @@ def apply_highpass_filter(
     return out, x_prev, y_prev
 
 
+class DynamicAGC:
+    """Lightweight RMS-based AGC with noise floor gating and tanh soft limiting."""
+
+    def __init__(
+        self,
+        *,
+        target_rms: float = 0.10,
+        min_gain: float = 2.0,
+        max_gain: float = 48.0,
+        noise_floor_rms: float = 0.0012,
+    ) -> None:
+        self.target_rms = target_rms
+        self.min_gain = min_gain
+        self.max_gain = max_gain
+        self.noise_floor_rms = noise_floor_rms
+        self.gain = min_gain
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        if len(samples) == 0:
+            return samples
+        frame_rms = float(np.sqrt(np.mean(samples * samples)))
+        if frame_rms > self.noise_floor_rms:
+            desired = min(self.max_gain, max(self.min_gain, self.target_rms / frame_rms))
+            alpha = 0.35 if desired < self.gain else 0.20
+            self.gain = (1.0 - alpha) * self.gain + alpha * desired
+        else:
+            # Decay gently toward min_gain in silence so room noise stays well below VAD threshold.
+            self.gain = 0.92 * self.gain + 0.08 * self.min_gain
+        return np.tanh(samples * self.gain).astype(np.float32)
+
+
 def match_wakeup_phrase(
     text: str, extra_keywords: list[str] | None = None
 ) -> tuple[str, str] | None:
@@ -204,6 +235,14 @@ class LocalSpeechPipeline:
         self._logged_first_audio = False
         self._hp_prev_x: float = 0.0
         self._hp_prev_y: float = 0.0
+        self._agc = (
+            DynamicAGC(
+                target_rms=config.agc_target_rms,
+                max_gain=config.agc_max_gain,
+            )
+            if config.agc_enabled
+            else None
+        )
 
     def set_muted(self, muted: bool) -> None:
         self._explicit_muted = muted
@@ -254,7 +293,9 @@ class LocalSpeechPipeline:
         samples, self._hp_prev_x, self._hp_prev_y = apply_highpass_filter(
             samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
         )
-        if self._config.input_gain != 1.0:
+        if self._agc is not None:
+            samples = self._agc.process(samples)
+        elif self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
         if not self._logged_first_audio:
             self._logged_first_audio = True
