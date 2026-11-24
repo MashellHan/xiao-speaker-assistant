@@ -15,6 +15,7 @@ from pypinyin import lazy_pinyin
 from scipy.signal import lfilter
 
 from xiao_speaker_assistant.config import SpeechConfig
+from xiao_speaker_assistant.voice.aec import LinearEchoCanceller
 from xiao_speaker_assistant.voice.cloud_asr import DoubaoFlashASR, OpenAIWhisperASR
 from xiao_speaker_assistant.voice.models_setup import (
     find_paraformer_dir,
@@ -69,6 +70,19 @@ def pcm_to_float32(pcm_bytes: bytes, bits_per_sample: int = 16, s32_shift: int =
     return s16.astype(np.float32) / 32768.0
 
 
+def deinterleave_mic_and_ref(
+    samples: np.ndarray, *, channels: int
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Split interleaved `[mic, ref, ...]` float32 samples into `(mic, ref)`."""
+    if channels <= 1:
+        return samples, None
+    usable = len(samples) - (len(samples) % channels)
+    if usable <= 0:
+        return np.zeros(0, dtype=np.float32), None
+    frames = samples[:usable].reshape(-1, channels)
+    return frames[:, 0].copy(), frames[:, 1].copy()
+
+
 def apply_highpass_filter(
     samples: np.ndarray,
     *,
@@ -104,12 +118,14 @@ class DynamicAGC:
         self.noise_floor_rms = noise_floor_rms
         self.gain = min_gain
 
-    def process(self, samples: np.ndarray) -> np.ndarray:
+    def process(self, samples: np.ndarray, *, freeze_boost: bool = False) -> np.ndarray:
         if len(samples) == 0:
             return samples
         frame_rms = float(np.sqrt(np.mean(samples * samples)))
         if frame_rms > self.noise_floor_rms:
             desired = min(self.max_gain, max(self.min_gain, self.target_rms / frame_rms))
+            if freeze_boost and desired > self.gain:
+                desired = self.gain
             alpha = 0.35 if desired < self.gain else 0.20
             self.gain = (1.0 - alpha) * self.gain + alpha * desired
         else:
@@ -260,6 +276,11 @@ class LocalSpeechPipeline:
         self._logged_first_audio = False
         self._hp_prev_x: float = 0.0
         self._hp_prev_y: float = 0.0
+        self._aec = (
+            LinearEchoCanceller()
+            if (config.aec_enabled and config.capture_channels >= 2)
+            else None
+        )
         self._agc = (
             DynamicAGC(
                 target_rms=config.agc_target_rms,
@@ -333,18 +354,31 @@ class LocalSpeechPipeline:
                 on_sleep()
             return
 
-        samples = pcm_to_float32(
+        raw_samples = pcm_to_float32(
             pcm_bytes,
             bits_per_sample=self._config.capture_bits_per_sample,
             s32_shift=self._config.s32_shift,
         )
-        if len(samples) == 0:
+        if len(raw_samples) == 0:
             return
+        mic_samples, ref_samples = deinterleave_mic_and_ref(
+            raw_samples, channels=self._config.capture_channels
+        )
+        if len(mic_samples) == 0:
+            return
+        far_end_active = False
+        if self._aec is not None and ref_samples is not None:
+            far_end_active = float(np.mean(ref_samples * ref_samples)) > 1e-6
+            samples = self._aec.process(mic_samples, ref_samples)
+            if len(samples) == 0:
+                return
+        else:
+            samples = mic_samples
         samples, self._hp_prev_x, self._hp_prev_y = apply_highpass_filter(
             samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
         )
         if self._agc is not None:
-            samples = self._agc.process(samples)
+            samples = self._agc.process(samples, freeze_boost=far_end_active)
         elif self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
         if not self._logged_first_audio:

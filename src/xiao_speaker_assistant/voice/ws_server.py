@@ -84,10 +84,13 @@ class SpeakerGateway:
         def on_state(playing: bool) -> None:
             if self._pipeline is None:
                 return
+            # Always keep VAD muted during playback to prevent nonlinear residual echo self-talk;
+            # unified KWS still runs unmuted on the AEC-cleaned signal for low-volume barge-in.
             if playing:
                 self._pipeline.set_muted(True)
             else:
-                self._pipeline.mute_for(0.25)
+                tail = 0.15 if (self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2) else 0.25
+                self._pipeline.mute_for(tail)
                 self._pipeline.set_muted(False)
 
         pb = PlaybackController(
@@ -180,11 +183,12 @@ class SpeakerGateway:
                 logger.warning("Audio stream stalled >4s; restarting speaker recording")
                 bits = self._config.speech.capture_bits_per_sample
                 ch = self._config.speech.capture_channels
+                pcm_dev = self._config.speech.capture_pcm
                 await self.send_command(
                     conn,
                     "start_recording",
                     {
-                        "pcm": "noop",
+                        "pcm": pcm_dev,
                         "channels": ch,
                         "bits_per_sample": bits,
                         "sample_rate": 16000,
@@ -210,10 +214,13 @@ class SpeakerGateway:
         if self._pipeline is not None:
             bits = self._config.speech.capture_bits_per_sample
             ch = self._config.speech.capture_channels
+            pcm_dev = self._config.speech.capture_pcm
             logger.info(
-                "Starting speaker audio stream (%dch, %d-bit) for local KWS (`%s`) + %s",
+                "Starting speaker audio stream (%s, %dch, %d-bit, aec=%s) for local KWS (`%s`) + %s",
+                pcm_dev,
                 ch,
                 bits,
+                self._config.speech.aec_enabled,
                 ", ".join(self._config.speech.local_keywords),
                 self._config.speech.asr_model,
             )
@@ -221,7 +228,7 @@ class SpeakerGateway:
                 conn,
                 "start_recording",
                 {
-                    "pcm": "noop",
+                    "pcm": pcm_dev,
                     "channels": ch,
                     "bits_per_sample": bits,
                     "sample_rate": 16000,
