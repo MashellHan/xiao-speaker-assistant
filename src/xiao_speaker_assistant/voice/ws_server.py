@@ -306,6 +306,21 @@ class SpeakerGateway:
         if self._on_session_reset is not None:
             self._on_session_reset()
 
+    async def _yield_to_native_xiaoai(self) -> None:
+        logger.info("Native XiaoAI activated; yielding control cleanly to avoid crosstalk")
+        self._interrupted = True
+        if self._active_reply_task is not None and not self._active_reply_task.done():
+            self._active_reply_task.cancel()
+        for fut in self._pending_rpc.values():
+            if not fut.done():
+                fut.cancel()
+        if self._pipeline is not None:
+            self._pipeline.set_awake(False)
+            self._pipeline.set_muted(False)
+            self._pipeline.mute_for(6.0)
+        if self._on_session_reset is not None:
+            self._on_session_reset()
+
     async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
         if self.is_exit_command(text):
             await self._handle_interrupt(conn)
@@ -346,6 +361,11 @@ class SpeakerGateway:
             return
 
         if self._pipeline is not None:
+            if self._is_native_speech_recognizer_event(msg) and (
+                self._pipeline.awake
+                or (self._active_reply_task is not None and not self._active_reply_task.done())
+            ):
+                await self._yield_to_native_xiaoai()
             return
 
         if (
@@ -389,6 +409,24 @@ class SpeakerGateway:
         if len(cleaned) <= 7 and "登录" not in cleaned and "账号" not in cleaned:
             return any(sub in cleaned for sub in SHORT_EXIT_SUBSTRINGS)
         return False
+
+    @staticmethod
+    def _is_native_speech_recognizer_event(msg: dict[str, Any]) -> bool:
+        evt = msg.get("Event")
+        if not isinstance(evt, dict) or evt.get("event") != "instruction":
+            return False
+        data = evt.get("data")
+        if not isinstance(data, dict):
+            return False
+        line = data.get("NewLine")
+        if not isinstance(line, str):
+            return False
+        try:
+            log_msg = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        header = log_msg.get("header") or {}
+        return header.get("namespace") == "SpeechRecognizer"
 
     @staticmethod
     def _is_native_speak_event(msg: dict[str, Any]) -> bool:
