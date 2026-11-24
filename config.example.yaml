@@ -17,6 +17,7 @@ speech:
     - 小助手
   local_keywords:
     - hi nomi
+    - 你好诺米
     - 你好管家
   asr_provider: xiaoai_asr # sense_voice (for Hi Nomi) | xiaoai_asr
   asr_model: sense_voice # sense_voice | paraformer
