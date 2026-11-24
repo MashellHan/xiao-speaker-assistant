@@ -93,6 +93,8 @@ while true; do
     echo "$(date): starting {binary_name} -> $SERVER_URL" >> "$LOG_FILE"
     if [ -f "$AGENT_DIR/asound_xsa.conf" ]; then
         export ALSA_CONFIG_PATH="$AGENT_DIR/asound_xsa.conf"
+    else
+        unset ALSA_CONFIG_PATH
     fi
     "$CLIENT_BIN" "$SERVER_URL" >> "$LOG_FILE" 2>&1
     EXIT_CODE=$?
@@ -163,7 +165,7 @@ def build_update_server_url_command(
 
 def build_asound_xsa_conf() -> str:
     """Return ALSA config defining `pcm.xsa_aec` (ch0=mic, ch1=hw:0,3 ch3 speaker loopback)."""
-    return """</etc/asound.conf>
+    return """</usr/share/alsa/alsa.conf>
 
 pcm.xsa_aec {
     type plug

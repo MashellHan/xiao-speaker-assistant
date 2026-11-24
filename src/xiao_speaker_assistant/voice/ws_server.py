@@ -84,13 +84,13 @@ class SpeakerGateway:
         def on_state(playing: bool) -> None:
             if self._pipeline is None:
                 return
-            # When hardware ch3 linear AEC is active, keep VAD/KWS open so the user can barge in naturally.
-            if self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2:
-                return
+            # Always keep VAD muted during playback to prevent nonlinear residual echo self-talk;
+            # unified KWS still runs unmuted on the AEC-cleaned signal for low-volume barge-in.
             if playing:
                 self._pipeline.set_muted(True)
             else:
-                self._pipeline.mute_for(0.25)
+                tail = 0.15 if (self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2) else 0.25
+                self._pipeline.mute_for(tail)
                 self._pipeline.set_muted(False)
 
         pb = PlaybackController(

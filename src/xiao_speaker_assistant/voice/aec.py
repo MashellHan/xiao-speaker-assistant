@@ -8,8 +8,8 @@ import numpy as np
 class LinearEchoCanceller:
     """Overlap-save frequency-domain NLMS echo canceller (16 kHz, 256-sample hop / 512 FFT).
 
-    Cancels speaker loopback reference (`ref`, OH2P hw:0,3 ch3) from `mic` (ch0) in the linear
-    domain BEFORE any nonlinear AGC/tanh or VAD/KWS runs.
+    Uses SpeexDSP/Valin per-bin error-power step regularization so sparse harmonic TTS speech
+    and double-talk do not cause weight divergence.
     """
 
     def __init__(
@@ -18,7 +18,7 @@ class LinearEchoCanceller:
         hop_size: int = 256,
         num_blocks: int = 8,
         step_size: float = 0.35,
-        reg: float = 1e-4,
+        reg: float = 1e-2,
     ) -> None:
         self.hop_size = hop_size
         self.fft_size = hop_size * 2
@@ -31,10 +31,8 @@ class LinearEchoCanceller:
         self._ref_in_buf = np.zeros(0, dtype=np.float32)
         self._ref_prev = np.zeros(self.hop_size, dtype=np.float32)
 
-        # Frequency-domain tapped delay line of reference frames and adaptive filter weights
         self._X_hist = np.zeros((self.num_blocks, self.num_bins), dtype=np.complex64)
         self._W = np.zeros((self.num_blocks, self.num_bins), dtype=np.complex64)
-        self._power_est = np.full(self.num_bins, reg, dtype=np.float32)
 
     def reset(self) -> None:
         self._mic_in_buf = np.zeros(0, dtype=np.float32)
@@ -42,40 +40,31 @@ class LinearEchoCanceller:
         self._ref_prev.fill(0.0)
         self._X_hist.fill(0.0)
         self._W.fill(0.0)
-        self._power_est.fill(self.reg)
 
     def _process_block(self, mic_hop: np.ndarray, ref_hop: np.ndarray) -> np.ndarray:
         ref_frame = np.concatenate([self._ref_prev, ref_hop])
         self._ref_prev = ref_hop.copy()
 
-        # Shift reference FFT history and insert newest block
         self._X_hist[1:] = self._X_hist[:-1]
         X_new = np.fft.rfft(ref_frame).astype(np.complex64)
         self._X_hist[0] = X_new
 
-        # Predicted echo in time domain (overlap-save: keep last hop_size samples)
         Y_spec = np.sum(self._W * self._X_hist, axis=0)
         y_time = np.fft.irfft(Y_spec, n=self.fft_size).astype(np.float32)[self.hop_size :]
 
         err = mic_hop - y_time
-
-        # Smooth far-end spectral power + double-talk step attenuation
-        ref_pow = (X_new.real * X_new.real + X_new.imag * X_new.imag).astype(np.float32)
-        self._power_est = 0.85 * self._power_est + 0.15 * ref_pow
-        total_ref_pow = np.sum(np.abs(self._X_hist) ** 2, axis=0) + self.reg
-
-        mic_energy = float(np.mean(mic_hop * mic_hop))
-        err_energy = float(np.mean(err * err))
         ref_energy = float(np.mean(ref_hop * ref_hop))
 
-        # Only adapt significantly when far-end reference is active; slow adaptation on near-end double-talk.
-        if ref_energy > 1e-6:
-            dt_scale = 0.15 if err_energy > mic_energy * 1.1 else 1.0
-            mu = (self.step_size * dt_scale) / total_ref_pow
+        if ref_energy > 1e-8:
             e_padded = np.concatenate([np.zeros(self.hop_size, dtype=np.float32), err])
             E_spec = np.fft.rfft(e_padded).astype(np.complex64)
-            grad = (np.conj(self._X_hist) * E_spec[None, :]) * mu[None, :]
-            self._W += grad
+            tot_ref = (
+                np.sum(self._X_hist.real * self._X_hist.real + self._X_hist.imag * self._X_hist.imag, axis=0)
+            ).astype(np.float32)
+            err_pow = (E_spec.real * E_spec.real + E_spec.imag * E_spec.imag).astype(np.float32)
+            floor = max(self.reg, 0.02 * float(np.mean(tot_ref)))
+            mu = self.step_size / (tot_ref + self.num_blocks * err_pow + floor)
+            self._W += (np.conj(self._X_hist) * E_spec[None, :]) * mu[None, :]
             # Constrain filter weights to valid causal half in time domain
             w_time = np.fft.irfft(self._W, n=self.fft_size, axis=1)
             w_time[:, self.hop_size :] = 0.0

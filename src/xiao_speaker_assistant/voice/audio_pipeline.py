@@ -118,12 +118,14 @@ class DynamicAGC:
         self.noise_floor_rms = noise_floor_rms
         self.gain = min_gain
 
-    def process(self, samples: np.ndarray) -> np.ndarray:
+    def process(self, samples: np.ndarray, *, freeze_boost: bool = False) -> np.ndarray:
         if len(samples) == 0:
             return samples
         frame_rms = float(np.sqrt(np.mean(samples * samples)))
         if frame_rms > self.noise_floor_rms:
             desired = min(self.max_gain, max(self.min_gain, self.target_rms / frame_rms))
+            if freeze_boost and desired > self.gain:
+                desired = self.gain
             alpha = 0.35 if desired < self.gain else 0.20
             self.gain = (1.0 - alpha) * self.gain + alpha * desired
         else:
@@ -364,7 +366,9 @@ class LocalSpeechPipeline:
         )
         if len(mic_samples) == 0:
             return
+        far_end_active = False
         if self._aec is not None and ref_samples is not None:
+            far_end_active = float(np.mean(ref_samples * ref_samples)) > 1e-6
             samples = self._aec.process(mic_samples, ref_samples)
             if len(samples) == 0:
                 return
@@ -374,7 +378,7 @@ class LocalSpeechPipeline:
             samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
         )
         if self._agc is not None:
-            samples = self._agc.process(samples)
+            samples = self._agc.process(samples, freeze_boost=far_end_active)
         elif self._config.input_gain != 1.0:
             samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
         if not self._logged_first_audio:

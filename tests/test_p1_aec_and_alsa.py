@@ -1,12 +1,10 @@
-import asyncio
-import struct
 from unittest.mock import MagicMock
 
 import numpy as np
 
 from xiao_speaker_assistant.config import AppConfig
 from xiao_speaker_assistant.voice.aec import LinearEchoCanceller
-from xiao_speaker_assistant.voice.audio_pipeline import deinterleave_mic_and_ref
+from xiao_speaker_assistant.voice.audio_pipeline import DynamicAGC, deinterleave_mic_and_ref
 from xiao_speaker_assistant.voice.speaker_deployer import (
     build_asound_xsa_conf,
     build_boot_script,
@@ -14,39 +12,60 @@ from xiao_speaker_assistant.voice.speaker_deployer import (
 from xiao_speaker_assistant.voice.ws_server import SpeakerGateway
 
 
-def test_linear_aec_attenuates_speaker_echo_and_preserves_near_end() -> None:
-    rng = np.random.default_rng(42)
-    aec = LinearEchoCanceller(hop_size=256, num_blocks=8, step_size=0.45)
+def test_linear_aec_attenuates_harmonic_tts_echo_and_preserves_double_talk() -> None:
+    aec = LinearEchoCanceller(hop_size=256, num_blocks=8, step_size=0.35)
 
-    # 3 seconds of synthetic far-end speaker signal
+    # Realistic sparse harmonic + amplitude-modulated TTS speech (3 seconds at 16 kHz)
     n = 16000 * 3
-    ref = 0.25 * rng.standard_normal(n).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) / 16000.0
+    env = 0.5 * (1.0 + np.sin(2 * np.pi * 3.5 * t))
+    f0 = 165.0 + 25.0 * np.sin(2 * np.pi * 1.8 * t)
+    ref = env * (
+        0.18 * np.sin(2 * np.pi * f0 * t)
+        + 0.10 * np.sin(2 * np.pi * 2 * f0 * t)
+        + 0.05 * np.sin(2 * np.pi * 3 * f0 * t)
+    )
+    ref = ref.astype(np.float32)
 
-    # Simulated acoustic echo path (multi-tap delayed reflection)
     echo = np.zeros(n, dtype=np.float32)
     echo[40:] += 0.55 * ref[:-40]
     echo[120:] += -0.25 * ref[:-120]
     echo[310:] += 0.12 * ref[:-310]
 
-    # Far-end-only portion first (2.0s) to adapt, then 1.0s double-talk with near-end speech tone
-    t_near = np.arange(16000, dtype=np.float32) / 16000.0
-    near_speech = 0.12 * np.sin(2 * np.pi * 440.0 * t_near).astype(np.float32)
+    # 2.0s far-end adaptation, 0.5s double-talk with unvoiced/high-band near-end, 0.5s post-DT
+    rng = np.random.default_rng(7)
+    near_speech = np.zeros(8000, dtype=np.float32)
+    t_near = np.arange(8000, dtype=np.float32) / 16000.0
+    near_speech += 0.10 * np.sin(2 * np.pi * 1900.0 * t_near).astype(np.float32)
+    near_speech += 0.04 * rng.standard_normal(8000).astype(np.float32)
+
     mic = echo.copy()
-    mic[32000:] += near_speech
+    mic[32000:40000] += near_speech
 
     cleaned = aec.process(mic, ref)
     assert len(cleaned) == (n // 256) * 256
 
-    # Measure ERLE on converged echo-only window [24000:32000]
-    in_pow = float(np.mean(echo[24000:32000] ** 2))
-    out_pow = float(np.mean(cleaned[24000:32000] ** 2))
-    erle_db = 10.0 * np.log10(in_pow / max(out_pow, 1e-12))
-    assert erle_db > 15.0
+    # Post-double-talk echo cancellation must stay converged (no divergence!)
+    in_pow = float(np.mean(echo[40000:47000] ** 2))
+    out_pow = float(np.mean(cleaned[40000:47000] ** 2))
+    post_dt_erle = 10.0 * np.log10(in_pow / max(out_pow, 1e-12))
+    assert post_dt_erle > 12.0
 
-    # Near-end speech tone remains clearly recoverable in double-talk window
-    dt_seg = cleaned[34000:46000]
-    corr = float(np.corrcoef(dt_seg, near_speech[2000:14000])[0, 1])
-    assert corr > 0.75
+    # Near-end speech remains strongly correlated during double-talk
+    dt_seg = cleaned[33000:39500]
+    corr = float(np.corrcoef(dt_seg, near_speech[1000:7500])[0, 1])
+    assert corr > 0.80
+
+
+def test_dynamic_agc_freezes_boost_during_active_far_end_reference() -> None:
+    agc = DynamicAGC(target_rms=0.10, min_gain=2.0, max_gain=48.0, noise_floor_rms=0.0012)
+    agc.gain = 6.0
+    t = np.linspace(0, 1, 480, dtype=np.float32)
+    residual_echo = 0.006 * np.sin(2 * np.pi * 10 * t)
+    for _ in range(10):
+        agc.process(residual_echo, freeze_boost=True)
+    # Gain must NOT climb toward 16x while far-end speaker is active
+    assert agc.gain <= 6.01
 
 
 def test_deinterleave_mic_and_ref_splits_two_channels() -> None:
@@ -56,17 +75,18 @@ def test_deinterleave_mic_and_ref_splits_two_channels() -> None:
     assert np.allclose(ref, [-0.5, -0.4, -0.3])
 
 
-def test_asound_xsa_conf_routes_ch0_and_ch3_loopback() -> None:
+def test_asound_xsa_conf_includes_system_alsa_and_routes_ch0_and_ch3_loopback() -> None:
     conf = build_asound_xsa_conf()
-    assert "</etc/asound.conf>" in conf
+    assert "</usr/share/alsa/alsa.conf>" in conf
     assert "pcm.xsa_aec" in conf
     assert "ttable.0.0 1" in conf
     assert "ttable.1.3 1" in conf
     boot = build_boot_script()
     assert "ALSA_CONFIG_PATH=" in boot
+    assert "unset ALSA_CONFIG_PATH" in boot
 
 
-def test_aec_enabled_2ch_does_not_mute_pipeline_during_playback() -> None:
+def test_aec_enabled_2ch_mutes_vad_for_echo_guard_with_short_tail() -> None:
     cfg = AppConfig()
     cfg.speech.aec_enabled = True
     cfg.speech.capture_channels = 2
@@ -89,4 +109,6 @@ def test_aec_enabled_2ch_does_not_mute_pipeline_during_playback() -> None:
     assert pb._on_playback_state is not None
     pb._on_playback_state(True)
     pb._on_playback_state(False)
-    fake_pipeline.set_muted.assert_not_called()
+    fake_pipeline.set_muted.assert_any_call(True)
+    fake_pipeline.mute_for.assert_called_once_with(0.15)
+    fake_pipeline.set_muted.assert_any_call(False)
