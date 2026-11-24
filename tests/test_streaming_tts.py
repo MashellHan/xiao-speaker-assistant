@@ -53,3 +53,35 @@ def test_gateway_streaming_speaks_sentences_sequentially_via_rpc() -> None:
     # Second sentence must NOT killall the first sentence since it waited for completion!
     assert "killall miplayer" not in sent_payloads[1]["Request"]["payload"]
     assert "第二句话。" in sent_payloads[1]["Request"]["payload"]
+
+
+def test_gateway_barge_in_interrupt_cancels_active_streaming_reply() -> None:
+    sent_commands: list[str] = []
+    started = asyncio.Event()
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 12345)
+
+        async def send(self, raw: str) -> None:
+            msg = json.loads(raw)
+            sent_commands.append(msg["Request"]["payload"])
+
+    async def slow_stream(query: str):
+        yield "第一句很长的话。"
+        started.set()
+        await asyncio.sleep(10)
+        yield "永远不该播放的第二句。"
+
+    gw = SpeakerGateway(AppConfig(), on_stream_query=slow_stream)
+
+    async def run() -> None:
+        conn = FakeConn()
+        reply_task = asyncio.create_task(gw._run_query_and_speak(conn, "测试打断"))
+        await started.wait()
+        await asyncio.sleep(0.02)
+        await gw._handle_interrupt(conn)
+        await reply_task
+
+    asyncio.run(run())
+    assert any("killall miplayer tts_play.sh" in c for c in sent_commands)
+    assert not any("永远不该播放的第二句" in c for c in sent_commands)
