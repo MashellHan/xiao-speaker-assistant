@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from xiao_speaker_assistant.voice.audio_pipeline import (
+    apply_highpass_filter,
     extract_record_pcm_from_binary,
     match_wakeup_phrase,
     pcm_to_float32,
@@ -55,6 +56,12 @@ def test_match_wakeup_phrase_handles_hi_nomi_variants_and_inline_queries() -> No
     assert match_wakeup_phrase("蔡纳米三句话介绍一下太阳系") == ("hi nomi", "三句话介绍一下太阳系")
     assert match_wakeup_phrase("海诺米，帮我查一下") == ("hi nomi", "帮我查一下")
     assert match_wakeup_phrase("今天天气怎么样") is None
+
+
+def test_apply_highpass_filter_removes_dc_offset() -> None:
+    dc = np.full(1600, 0.25, dtype=np.float32)
+    filtered, _, _ = apply_highpass_filter(dc)
+    assert abs(float(filtered[-1])) < 1e-4
     assert match_wakeup_phrase("Hi, Normi.") == ("hi nomi", "")
     assert match_wakeup_phrase("Hi, knowmi. Tell me a joke.") == ("hi nomi", "Tell me a joke")
     assert match_wakeup_phrase("Hi Nomi，帮我查一下邮件") == ("hi nomi", "帮我查一下邮件")
