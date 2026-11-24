@@ -33,6 +33,16 @@ def find_sense_voice_dir(models_dir: Path) -> Path:
     )
 
 
+def find_paraformer_dir(models_dir: Path) -> Path:
+    for entry in sorted(models_dir.iterdir()):
+        if entry.is_dir() and "paraformer" in entry.name:
+            if (entry / "model.int8.onnx").is_file() and (entry / "tokens.txt").is_file():
+                return entry
+    raise FileNotFoundError(
+        f"Paraformer model directory not found under {models_dir}. Run `xsa download-models`."
+    )
+
+
 def generate_keywords_file(models_dir: Path, keywords: list[str]) -> Path:
     from sherpa_onnx import text2token
 
