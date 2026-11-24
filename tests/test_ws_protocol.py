@@ -129,6 +129,42 @@ def test_ignores_short_filler_noise_in_local_utterance() -> None:
     assert called == ["我有未读邮件吗？"]
 
 
+def test_yields_to_native_xiaoai_without_killing_playback() -> None:
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from xiao_speaker_assistant.config import AppConfig
+
+    sent = []
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    async def dummy(q: str) -> str:
+        return q
+
+    reset_called = []
+    gw = SpeakerGateway(AppConfig(), on_query=dummy, on_session_reset=lambda: reset_called.append(True))
+    fake_pipeline = MagicMock()
+    fake_pipeline.awake = True
+    gw._pipeline = fake_pipeline
+
+    line = json.dumps({"header": {"namespace": "SpeechRecognizer", "name": "RecognizeResult"}})
+    event = json.dumps({"Event": {"id": "evt-4", "event": "instruction", "data": {"NewLine": line}}})
+
+    async def run() -> None:
+        await gw._handle_text_message(FakeConn(), event)
+
+    asyncio.run(run())
+    fake_pipeline.set_awake.assert_called_once_with(False)
+    fake_pipeline.mute_for.assert_called_once_with(6.0)
+    assert reset_called == [True]
+    assert sent == []
+
+
 def test_start_recording_uses_larger_oh2p_alsa_buffer() -> None:
     import asyncio
     from xiao_speaker_assistant.config import AppConfig
