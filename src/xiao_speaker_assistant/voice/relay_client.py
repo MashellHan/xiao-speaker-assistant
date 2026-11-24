@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 from websockets.asyncio.client import ClientConnection
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
-from xiao_speaker_assistant.voice.audio_pipeline import LocalSpeechPipeline
-from xiao_speaker_assistant.voice.ws_server import QueryHandler, SpeakerGateway
+from xiao_speaker_assistant.voice.ws_server import (
+    QueryHandler,
+    SpeakerGateway,
+    StreamQueryHandler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,48 +91,41 @@ class RelayHostClient:
         return {"Authorization": f"Bearer {self._auth_token}"}
 
     def _ensure_gateway_pipeline(self) -> None:
-        if (
-            self._gateway._config.speech.asr_provider == "sense_voice"
-            and self._gateway._pipeline is None
-        ):
-            logger.info("Loading local KWS + VAD + SenseVoice models...")
-            self._gateway._pipeline = LocalSpeechPipeline(self._gateway._config.speech)
-            logger.info("Local speech pipeline ready!")
+        self._gateway.ensure_pipeline()
 
     async def _serve_connection(self, ws: ClientConnection) -> bool:
         conn: Any = ws
         self._active_ws = ws
         self._gateway._connections.add(conn)
+        self._gateway._pending_rpc.setdefault(conn, {})
+        self._gateway._get_session(conn)
+        self._gateway._get_playback(conn)
         self._connected_event.set()
         received_any = False
 
+        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=48)
+        audio_worker_task = asyncio.create_task(self._gateway._audio_worker(conn, audio_queue))
+        watchdog_task: asyncio.Task[None] | None = None
+
         try:
             if self._gateway._pipeline is not None:
-                bits = self._gateway._config.speech.capture_bits_per_sample
-                await self._gateway.send_command(
-                    conn,
-                    "start_recording",
-                    {
-                        "pcm": "noop",
-                        "channels": 1,
-                        "bits_per_sample": bits,
-                        "sample_rate": 16000,
-                        "period_size": 360,
-                        "buffer_size": 1440,
-                    },
-                )
+                await self._gateway.start_recording(conn)
+                watchdog_task = asyncio.create_task(self._gateway._audio_watchdog(conn))
 
             async for raw in ws:
                 received_any = True
                 if isinstance(raw, bytes):
-                    await self._gateway._handle_binary_message(conn, raw)
+                    self._gateway.enqueue_audio_frame(audio_queue, raw)
                 else:
                     await self._gateway._handle_text_message(conn, raw)
         finally:
             self._connected_event.clear()
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+            audio_worker_task.cancel()
             if self._active_ws is ws:
                 self._active_ws = None
-            self._gateway._connections.discard(conn)
+            self._gateway._cleanup_connection(conn)
 
         return received_any
 
@@ -195,15 +191,23 @@ class RelayHostClient:
 
 async def run_with_relay(
     config: AppConfig,
-    on_query: QueryHandler,
-    relay_url: str,
+    on_query: QueryHandler | None = None,
+    relay_url: str = "",
     *,
+    on_stream_query: StreamQueryHandler | None = None,
+    on_session_reset: Callable[[], None] | None = None,
     auth_token: str | None = None,
     token_env: str = "XSA_RELAY_TOKEN",
     also_serve_local: bool = False,
 ) -> None:
     """Run SpeakerGateway connected outbound to the Azure relay (optionally also local WS)."""
-    gateway = SpeakerGateway(config, on_query=on_query)
+    gateway = SpeakerGateway(
+        config,
+        on_query=on_query,
+        on_stream_query=on_stream_query,
+        on_session_reset=on_session_reset,
+    )
+    gateway.ensure_pipeline()
     client = RelayHostClient(
         gateway,
         relay_url=relay_url,

@@ -11,6 +11,15 @@ import asyncio
 import sys
 
 
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    try:
+        if not writer.is_closing():
+            writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         while True:
@@ -21,11 +30,6 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> No
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
         pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
 
 
 async def handle_client(
@@ -40,12 +44,23 @@ async def handle_client(
         up_reader, up_writer = await asyncio.open_connection(target_host, target_port)
     except Exception as exc:
         print(f"[bridge] upstream connect failed: {exc}", flush=True)
-        client_writer.close()
+        await _close_writer(client_writer)
         return
 
     t1 = asyncio.create_task(pipe(client_reader, up_writer))
     t2 = asyncio.create_task(pipe(up_reader, client_writer))
-    await asyncio.gather(t1, t2, return_exceptions=True)
+    try:
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    except Exception:
+        pass
+    finally:
+        await asyncio.gather(_close_writer(client_writer), _close_writer(up_writer), return_exceptions=True)
 
 
 async def run_bridge(listen_host: str, listen_port: int, target_host: str, target_port: int) -> None:

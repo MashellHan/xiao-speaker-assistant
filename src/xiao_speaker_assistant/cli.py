@@ -18,6 +18,7 @@ import httpx
 
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
+from xiao_speaker_assistant.llm.opencode_server import load_or_create_mcp_token
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import (
     ConfirmationStore,
@@ -215,7 +216,8 @@ def cmd_doctor(config: AppConfig) -> int:
 
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     confirmations = ConfirmationStore()
-    mcp_token = secrets.token_urlsafe(24)
+    agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
+    mcp_token = load_or_create_mcp_token(agent_home)
     mcp_server = McpServer(
         config,
         confirmation_store=confirmations,
@@ -285,6 +287,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 config,
                 on_query=handle_query,
                 relay_url=args.relay,
+                on_stream_query=stream_query,
+                on_session_reset=reset_all,
                 token_env=args.relay_token_env,
                 also_serve_local=True,
             )

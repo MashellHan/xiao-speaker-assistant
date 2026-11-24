@@ -3,6 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+ENV_FILE="${XSA_ENV_FILE:-$HOME/.config/xiao-speaker-assistant/env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
 uv run xsa serve --host 127.0.0.1 --port 4398 "$@" &
 SRV_PID=$!
 
