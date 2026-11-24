@@ -1,0 +1,48 @@
+# Copy to config.yaml (ignored by git) and customize.
+# Uses local `opencode` CLI (raven proxy / Gemini) and `codex` CLI — no API keys needed.
+
+speaker:
+  model: OH2P
+  ws_host: 0.0.0.0
+  ws_port: 4399
+  auth_token_env: XSA_SPEAKER_TOKEN
+  tts_provider: xiaoai # xiaoai | openai | mlx_audio
+
+speech:
+  wakeup_keywords:
+    - 帮我
+    - 请
+    - nomi
+    - 你好管家
+    - 小助手
+  asr_provider: xiaoai_asr # sense_voice | xiaoai_asr
+  vad_min_silence_ms: 800
+
+llm:
+  default_provider: opencode # opencode | codex | codex_api | gemini_api
+  spoken_max_chars: 220
+  providers:
+    opencode:
+      binary: opencode
+      model: raven/gemini-4-hydrogen
+      timeout_sec: 120
+      auto_approve: false
+    codex:
+      binary: codex
+      workdir: .
+      timeout_sec: 120
+
+tools:
+  outlook:
+    enabled: true
+    client_id_env: OUTLOOK_CLIENT_ID
+    tenant_id: consumers
+    token_cache_file: ~/.config/xiao-speaker-assistant/outlook_token_cache.json
+    require_voice_confirmation_for_send: true
+  xiaohongshu:
+    enabled: false
+    mcp_url: http://127.0.0.1:18060/mcp
+  browser:
+    enabled: false
+    mcp_url: http://127.0.0.1:8931/mcp
+    preferred_browser: msedge

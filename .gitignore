@@ -1,0 +1,28 @@
+# Private local artifacts (backups, firmware images, keys, logs)
+.local/
+state/
+models/
+*.bin
+*.img
+*.squashfs
+*.pem
+*.key
+token_cache*.json
+
+# Local config and secrets
+.env
+config.yaml
+*.local.yaml
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# macOS
+.DS_Store
