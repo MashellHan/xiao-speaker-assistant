@@ -20,7 +20,7 @@ SAMPLE_RATE = 16000
 VAD_WINDOW_SAMPLES = 512
 
 HI_NOMI_REGEX = re.compile(
-    r"^\s*(?:hi|hey|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
+    r"^\s*(?:hi|hey|hello|can|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
     r"(?:nomi|normi|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米)"
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
@@ -147,6 +147,10 @@ class LocalSpeechPipeline:
 
     def mute_for(self, seconds: float) -> None:
         self._muted_until = max(self._muted_until, time.monotonic() + seconds)
+
+    def refresh_activity(self) -> None:
+        if self.awake:
+            self._last_active_at = time.monotonic()
 
     def set_awake(self, awake: bool) -> None:
         self.awake = awake
