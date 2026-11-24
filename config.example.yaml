@@ -15,8 +15,12 @@ speech:
     - nomi
     - 你好管家
     - 小助手
-  asr_provider: xiaoai_asr # sense_voice | xiaoai_asr
-  vad_min_silence_ms: 800
+  local_keywords:
+    - hi nomi
+    - 你好管家
+  asr_provider: xiaoai_asr # sense_voice (for Hi Nomi) | xiaoai_asr
+  models_dir: models
+  vad_min_silence_ms: 700
 
 llm:
   default_provider: opencode # opencode | codex | codex_api | gemini_api

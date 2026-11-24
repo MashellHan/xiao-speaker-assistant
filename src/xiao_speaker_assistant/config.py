@@ -22,8 +22,15 @@ class SpeechConfig(BaseModel):
     wakeup_keywords: list[str] = Field(
         default_factory=lambda: ["帮我", "请", "nomi", "你好管家", "小助手"]
     )
+    local_keywords: list[str] = Field(default_factory=lambda: ["hi nomi", "你好管家"])
     asr_provider: Literal["sense_voice", "xiaoai_asr"] = "xiaoai_asr"
-    vad_min_silence_ms: int = 800
+    models_dir: str = "models"
+    kws_score: float = 2.0
+    kws_threshold: float = 0.2
+    vad_threshold: float = 0.2
+    vad_min_silence_ms: int = 700
+    input_gain: float = 1.0
+    conversation_timeout_sec: float = 25.0
 
 
 class OpencodeCliConfig(BaseModel):

@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-uv run xsa serve --host 127.0.0.1 --port 4398 &
+uv run xsa serve --host 127.0.0.1 --port 4398 "$@" &
 SRV_PID=$!
 
 cleanup() {
