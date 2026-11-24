@@ -40,10 +40,14 @@ def test_generate_keywords_file_replaces_spaces_in_tag(tmp_path: Path) -> None:
     assert lines == ["▁HI ▁NO M I @hi_nomi", "你 好 管 家 @你好管家"]
 
 
-def test_pcm_to_float32_scales_a113_s32_lower_24_bits() -> None:
-    raw = struct.pack("<ii", 4456448, -2883584)
-    samples = pcm_to_float32(raw, bits_per_sample=32)
-    assert np.allclose(samples, [17408 / 32768.0, -11264 / 32768.0], atol=1e-5)
+def test_pcm_to_float32_scales_16bit_and_32bit_cleanly() -> None:
+    raw16 = struct.pack("<hh", 16384, -8192)
+    samples16 = pcm_to_float32(raw16, bits_per_sample=16)
+    assert np.allclose(samples16, [0.5, -0.25], atol=1e-5)
+
+    raw32 = struct.pack("<ii", 16384 << 16, (-8192) << 16)
+    samples32 = pcm_to_float32(raw32, bits_per_sample=32, s32_shift=16)
+    assert np.allclose(samples32, [0.5, -0.25], atol=1e-5)
 
 
 def test_match_wakeup_phrase_handles_hi_nomi_variants_and_inline_queries() -> None:
