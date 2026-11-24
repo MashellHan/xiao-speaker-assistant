@@ -27,12 +27,13 @@ class SpeechConfig(BaseModel):
     asr_model: Literal["sense_voice", "paraformer"] = "sense_voice"
     asr_language: str = "zh"
     models_dir: str = "models"
-    capture_bits_per_sample: Literal[16, 32] = 32
+    capture_bits_per_sample: Literal[16, 32] = 16
+    s32_shift: int = 16
     kws_score: float = 2.5
     kws_threshold: float = 0.15
     vad_threshold: float = 0.2
     vad_min_silence_ms: int = 500
-    input_gain: float = 1.0
+    input_gain: float = 4.0
     conversation_timeout_sec: float = 25.0
 
 
