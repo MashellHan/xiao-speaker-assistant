@@ -32,9 +32,9 @@ HI_NOMI_REGEX = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a"}
-_PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao"}
-_PINYIN_THIRD = {"mi", "min", "mei"}
+_PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a", "chen", "han", "an"}
+_PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao", "lao"}
+_PINYIN_THIRD = {"mi", "min", "mei", "ming"}
 
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:

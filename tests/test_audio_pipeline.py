@@ -54,6 +54,8 @@ def test_match_wakeup_phrase_handles_hi_nomi_variants_and_inline_queries() -> No
     assert match_wakeup_phrase("i know me") == ("hi nomi", "")
     assert match_wakeup_phrase("Can know me.") == ("hi nomi", "")
     assert match_wakeup_phrase("蔡纳米三句话介绍一下太阳系") == ("hi nomi", "三句话介绍一下太阳系")
+    assert match_wakeup_phrase("陈老明三句话介绍一下叹阳系。") == ("hi nomi", "三句话介绍一下叹阳系")
+    assert match_wakeup_phrase("陈老师你好") is None
     assert match_wakeup_phrase("海诺米，帮我查一下") == ("hi nomi", "帮我查一下")
     assert match_wakeup_phrase("今天天气怎么样") is None
 
