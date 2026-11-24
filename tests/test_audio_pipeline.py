@@ -7,6 +7,7 @@ import numpy as np
 
 from xiao_speaker_assistant.voice.audio_pipeline import (
     extract_record_pcm_from_binary,
+    match_wakeup_phrase,
     pcm_to_float32,
 )
 from xiao_speaker_assistant.voice.models_setup import generate_keywords_file
@@ -42,3 +43,13 @@ def test_pcm_to_float32_scales_a113_s32_lower_24_bits() -> None:
     raw = struct.pack("<ii", 4456448, -2883584)
     samples = pcm_to_float32(raw, bits_per_sample=32)
     assert np.allclose(samples, [17408 / 32768.0, -11264 / 32768.0], atol=1e-5)
+
+
+def test_match_wakeup_phrase_handles_hi_nomi_variants_and_inline_queries() -> None:
+    assert match_wakeup_phrase("Hi, Nomi.") == ("hi nomi", "")
+    assert match_wakeup_phrase("H nomi.") == ("hi nomi", "")
+    assert match_wakeup_phrase("Hi, Normi.") == ("hi nomi", "")
+    assert match_wakeup_phrase("Hi, knowmi. Tell me a joke.") == ("hi nomi", "Tell me a joke")
+    assert match_wakeup_phrase("Hi Nomi，帮我查一下邮件") == ("hi nomi", "帮我查一下邮件")
+    assert match_wakeup_phrase("你好管家", ["你好管家"]) == ("你好管家", "")
+    assert match_wakeup_phrase("打开电视", ["你好管家"]) is None

@@ -1,9 +1,10 @@
-"""Local KWS (`Hi Nomi`) + Silero VAD + SenseVoice offline ASR pipeline."""
+"""Local KWS + Silero VAD + SenseVoice offline ASR pipeline (supports `Hi Nomi`)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -18,9 +19,16 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 VAD_WINDOW_SAMPLES = 512
 
+HI_NOMI_REGEX = re.compile(
+    r"^\s*(?:hi|hey|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
+    r"(?:nomi|normi|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米)"
+    r"(?:[,，.。!！?\s:]*(.*))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
-    """Decode open-xiaoai-client binary Stream JSON frame (`tag == 'record'`) to int16 PCM."""
+    """Decode open-xiaoai-client binary Stream JSON frame (`tag == 'record'`) to PCM bytes."""
     try:
         obj = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -53,8 +61,35 @@ def pcm_to_float32(pcm_bytes: bytes, bits_per_sample: int = 32) -> np.ndarray:
     return s16.astype(np.float32) / 32768.0
 
 
+def match_wakeup_phrase(
+    text: str, extra_keywords: list[str] | None = None
+) -> tuple[str, str] | None:
+    """Match `Hi Nomi` (with phonetic variants) or configured wake keywords.
+
+    Returns (wake_label, remaining_query) or None if not matched.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    m = HI_NOMI_REGEX.match(stripped)
+    if m:
+        rest = (m.group(1) or "").strip(" ，,。.!！？:：")
+        return "hi nomi", rest
+
+    lowered = stripped.lower()
+    for kw in extra_keywords or []:
+        clean_kw = kw.strip().lower()
+        if not clean_kw:
+            continue
+        if lowered.startswith(clean_kw):
+            rest = stripped[len(clean_kw) :].strip(" ，,。.!！？:：")
+            return clean_kw, rest
+    return None
+
+
 class LocalSpeechPipeline:
-    """Runs KWS (`Hi Nomi`) -> Silero VAD -> SenseVoice ASR on 16kHz mono PCM."""
+    """Runs KWS + Silero VAD + SenseVoice ASR on 16kHz mono PCM."""
 
     def __init__(self, config: SpeechConfig) -> None:
         import sherpa_onnx
@@ -82,7 +117,7 @@ class LocalSpeechPipeline:
             model=str(models_dir / "silero_vad.onnx"),
             threshold=config.vad_threshold,
             min_silence_duration=config.vad_min_silence_ms / 1000.0,
-            min_speech_duration=0.25,
+            min_speech_duration=0.1,
             window_size=VAD_WINDOW_SAMPLES,
             max_speech_duration=20.0,
         )
@@ -133,7 +168,7 @@ class LocalSpeechPipeline:
             return
 
         if self.awake and (now - self._last_active_at) > self._config.conversation_timeout_sec:
-            logger.info("Local conversation timed out; returning to KWS idle")
+            logger.info("Local conversation timed out; returning to idle")
             self.set_awake(False)
             if on_sleep:
                 on_sleep()
@@ -148,8 +183,14 @@ class LocalSpeechPipeline:
             self._logged_first_audio = True
             rms = float(np.sqrt(np.mean(samples * samples)))
             peak = float(np.max(np.abs(samples)))
-            logger.info("First audio frame received (rms=%.4f, peak=%.4f, bits=%d)", rms, peak, self._config.capture_bits_per_sample)
+            logger.info(
+                "First audio frame received (rms=%.4f, peak=%.4f, bits=%d)",
+                rms,
+                peak,
+                self._config.capture_bits_per_sample,
+            )
 
+        # Fast Zipformer KWS path when idle (instant trigger for Chinese wake words like 你好管家).
         if not self.awake:
             self._kws_stream.accept_waveform(SAMPLE_RATE, samples)
             while self._kws.is_ready(self._kws_stream):
@@ -161,24 +202,40 @@ class LocalSpeechPipeline:
                     if on_wakeup:
                         on_wakeup(keyword)
                     return
-            return
 
-        # Awake: feed VAD in 512-sample windows and transcribe completed segments with SenseVoice.
+        # Feed Silero VAD continuously so both `Hi Nomi` wakeup and full utterances work smoothly.
         self._vad_buffer = np.concatenate([self._vad_buffer, samples])
         while len(self._vad_buffer) >= VAD_WINDOW_SAMPLES:
             chunk = self._vad_buffer[:VAD_WINDOW_SAMPLES]
             self._vad_buffer = self._vad_buffer[VAD_WINDOW_SAMPLES:]
             self._vad.accept_waveform(chunk)
-            if self._vad.is_speech_detected():
+            if self.awake and self._vad.is_speech_detected():
                 self._last_active_at = time.monotonic()
 
         while not self._vad.empty():
             segment = self._vad.front.samples
             self._vad.pop()
-            self._last_active_at = time.monotonic()
             text = self._transcribe(segment)
-            if text and on_utterance:
-                on_utterance(text)
+            if not text:
+                continue
+
+            if not self.awake:
+                matched = match_wakeup_phrase(text, self._config.local_keywords)
+                if not matched:
+                    logger.info("Idle speech (ignored): %s", text)
+                    continue
+                wake_label, rest = matched
+                logger.info("SenseVoice wake matched (%s): %s", wake_label, text)
+                self.set_awake(True)
+                if rest:
+                    if on_utterance:
+                        on_utterance(rest)
+                elif on_wakeup:
+                    on_wakeup(wake_label)
+            else:
+                self._last_active_at = time.monotonic()
+                if on_utterance:
+                    on_utterance(text)
 
     def _transcribe(self, samples: list[float] | np.ndarray) -> str:
         stream = self._asr.create_stream()
