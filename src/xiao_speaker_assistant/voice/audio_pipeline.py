@@ -238,7 +238,7 @@ class LocalSpeechPipeline:
             model=str(models_dir / "silero_vad.onnx"),
             threshold=config.vad_threshold,
             min_silence_duration=config.vad_min_silence_ms / 1000.0,
-            min_speech_duration=0.1,
+            min_speech_duration=0.25,
             window_size=VAD_WINDOW_SAMPLES,
             max_speech_duration=20.0,
         )

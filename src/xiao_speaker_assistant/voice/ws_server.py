@@ -28,6 +28,7 @@ QueryHandler = Callable[[str], Awaitable[str]]
 StreamQueryHandler = Callable[[str], AsyncIterator[str]]
 
 IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
+FILLER_NOISE_WORDS = {"嗯", "啊", "哦", "呃", "额", "唉", "唔", "哈", "嘿", "喂"}
 EXIT_EXACT_WORDS = {
     "退出",
     "退下",
@@ -309,6 +310,12 @@ class SpeakerGateway:
         if self.is_exit_command(text):
             await self._handle_interrupt(conn)
             await self.speak_sentence(conn, "好的，已退出。", interrupt=True, wait_response=True)
+            return
+        cleaned = text.strip(" ，。！？,.!?")
+        if cleaned in FILLER_NOISE_WORDS or (len(cleaned) <= 2 and cleaned not in {"确认", "取消", "是的", "好"}):
+            logger.info("Ignoring short filler/noise utterance: %s", text)
+            if self._pipeline is not None:
+                self._pipeline.refresh_activity()
             return
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
