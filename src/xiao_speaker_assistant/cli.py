@@ -13,7 +13,7 @@ from typing import Any
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
 from xiao_speaker_assistant.llm.router import resolve_binary
-from xiao_speaker_assistant.tools import HttpMcpClient, OutlookClient, PendingEmailDraft
+from xiao_speaker_assistant.tools import HttpMcpClient, McpServer, OutlookClient, PendingEmailDraft
 from xiao_speaker_assistant.voice import SpeakerGateway
 from xiao_speaker_assistant.voice.models_setup import download_models
 
@@ -125,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="Check config and local CLI backends")
     sub.add_parser("outlook-login", help="Sign in to Outlook using device code + private file cache")
     sub.add_parser("download-models", help="Download VAD + KWS + SenseVoice models for `Hi Nomi` wakeup")
+    sub.add_parser(
+        "mcp-server",
+        help="Run stdio JSON-RPC 2.0 MCP server for Outlook, Xiaohongshu, and Browser",
+    )
 
     ask_p = sub.add_parser("ask", help="Test a single question via opencode or codex CLI")
     ask_p.add_argument("prompt", help="Question text")
@@ -156,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "download-models":
         download_models(Path(config.speech.models_dir).expanduser(), config.speech.local_keywords)
+        return 0
+    if args.command == "mcp-server":
+        asyncio.run(McpServer(config).serve_stdio())
         return 0
     if args.command == "ask":
         router = LLMRouter(config.llm)
