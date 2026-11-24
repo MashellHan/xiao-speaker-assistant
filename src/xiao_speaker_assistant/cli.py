@@ -225,6 +225,30 @@ def main(argv: list[str] | None = None) -> int:
                 executor=lambda name, t_args: execute_tool(clients, name, t_args),
             )
 
+        async def stream_query(query: str):
+            if confirmations.peek() is not None:
+                if is_confirm_utterance(query):
+                    draft = confirmations.confirm_and_pop()
+                    if draft is not None and "outlook" in clients:
+                        await clients["outlook"].send_email(draft)
+                        yield f"好的，已发送邮件给 {draft.to}。"
+                        return
+                elif is_cancel_utterance(query):
+                    confirmations.clear()
+                    yield "好的，已取消发送邮件。"
+                    return
+
+            chosen = args.provider
+            if chosen is None and ("codex" in query.lower()):
+                chosen = "codex"
+            async for sentence in router.stream_ask(
+                query,
+                provider=chosen,
+                tools=tools,
+                executor=lambda name, t_args: execute_tool(clients, name, t_args),
+            ):
+                yield sentence
+
         if args.relay:
             asyncio.run(
                 run_with_relay(
@@ -236,7 +260,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         else:
-            gateway = SpeakerGateway(config, on_query=handle_query)
+            gateway = SpeakerGateway(
+                config,
+                on_query=handle_query,
+                on_stream_query=stream_query,
+            )
             asyncio.run(gateway.serve_forever())
         return 0
 
