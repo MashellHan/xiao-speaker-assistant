@@ -152,8 +152,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve_p.add_argument(
         "--asr-model",
-        choices=["sense_voice", "paraformer"],
-        help="Select offline ASR model when `--asr sense_voice` is active",
+        choices=["sense_voice", "paraformer", "doubao_flash", "openai_whisper"],
+        help="Select ASR engine when `--asr sense_voice` is active",
     )
     serve_p.add_argument(
         "--relay",
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         download_models(Path(config.speech.models_dir).expanduser(), config.speech.local_keywords)
         return 0
     if args.command == "mcp-server":
-        asyncio.run(McpServer(config).serve_stdio())
+        asyncio.run(McpServer(config, include_local_tools=True).serve_stdio())
         return 0
     if args.command == "ask":
         router = LLMRouter(config.llm)

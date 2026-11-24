@@ -14,6 +14,7 @@ import numpy as np
 from pypinyin import lazy_pinyin
 
 from xiao_speaker_assistant.config import SpeechConfig
+from xiao_speaker_assistant.voice.cloud_asr import DoubaoFlashASR, OpenAIWhisperASR
 from xiao_speaker_assistant.voice.models_setup import (
     find_paraformer_dir,
     find_sense_voice_dir,
@@ -226,7 +227,22 @@ class LocalSpeechPipeline:
         )
         self._vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=30.0)
 
-        if config.asr_model == "paraformer":
+        self._cloud_asr: DoubaoFlashASR | OpenAIWhisperASR | None = None
+        self._asr = None
+        if config.asr_model == "doubao_flash":
+            asr = DoubaoFlashASR()
+            asr.validate_credentials()
+            self._cloud_asr = asr
+        elif config.asr_model == "openai_whisper":
+            asr_w = OpenAIWhisperASR(
+                base_url=config.whisper_base_url,
+                api_key_env=config.whisper_api_key_env,
+                model=config.whisper_model,
+                language=config.asr_language,
+            )
+            asr_w.validate_credentials()
+            self._cloud_asr = asr_w
+        elif config.asr_model == "paraformer":
             pf_dir = find_paraformer_dir(models_dir)
             self._asr = sherpa_onnx.OfflineRecognizer.from_paraformer(
                 paraformer=str(pf_dir / "model.int8.onnx"),
@@ -394,6 +410,9 @@ class LocalSpeechPipeline:
                     on_utterance(text)
 
     def _transcribe(self, samples: list[float] | np.ndarray) -> str:
+        if self._cloud_asr is not None:
+            return self._cloud_asr.transcribe(samples)
+        assert self._asr is not None
         stream = self._asr.create_stream()
         stream.accept_waveform(SAMPLE_RATE, samples)
         self._asr.decode_stream(stream)
