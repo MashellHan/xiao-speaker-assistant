@@ -142,7 +142,7 @@ def test_mcp_server_initialize_and_tools_list() -> None:
     names = {t["name"] for t in list_resp["result"]["tools"]}
     assert names == {
         "outlook_list_emails",
-        "outlook_send_email",
+        "outlook_prepare_email",
         "xiaohongshu_search",
         "xiaohongshu_detail",
         "browser_fetch_summary",
@@ -196,7 +196,7 @@ def test_mcp_server_outlook_list_and_send_confirmation_guard(tmp_path) -> None:
     assert list_data["emails"][0]["subject"] == "周报提醒"
     assert fake_outlook.list_calls == [(3, True)]
 
-    # Unconfirmed send should queue in ConfirmationStore and NOT send.
+    # Calling outlook_prepare_email queues in ConfirmationStore even if confirmed=True is smuggled.
     real_outlook = OutlookClient(cfg.tools.outlook)
     guarded_server = McpServer(cfg, outlook_client=real_outlook)
     unconfirmed_resp = asyncio.run(
@@ -206,11 +206,12 @@ def test_mcp_server_outlook_list_and_send_confirmation_guard(tmp_path) -> None:
                 "id": 11,
                 "method": "tools/call",
                 "params": {
-                    "name": "outlook_send_email",
+                    "name": "outlook_prepare_email",
                     "arguments": {
                         "to": "bob@example.com",
                         "subject": "会议",
                         "body": "三点开会",
+                        "confirmed": True,
                     },
                 },
             }
@@ -225,33 +226,13 @@ def test_mcp_server_outlook_list_and_send_confirmation_guard(tmp_path) -> None:
         to="bob@example.com", subject="会议", body="三点开会", confirmed=False
     )
 
-    # Confirmed send proceeds and clears the store.
-    server.confirmation_store.set_pending(
-        PendingEmailDraft(to="bob@example.com", subject="会议", body="三点开会")
-    )
-    confirmed_resp = asyncio.run(
-        server.handle_message(
-            {
-                "jsonrpc": "2.0",
-                "id": 12,
-                "method": "tools/call",
-                "params": {
-                    "name": "outlook_send_email",
-                    "arguments": {
-                        "to": "bob@example.com",
-                        "subject": "会议",
-                        "body": "三点开会",
-                        "confirmed": True,
-                    },
-                },
-            }
-        )
-    )
-    assert confirmed_resp is not None
-    sent_payload = json.loads(confirmed_resp["result"]["content"][0]["text"])
+    # Only after explicit confirmation pop + send_email does it send.
+    popped = guarded_server.confirmation_store.confirm_and_pop()
+    assert popped is not None and popped.confirmed is True
+    sent_payload = json.loads(asyncio.run(fake_outlook.send_email(popped)))
     assert sent_payload["status"] == "sent"
     assert len(fake_outlook.sent_drafts) == 1
-    assert server.confirmation_store.peek() is None
+    assert guarded_server.confirmation_store.peek() is None
 
 
 def test_mcp_server_xiaohongshu_disabled_and_enabled() -> None:

@@ -1,19 +1,26 @@
-"""Stdio JSON-RPC 2.0 MCP server exposing Outlook, Xiaohongshu, and Browser tools."""
+"""Stdio & Streamable-HTTP JSON-RPC 2.0 MCP server for Outlook, Codex, Xiaohongshu, Browser, and Mac tools."""
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
 import httpx
+from aiohttp import web
 
 from xiao_speaker_assistant.config import AppConfig
+from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools.browser import (
     async_fetch_webpage_summary,
     extract_html_summary,
@@ -49,11 +56,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "outlook_send_email",
+        "name": "outlook_prepare_email",
         "description": (
-            "Send an email via Outlook. Guarded by require_voice_confirmation_for_send: "
-            "unless confirmed=true (or confirmation is disabled), queues the draft and returns "
-            "a confirmation_required status."
+            "Prepare an Outlook email draft for voice confirmation. "
+            "Stores the draft in ConfirmationStore and asks the user to verbally confirm "
+            "('确认发送' or '取消') before sending."
         ),
         "inputSchema": {
             "type": "object",
@@ -61,11 +68,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "to": {"type": "string", "description": "Recipient email address"},
                 "subject": {"type": "string", "description": "Email subject"},
                 "body": {"type": "string", "description": "Plain-text email body"},
-                "confirmed": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "True only after explicit user voice confirmation",
-                },
             },
             "required": ["to", "subject", "body"],
         },
@@ -160,13 +162,45 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["path"],
         },
     },
+    {
+        "name": "mac_disk_usage",
+        "description": "Check disk space (total, used, free GB and percentage) on this Mac.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "default": "/",
+                    "description": "Filesystem path to inspect (default: /)",
+                },
+            },
+        },
+    },
+    {
+        "name": "codex_analyze",
+        "description": (
+            "Run local Codex CLI (`codex exec --ephemeral`) for code analysis, "
+            "debugging, or technical reasoning on a repository or prompt."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Analysis task or question for Codex"},
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory for Codex analysis",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
 
 
 class McpServer:
-    """Stdio JSON-RPC 2.0 MCP server for Xiao Speaker Assistant tools."""
+    """Stdio & Streamable-HTTP JSON-RPC 2.0 MCP server for Xiao Speaker Assistant tools."""
 
     def __init__(
         self,
@@ -192,6 +226,7 @@ class McpServer:
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
         self._edge_dry_run = edge_dry_run
+        self._http_sessions: set[str] = set()
 
     @staticmethod
     def _ok(req_id: Any, result: Any) -> dict[str, Any]:
@@ -276,8 +311,8 @@ class McpServer:
     ) -> dict[str, Any]:
         if name == "outlook_list_emails":
             return self._ok(req_id, await self._call_outlook_list_emails(args))
-        if name == "outlook_send_email":
-            return self._ok(req_id, await self._call_outlook_send_email(args))
+        if name in {"outlook_prepare_email", "outlook_send_email"}:
+            return self._ok(req_id, await self._call_outlook_prepare_email(args))
         if name == "xiaohongshu_search":
             return self._ok(req_id, await self._call_xiaohongshu_search(args))
         if name == "xiaohongshu_detail":
@@ -290,6 +325,10 @@ class McpServer:
             return self._ok(req_id, await self._call_mac_list_recent_files(args))
         if name == "mac_read_text_file":
             return self._ok(req_id, await self._call_mac_read_text_file(args))
+        if name == "mac_disk_usage":
+            return self._ok(req_id, await self._call_mac_disk_usage(args))
+        if name == "codex_analyze":
+            return self._ok(req_id, await self._call_codex_analyze(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -312,7 +351,7 @@ class McpServer:
             )
         return self._tool_result({"emails": emails, "count": len(emails)})
 
-    async def _call_outlook_send_email(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def _call_outlook_prepare_email(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self._config.tools.outlook.enabled:
             return self._tool_result(
                 {
@@ -333,13 +372,15 @@ class McpServer:
                 is_error=True,
             )
 
-        confirmed = bool(args.get("confirmed", False))
-        draft = PendingEmailDraft(to=to, subject=subject, body=body, confirmed=confirmed)
-        if self._config.tools.outlook.require_voice_confirmation_for_send and not confirmed:
+        # Never trust LLM-provided `confirmed` when voice confirmation is required;
+        # only ConfirmationStore + explicit spoken confirmation can dispatch send_email.
+        if self._config.tools.outlook.require_voice_confirmation_for_send:
+            draft = PendingEmailDraft(to=to, subject=subject, body=body, confirmed=False)
             self.confirmation_store.set_pending(draft)
             result_json = await self._outlook.send_email(draft)
             return self._tool_result(result_json, is_error=False)
 
+        draft = PendingEmailDraft(to=to, subject=subject, body=body, confirmed=True)
         try:
             result_json = await self._outlook.send_email(draft)
         except Exception as exc:
@@ -498,6 +539,192 @@ class McpServer:
                 is_error=True,
             )
         return self._tool_result({"path": path, "content": content, "chars": len(content)})
+
+    async def _call_mac_disk_usage(self, args: dict[str, Any]) -> dict[str, Any]:
+        target = str(args.get("path") or "/").strip() or "/"
+        try:
+            resolved = str(Path(target).expanduser())
+            usage = await asyncio.to_thread(shutil.disk_usage, resolved)
+        except OSError as exc:
+            return self._tool_result(
+                {"error": "mac_disk_error", "message": str(exc)},
+                is_error=True,
+            )
+        gib = 1024**3
+        total_gb = round(usage.total / gib, 2)
+        used_gb = round(usage.used / gib, 2)
+        free_gb = round(usage.free / gib, 2)
+        free_pct = round((usage.free / usage.total) * 100.0, 1) if usage.total else 0.0
+        return self._tool_result(
+            {
+                "path": resolved,
+                "total_gb": total_gb,
+                "used_gb": used_gb,
+                "free_gb": free_gb,
+                "free_percent": free_pct,
+            }
+        )
+
+    async def _call_codex_analyze(self, args: dict[str, Any]) -> dict[str, Any]:
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            return self._tool_result(
+                {"error": "invalid_arguments", "message": "Argument 'prompt' is required."},
+                is_error=True,
+            )
+        codex_cfg = self._config.llm.providers.codex
+        raw_workdir = str(args.get("workdir") or codex_cfg.workdir).strip()
+        workdir_path = Path(raw_workdir).expanduser().resolve()
+        if not workdir_path.is_dir():
+            return self._tool_result(
+                {"error": "invalid_workdir", "message": f"Directory does not exist: {raw_workdir}"},
+                is_error=True,
+            )
+        try:
+            binary = resolve_binary(codex_cfg.binary)
+        except RuntimeError as exc:
+            return self._tool_result({"error": "codex_missing", "message": str(exc)}, is_error=True)
+
+        fd, out_file = tempfile.mkstemp(prefix="xsa-codex-mcp-", suffix=".txt")
+        os.close(fd)
+        try:
+            cmd = [
+                binary,
+                "exec",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "-s",
+                "read-only",
+                "-C",
+                str(workdir_path),
+                "-o",
+                out_file,
+            ]
+            if codex_cfg.model:
+                cmd.extend(["-m", codex_cfg.model])
+            cmd.append(prompt)
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=codex_cfg.timeout_sec
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return self._tool_result(
+                    {"error": "codex_timeout", "message": "Codex analysis timed out."},
+                    is_error=True,
+                )
+            if proc.returncode != 0:
+                err = stderr_b.decode("utf-8", errors="replace").strip()
+                out = stdout_b.decode("utf-8", errors="replace").strip()
+                return self._tool_result(
+                    {"error": "codex_failed", "message": err or out[-300:]},
+                    is_error=True,
+                )
+            text = Path(out_file).read_text(encoding="utf-8", errors="replace").strip()
+            return self._tool_result(
+                {"status": "ok", "workdir": str(workdir_path), "analysis": text[:4000]}
+            )
+        finally:
+            try:
+                os.unlink(out_file)
+            except OSError:
+                pass
+
+    async def start_http_server(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 4397,
+        *,
+        auth_token: str | None = None,
+    ) -> tuple[web.AppRunner, int]:
+        """Start an in-process Streamable-HTTP MCP endpoint on `/mcp`."""
+
+        def _check_security(request: web.Request) -> web.Response | None:
+            # Reject any browser cross-origin / no-cors simple requests immediately.
+            if request.headers.get("Origin"):
+                return web.json_response(
+                    {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
+                    status=403,
+                )
+            if auth_token:
+                auth_header = request.headers.get("Authorization", "")
+                if not auth_header.startswith("Bearer "):
+                    return web.json_response(
+                        {"error": "unauthorized", "message": "Missing Bearer token"},
+                        status=401,
+                    )
+                supplied = auth_header[7:].strip()
+                if not hmac.compare_digest(supplied, auth_token):
+                    return web.json_response(
+                        {"error": "unauthorized", "message": "Invalid Bearer token"},
+                        status=401,
+                    )
+            return None
+
+        async def handle_mcp_post(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
+            try:
+                raw_body = await request.text()
+                message = json.loads(raw_body)
+            except Exception:
+                err = self._error(None, -32700, "Parse error")
+                return web.json_response(err, status=400)
+
+            if not isinstance(message, dict):
+                return web.json_response(self._error(None, -32600, "Invalid Request"), status=400)
+
+            session_id = request.headers.get("Mcp-Session-Id") or uuid.uuid4().hex
+            self._http_sessions.add(session_id)
+            headers = {"Mcp-Session-Id": session_id}
+
+            response = await self.handle_message(message)
+            if response is None:
+                return web.Response(status=202, headers=headers)
+            return web.json_response(response, status=200, headers=headers)
+
+        async def handle_mcp_get(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
+            return web.Response(status=405, headers={"Allow": "POST, DELETE"})
+
+        async def handle_mcp_delete(request: web.Request) -> web.Response:
+            denied = _check_security(request)
+            if denied is not None:
+                return denied
+            session_id = request.headers.get("Mcp-Session-Id")
+            if session_id:
+                self._http_sessions.discard(session_id)
+            return web.json_response({"closed": True}, status=200)
+
+        async def handle_health(_request: web.Request) -> web.Response:
+            return web.json_response({"ok": True, "server": SERVER_INFO})
+
+        app = web.Application()
+        app.router.add_post("/mcp", handle_mcp_post)
+        app.router.add_get("/mcp", handle_mcp_get)
+        app.router.add_delete("/mcp", handle_mcp_delete)
+        app.router.add_get("/health", handle_health)
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+
+        actual_port = port
+        if site._server and site._server.sockets:  # type: ignore[attr-defined]
+            actual_port = int(site._server.sockets[0].getsockname()[1])  # type: ignore[attr-defined]
+        logger.info("Unified HTTP MCP server listening on http://%s:%d/mcp", host, actual_port)
+        return runner, actual_port
 
     async def serve_stdio(
         self,

@@ -43,6 +43,9 @@ llm:
       model: raven/gemini-4-hydrogen
       timeout_sec: 120
       auto_approve: true
+      server_url: http://127.0.0.1:4396
+      agent_home: ~/.local/share/xiao-speaker-assistant/agent-home
+      auto_start_server: true
     codex:
       binary: codex
       workdir: .

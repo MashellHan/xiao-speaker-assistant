@@ -71,8 +71,10 @@ class OpencodeCliConfig(BaseModel):
     model: str = "raven/gemini-4-hydrogen"
     timeout_sec: float = 120.0
     auto_approve: bool = True
-    server_url: str = "http://127.0.0.1:4096"
+    server_url: str = "http://127.0.0.1:4396"
     agent_home: str = "~/.local/share/xiao-speaker-assistant/agent-home"
+    auto_start_server: bool = True
+    password_env: str = "XSA_OPENCODE_PASSWORD"
 
 
 class CodexCliConfig(BaseModel):
