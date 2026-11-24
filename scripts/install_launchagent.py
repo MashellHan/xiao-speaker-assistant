@@ -5,16 +5,30 @@ from __future__ import annotations
 
 import argparse
 import plistlib
+import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 LAUNCHAGENT_LABEL = "com.mashellhan.xiao-speaker-assistant"
 DEFAULT_PLIST_PATH = Path(f"~/Library/LaunchAgents/{LAUNCHAGENT_LABEL}.plist")
+DEFAULT_ENV_FILE = Path("~/.config/xiao-speaker-assistant/env")
 
 
 def default_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def validate_env_file(env_file: Path) -> Path:
+    expanded = env_file.expanduser().resolve()
+    if not expanded.is_file():
+        raise FileNotFoundError(f"Env file not found: {expanded}")
+    mode = stat.S_IMODE(expanded.stat().st_mode)
+    if mode & 0o077:
+        raise PermissionError(
+            f"Env file {expanded} must not be group/world-accessible (mode={oct(mode)}; run `chmod 600`)"
+        )
+    return expanded
 
 
 def build_program_arguments(
@@ -45,6 +59,7 @@ def build_launchagent_dict(
     asr_model: str | None = None,
     relay: str | None = None,
     keep_awake: bool = False,
+    env_file: Path | None = None,
 ) -> dict[str, Any]:
     root = (repo_root or default_repo_root()).resolve()
     gateway_script = root / "scripts" / "start_mac_gateway.sh"
@@ -58,6 +73,9 @@ def build_launchagent_dict(
     )
     local_bin = Path.home() / ".local" / "bin"
     path_env = f"{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    env_vars: dict[str, str] = {"PATH": path_env}
+    if env_file is not None:
+        env_vars["XSA_ENV_FILE"] = str(env_file.expanduser().resolve())
     return {
         "Label": LAUNCHAGENT_LABEL,
         "ProgramArguments": program_args,
@@ -66,9 +84,7 @@ def build_launchagent_dict(
         "KeepAlive": True,
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),
-        "EnvironmentVariables": {
-            "PATH": path_env,
-        },
+        "EnvironmentVariables": env_vars,
     }
 
 
@@ -79,6 +95,7 @@ def render_launchagent_plist(
     asr_model: str | None = None,
     relay: str | None = None,
     keep_awake: bool = False,
+    env_file: Path | None = None,
 ) -> bytes:
     payload = build_launchagent_dict(
         repo_root=repo_root,
@@ -86,6 +103,7 @@ def render_launchagent_plist(
         asr_model=asr_model,
         relay=relay,
         keep_awake=keep_awake,
+        env_file=env_file,
     )
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
 
@@ -148,12 +166,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--asr-model",
-        choices=["sense_voice", "paraformer"],
-        help="Offline ASR model passed to start_mac_gateway.sh.",
+        choices=["sense_voice", "paraformer", "doubao_flash", "openai_whisper"],
+        help="ASR model passed to start_mac_gateway.sh.",
     )
     parser.add_argument(
         "--relay",
         help="Outbound WebSocket relay URL (e.g. wss://relay.example.com) passed to start_mac_gateway.sh.",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help=f"Optional 0600 shell env file (e.g. {DEFAULT_ENV_FILE}) sourced by start_mac_gateway.sh.",
     )
     parser.add_argument(
         "--keep-awake",
@@ -188,6 +212,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"LaunchAgent plist not found: {target}")
         return 0
 
+    validated_env: Path | None = None
+    if args.env_file is not None:
+        try:
+            validated_env = validate_env_file(args.env_file)
+        except (FileNotFoundError, PermissionError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
     repo_root = (args.repo_root or default_repo_root()).resolve()
     plist_bytes = render_launchagent_plist(
         repo_root=repo_root,
@@ -195,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         asr_model=args.asr_model,
         relay=args.relay,
         keep_awake=args.keep_awake,
+        env_file=validated_env,
     )
 
     if args.install:

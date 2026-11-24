@@ -1,9 +1,10 @@
-"""WebSocket server (:4399) speaking open-xiaoai protocol with PlaybackController & clean arbitration."""
+"""WebSocket server (:4399) speaking open-xiaoai protocol with PlaybackController & per-connection sessions."""
 
 from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 import json
 import logging
 import time
@@ -49,6 +50,19 @@ EXIT_PHRASES = ("退出对话", "结束对话", "停止对话", "退出模式", 
 SHORT_EXIT_SUBSTRINGS = ("退出", "退下", "退一下", "闭嘴", "停止", "停下", "别说了", "再见", "拜拜")
 
 
+@dataclass
+class SpeakerSession:
+    """Per-connection mutable state isolated per speaker socket."""
+
+    seen_dialogs: set[str] = field(default_factory=set)
+    continuous_mode: bool = False
+    query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    mute_native_until: float = 0.0
+    last_audio_at: float = 0.0
+    active_reply_task: asyncio.Task[None] | None = None
+    interrupted: bool = False
+
+
 class SpeakerGateway:
     def __init__(
         self,
@@ -56,6 +70,9 @@ class SpeakerGateway:
         on_query: QueryHandler | None = None,
         on_stream_query: StreamQueryHandler | None = None,
         on_session_reset: Callable[[], None] | None = None,
+        *,
+        audio_watchdog_interval: float = 3.0,
+        audio_stall_timeout: float = 4.0,
     ) -> None:
         if on_query is None and on_stream_query is None:
             raise ValueError("Either on_query or on_stream_query must be provided")
@@ -63,20 +80,31 @@ class SpeakerGateway:
         self._on_query = on_query
         self._on_stream_query = on_stream_query
         self._on_session_reset = on_session_reset
+        self._audio_watchdog_interval = audio_watchdog_interval
+        self._audio_stall_timeout = audio_stall_timeout
         self._connections: set[ServerConnection] = set()
-        self._seen_dialogs: set[str] = set()
-        self._continuous_mode: bool = False
-        self._query_lock = asyncio.Lock()
+        self._sessions: dict[Any, SpeakerSession] = {}
         self._mute_native_until: float = 0.0
         self._pipeline: LocalSpeechPipeline | None = None
         self._pending_rpc: dict[Any, dict[str, asyncio.Future[dict[str, Any]]]] = {}
         self._playbacks: dict[Any, PlaybackController] = {}
         self._asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xsa-asr")
-        self._last_audio_at: float = 0.0
-        self._active_reply_task: asyncio.Task[None] | None = None
-        self._interrupted: bool = False
 
-    def _get_playback(self, conn: ServerConnection) -> PlaybackController:
+    def ensure_pipeline(self) -> LocalSpeechPipeline | None:
+        if self._config.speech.asr_provider == "sense_voice" and self._pipeline is None:
+            logger.info("Loading local KWS + VAD + %s models...", self._config.speech.asr_model)
+            self._pipeline = LocalSpeechPipeline(self._config.speech)
+            logger.info("Local speech pipeline ready!")
+        return self._pipeline
+
+    def _get_session(self, conn: Any) -> SpeakerSession:
+        sess = self._sessions.get(conn)
+        if sess is None:
+            sess = SpeakerSession()
+            self._sessions[conn] = sess
+        return sess
+
+    def _get_playback(self, conn: Any) -> PlaybackController:
         pb = self._playbacks.get(conn)
         if pb is not None:
             return pb
@@ -89,7 +117,11 @@ class SpeakerGateway:
             if playing:
                 self._pipeline.set_muted(True)
             else:
-                tail = 0.15 if (self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2) else 0.25
+                tail = (
+                    0.15
+                    if (self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2)
+                    else 0.25
+                )
                 self._pipeline.mute_for(tail)
                 self._pipeline.set_muted(False)
 
@@ -105,9 +137,21 @@ class SpeakerGateway:
         self._playbacks[conn] = pb
         return pb
 
+    def _cleanup_connection(self, conn: Any) -> None:
+        self._connections.discard(conn)
+        sess = self._sessions.pop(conn, None)
+        if sess is not None and sess.active_reply_task is not None and not sess.active_reply_task.done():
+            sess.interrupted = True
+            sess.active_reply_task.cancel()
+        self._playbacks.pop(conn, None)
+        conn_rpcs = self._pending_rpc.pop(conn, {})
+        for fut in conn_rpcs.values():
+            if not fut.done():
+                fut.cancel()
+
     async def send_command(
         self,
-        conn: ServerConnection,
+        conn: Any,
         command: str,
         payload: Any = None,
         *,
@@ -139,13 +183,13 @@ class SpeakerGateway:
             conn_rpcs.pop(req_id, None)
 
     async def run_shell(
-        self, conn: ServerConnection, script: str, *, wait_response: bool = False, timeout: float = 25.0
+        self, conn: Any, script: str, *, wait_response: bool = False, timeout: float = 25.0
     ) -> dict[str, Any] | None:
         return await self.send_command(
             conn, "run_shell", script, wait_response=wait_response, timeout=timeout
         )
 
-    async def stop_native_audio(self, conn: ServerConnection) -> None:
+    async def stop_native_audio(self, conn: Any) -> None:
         await self.run_shell(
             conn,
             "ubus -t 2 call mediaplayer player_wakeup '{\"action\":\"stop\"}' >/dev/null 2>&1 || true; "
@@ -153,13 +197,13 @@ class SpeakerGateway:
             "mphelper pause >/dev/null 2>&1 || true",
         )
 
-    async def play_wakeup_chime(self, conn: ServerConnection) -> None:
+    async def play_wakeup_chime(self, conn: Any) -> None:
         pb = self._get_playback(conn)
         await pb.play_chime()
 
     async def speak_sentence(
         self,
-        conn: ServerConnection,
+        conn: Any,
         text: str,
         *,
         interrupt: bool = True,
@@ -168,18 +212,47 @@ class SpeakerGateway:
         pb = self._get_playback(conn)
         await pb.speak(text, interrupt_native=interrupt)
 
-    async def abort_and_speak(self, conn: ServerConnection, text: str) -> None:
+    async def abort_and_speak(self, conn: Any, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
 
-    async def send_tts(self, conn: ServerConnection, text: str) -> None:
+    async def send_tts(self, conn: Any, text: str) -> None:
         await self.abort_and_speak(conn, text)
 
-    async def _audio_watchdog(self, conn: ServerConnection) -> None:
+    async def start_recording(self, conn: Any) -> None:
+        sess = self._get_session(conn)
+        bits = self._config.speech.capture_bits_per_sample
+        ch = self._config.speech.capture_channels
+        pcm_dev = self._config.speech.capture_pcm
+        logger.info(
+            "Starting speaker audio stream (%s, %dch, %d-bit, aec=%s) for local KWS (`%s`) + %s",
+            pcm_dev,
+            ch,
+            bits,
+            self._config.speech.aec_enabled,
+            ", ".join(self._config.speech.local_keywords),
+            self._config.speech.asr_model,
+        )
+        await self.send_command(
+            conn,
+            "start_recording",
+            {
+                "pcm": pcm_dev,
+                "channels": ch,
+                "bits_per_sample": bits,
+                "sample_rate": 16000,
+                "period_size": 1600,
+                "buffer_size": 3200,
+            },
+        )
+        sess.last_audio_at = time.monotonic()
+
+    async def _audio_watchdog(self, conn: Any) -> None:
+        sess = self._get_session(conn)
         while True:
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(self._audio_watchdog_interval)
             if self._pipeline is None:
                 return
-            if (time.monotonic() - self._last_audio_at) > 4.0:
+            if (time.monotonic() - sess.last_audio_at) > self._audio_stall_timeout:
                 logger.warning("Audio stream stalled >4s; restarting speaker recording")
                 bits = self._config.speech.capture_bits_per_sample
                 ch = self._config.speech.capture_channels
@@ -196,7 +269,29 @@ class SpeakerGateway:
                         "buffer_size": 3200,
                     },
                 )
-                self._last_audio_at = time.monotonic()
+                sess.last_audio_at = time.monotonic()
+
+    async def _audio_worker(self, conn: Any, queue: asyncio.Queue[bytes]) -> None:
+        while True:
+            raw = await queue.get()
+            try:
+                await self._handle_binary_message(conn, raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error processing speaker audio frame")
+
+    @staticmethod
+    def enqueue_audio_frame(queue: asyncio.Queue[bytes], raw: bytes) -> None:
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(raw)
+        except asyncio.QueueFull:
+            pass
 
     async def _handle_connection(self, conn: ServerConnection) -> None:
         expected_token = read_env_secret(self._config.speaker.auth_token_env)
@@ -208,35 +303,15 @@ class SpeakerGateway:
 
         self._connections.add(conn)
         self._pending_rpc.setdefault(conn, {})
+        self._get_session(conn)
         self._get_playback(conn)
         logger.info("Speaker connected from %s", conn.remote_address)
 
+        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=48)
+        audio_worker_task = asyncio.create_task(self._audio_worker(conn, audio_queue))
+
         if self._pipeline is not None:
-            bits = self._config.speech.capture_bits_per_sample
-            ch = self._config.speech.capture_channels
-            pcm_dev = self._config.speech.capture_pcm
-            logger.info(
-                "Starting speaker audio stream (%s, %dch, %d-bit, aec=%s) for local KWS (`%s`) + %s",
-                pcm_dev,
-                ch,
-                bits,
-                self._config.speech.aec_enabled,
-                ", ".join(self._config.speech.local_keywords),
-                self._config.speech.asr_model,
-            )
-            await self.send_command(
-                conn,
-                "start_recording",
-                {
-                    "pcm": pcm_dev,
-                    "channels": ch,
-                    "bits_per_sample": bits,
-                    "sample_rate": 16000,
-                    "period_size": 1600,
-                    "buffer_size": 3200,
-                },
-            )
-            self._last_audio_at = time.monotonic()
+            await self.start_recording(conn)
             watchdog_task: asyncio.Task[None] | None = asyncio.create_task(self._audio_watchdog(conn))
         else:
             watchdog_task = None
@@ -244,7 +319,7 @@ class SpeakerGateway:
         try:
             async for raw in conn:
                 if isinstance(raw, bytes):
-                    await self._handle_binary_message(conn, raw)
+                    self.enqueue_audio_frame(audio_queue, raw)
                     continue
                 await self._handle_text_message(conn, raw)
         except ConnectionClosed:
@@ -252,26 +327,23 @@ class SpeakerGateway:
         finally:
             if watchdog_task is not None:
                 watchdog_task.cancel()
-            self._connections.discard(conn)
-            self._playbacks.pop(conn, None)
-            conn_rpcs = self._pending_rpc.pop(conn, {})
-            for fut in conn_rpcs.values():
-                if not fut.done():
-                    fut.cancel()
+            audio_worker_task.cancel()
+            self._cleanup_connection(conn)
             logger.info("Speaker disconnected")
 
-    async def _handle_binary_message(self, conn: ServerConnection, raw: bytes) -> None:
+    async def _handle_binary_message(self, conn: Any, raw: bytes) -> None:
         if self._pipeline is None:
             return
         pcm = extract_record_pcm_from_binary(raw)
         if not pcm:
             return
-        self._last_audio_at = time.monotonic()
+        sess = self._get_session(conn)
+        sess.last_audio_at = time.monotonic()
         loop = asyncio.get_running_loop()
 
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
-            self._mute_native_until = time.monotonic() + 8.0
+            sess.mute_native_until = time.monotonic() + 8.0
             loop.call_soon_threadsafe(lambda: loop.create_task(self.play_wakeup_chime(conn)))
 
         def on_utterance(text: str) -> None:
@@ -300,10 +372,11 @@ class SpeakerGateway:
             ),
         )
 
-    async def _handle_interrupt(self, conn: ServerConnection) -> None:
-        self._interrupted = True
-        if self._active_reply_task is not None and not self._active_reply_task.done():
-            self._active_reply_task.cancel()
+    async def _handle_interrupt(self, conn: Any) -> None:
+        sess = self._get_session(conn)
+        sess.interrupted = True
+        if sess.active_reply_task is not None and not sess.active_reply_task.done():
+            sess.active_reply_task.cancel()
         for fut in self._pending_rpc.get(conn, {}).values():
             if not fut.done():
                 fut.cancel()
@@ -319,12 +392,14 @@ class SpeakerGateway:
         if self._on_session_reset is not None:
             self._on_session_reset()
 
-    async def _yield_to_native_xiaoai(self, conn: ServerConnection) -> None:
+    async def _yield_to_native_xiaoai(self, conn: Any) -> None:
         logger.info("Native XiaoAI activated; yielding control cleanly to avoid crosstalk")
-        self._interrupted = True
+        sess = self._get_session(conn)
+        sess.interrupted = True
+        sess.mute_native_until = 0.0
         self._mute_native_until = 0.0
-        if self._active_reply_task is not None and not self._active_reply_task.done():
-            self._active_reply_task.cancel()
+        if sess.active_reply_task is not None and not sess.active_reply_task.done():
+            sess.active_reply_task.cancel()
         for fut in self._pending_rpc.get(conn, {}).values():
             if not fut.done():
                 fut.cancel()
@@ -339,7 +414,8 @@ class SpeakerGateway:
         if self._on_session_reset is not None:
             self._on_session_reset()
 
-    async def _process_local_utterance(self, conn: ServerConnection, text: str) -> None:
+    async def _process_local_utterance(self, conn: Any, text: str) -> None:
+        sess = self._get_session(conn)
         if self.is_exit_command(text):
             await self._handle_interrupt(conn)
             await self.speak_sentence(conn, "好的，已退出。", interrupt=True, wait_response=True)
@@ -359,10 +435,10 @@ class SpeakerGateway:
                     self._pipeline.refresh_activity()
                 return
             text = rest
-        self._mute_native_until = time.monotonic() + 10.0
+        sess.mute_native_until = time.monotonic() + 10.0
         await self._run_query_and_speak(conn, text)
 
-    async def _handle_text_message(self, conn: ServerConnection, raw: str) -> None:
+    async def _handle_text_message(self, conn: Any, raw: str) -> None:
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -379,11 +455,16 @@ class SpeakerGateway:
             logger.debug("Speaker command response: %s", resp)
             return
 
+        sess = self._get_session(conn)
+        mute_until = max(sess.mute_native_until, self._mute_native_until)
+
         if self._pipeline is not None:
             pb = self._playbacks.get(conn)
-            is_nomi_active = self._pipeline.awake or (
-                self._active_reply_task is not None and not self._active_reply_task.done()
-            ) or (pb is not None and pb.is_playing)
+            is_nomi_active = (
+                self._pipeline.awake
+                or (sess.active_reply_task is not None and not sess.active_reply_task.done())
+                or (pb is not None and pb.is_playing)
+            )
 
             if self._is_explicit_native_xiaoai_wakeup(msg) and is_nomi_active:
                 await self._yield_to_native_xiaoai(conn)
@@ -394,7 +475,7 @@ class SpeakerGateway:
             )
             if (
                 not is_playing_own_xiaoai
-                and (is_nomi_active or time.monotonic() < self._mute_native_until)
+                and (is_nomi_active or time.monotonic() < mute_until)
                 and self._is_native_speak_event(msg)
             ):
                 logger.info("Suppressing stray native XiaoAI Speak event while Nomi is active")
@@ -405,7 +486,7 @@ class SpeakerGateway:
         pb = self._playbacks.get(conn)
         if (
             (pb is None or not pb.is_playing)
-            and time.monotonic() < self._mute_native_until
+            and time.monotonic() < mute_until
             and self._is_native_speak_event(msg)
         ):
             logger.debug("Suppressing native XiaoAI Speak event")
@@ -417,11 +498,11 @@ class SpeakerGateway:
             return
         dialog_id, text = extracted
         dedup_key = f"{dialog_id}:{text}"
-        if dedup_key in self._seen_dialogs:
+        if dedup_key in sess.seen_dialogs:
             return
-        self._seen_dialogs.add(dedup_key)
-        if len(self._seen_dialogs) > 200:
-            self._seen_dialogs.clear()
+        sess.seen_dialogs.add(dedup_key)
+        if len(sess.seen_dialogs) > 200:
+            sess.seen_dialogs.clear()
 
         if self.should_ignore_utterance(text):
             logger.debug("Ignoring bare wake word: %s", text)
@@ -493,37 +574,39 @@ class SpeakerGateway:
             "SpeakStream",
         }
 
-    async def _process_utterance(self, conn: ServerConnection, text: str) -> None:
+    async def _process_utterance(self, conn: Any, text: str) -> None:
+        sess = self._get_session(conn)
         if self.is_exit_command(text):
-            self._continuous_mode = False
-            self._mute_native_until = time.monotonic() + 6.0
+            sess.continuous_mode = False
+            sess.mute_native_until = time.monotonic() + 6.0
             if self._on_session_reset is not None:
                 self._on_session_reset()
             await self.speak_sentence(conn, "好的，已退出对话。", interrupt=True, wait_response=True)
             return
 
         matched_kw = next((kw for kw in self._config.speech.wakeup_keywords if kw in text), None)
-        if not matched_kw and not self._continuous_mode:
+        if not matched_kw and not sess.continuous_mode:
             return
 
-        self._mute_native_until = time.monotonic() + 10.0
+        sess.mute_native_until = time.monotonic() + 10.0
         await self.stop_native_audio(conn)
 
         query = text
         if matched_kw and text.startswith(matched_kw):
             query = text[len(matched_kw) :].lstrip(" ，,：:")
             if not query:
-                self._continuous_mode = True
+                sess.continuous_mode = True
                 await self.speak_sentence(conn, "我在，请讲。", interrupt=True, wait_response=True)
                 return
 
         await self._run_query_and_speak(conn, query)
 
-    async def _run_query_and_speak(self, conn: ServerConnection, query: str) -> None:
-        async with self._query_lock:
-            self._interrupted = False
+    async def _run_query_and_speak(self, conn: Any, query: str) -> None:
+        sess = self._get_session(conn)
+        async with sess.query_lock:
+            sess.interrupted = False
             task = asyncio.current_task()
-            self._active_reply_task = task
+            sess.active_reply_task = task
             try:
                 if self._on_stream_query is not None:
                     await self._run_streaming_reply(conn, query)
@@ -531,7 +614,7 @@ class SpeakerGateway:
                 assert self._on_query is not None
                 reply = await self._on_query(query)
                 logger.info("LLM reply: %s", reply)
-                self._mute_native_until = time.monotonic() + 8.0
+                sess.mute_native_until = time.monotonic() + 8.0
                 await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
             except asyncio.CancelledError:
                 logger.info("Reply task cancelled due to interrupt")
@@ -540,13 +623,14 @@ class SpeakerGateway:
                 logger.exception("Error handling query %r", query)
                 await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
             finally:
-                if self._pipeline is not None and not self._interrupted:
+                if self._pipeline is not None and not sess.interrupted:
                     self._pipeline.refresh_activity()
-                if self._active_reply_task is task:
-                    self._active_reply_task = None
+                if sess.active_reply_task is task:
+                    sess.active_reply_task = None
 
-    async def _run_streaming_reply(self, conn: ServerConnection, query: str) -> None:
+    async def _run_streaming_reply(self, conn: Any, query: str) -> None:
         assert self._on_stream_query is not None
+        sess = self._get_session(conn)
         queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         async def producer() -> None:
@@ -564,13 +648,13 @@ class SpeakerGateway:
         first_spoken = True
         try:
             while True:
-                if self._interrupted:
+                if sess.interrupted:
                     break
                 sentence = await queue.get()
-                if sentence is None or self._interrupted:
+                if sentence is None or sess.interrupted:
                     break
                 logger.info("Streaming TTS sentence: %s", sentence)
-                self._mute_native_until = time.monotonic() + 8.0
+                sess.mute_native_until = time.monotonic() + 8.0
                 await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
                 first_spoken = False
             await prod_task
@@ -579,7 +663,7 @@ class SpeakerGateway:
         finally:
             if not prod_task.done():
                 prod_task.cancel()
-            if self._pipeline is not None and not self._interrupted:
+            if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 
     @staticmethod
@@ -618,10 +702,7 @@ class SpeakerGateway:
         return None
 
     async def serve_forever(self) -> None:
-        if self._config.speech.asr_provider == "sense_voice":
-            logger.info("Loading local KWS + VAD + %s models...", self._config.speech.asr_model)
-            self._pipeline = LocalSpeechPipeline(self._config.speech)
-            logger.info("Local speech pipeline ready!")
+        self.ensure_pipeline()
 
         host = self._config.speaker.ws_host
         port = self._config.speaker.ws_port

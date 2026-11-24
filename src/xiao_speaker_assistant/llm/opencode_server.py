@@ -111,10 +111,18 @@ def load_or_create_server_password(agent_home: Path, password_env: str) -> str:
     env_pw = read_env_secret(password_env)
     if env_pw:
         return env_pw
+    return _load_or_create_token_file(agent_home, "server.token")
 
+
+def load_or_create_mcp_token(agent_home: Path) -> str:
+    """Persist/reuse a `0600` Bearer token file for the local HTTP MCP endpoint."""
+    return _load_or_create_token_file(agent_home, "mcp.token")
+
+
+def _load_or_create_token_file(agent_home: Path, filename: str) -> str:
     agent_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(agent_home, 0o700)
-    token_path = agent_home / "server.token"
+    token_path = agent_home / filename
     if token_path.exists():
         existing = token_path.read_text(encoding="utf-8").strip()
         if existing:
