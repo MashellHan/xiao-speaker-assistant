@@ -13,8 +13,16 @@ from typing import Any
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
 from xiao_speaker_assistant.llm.router import resolve_binary
-from xiao_speaker_assistant.tools import HttpMcpClient, McpServer, OutlookClient, PendingEmailDraft
-from xiao_speaker_assistant.voice import SpeakerGateway
+from xiao_speaker_assistant.tools import (
+    ConfirmationStore,
+    HttpMcpClient,
+    McpServer,
+    OutlookClient,
+    PendingEmailDraft,
+    is_cancel_utterance,
+    is_confirm_utterance,
+)
+from xiao_speaker_assistant.voice import SpeakerGateway, run_with_relay
 from xiao_speaker_assistant.voice.models_setup import download_models
 
 
@@ -143,6 +151,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Override speech recognition backend (`sense_voice` enables `Hi Nomi` local wakeup)",
     )
     serve_p.add_argument(
+        "--asr-model",
+        choices=["sense_voice", "paraformer"],
+        help="Select offline ASR model when `--asr sense_voice` is active",
+    )
+    serve_p.add_argument(
+        "--relay",
+        help="Connect outbound to an Azure/remote WebSocket relay (e.g. wss://relay.example.com)",
+    )
+    serve_p.add_argument(
+        "--relay-token-env",
+        default="XSA_RELAY_TOKEN",
+        help="Environment variable holding the relay Bearer token (default: XSA_RELAY_TOKEN)",
+    )
+    serve_p.add_argument(
         "--provider",
         choices=["opencode", "codex", "codex_api", "gemini_api"],
         help="Override default LLM provider",
@@ -176,10 +198,23 @@ def main(argv: list[str] | None = None) -> int:
             config.speaker.ws_port = args.port
         if args.asr:
             config.speech.asr_provider = args.asr
+        if args.asr_model:
+            config.speech.asr_model = args.asr_model
         router = LLMRouter(config.llm)
         tools, clients = build_tool_registry(config)
+        confirmations = ConfirmationStore()
 
         async def handle_query(query: str) -> str:
+            if confirmations.peek() is not None:
+                if is_confirm_utterance(query):
+                    draft = confirmations.confirm_and_pop()
+                    if draft is not None and "outlook" in clients:
+                        await clients["outlook"].send_email(draft)
+                        return f"好的，已发送邮件给 {draft.to}。"
+                elif is_cancel_utterance(query):
+                    confirmations.clear()
+                    return "好的，已取消发送邮件。"
+
             chosen = args.provider
             if chosen is None and ("codex" in query.lower()):
                 chosen = "codex"
@@ -190,8 +225,19 @@ def main(argv: list[str] | None = None) -> int:
                 executor=lambda name, t_args: execute_tool(clients, name, t_args),
             )
 
-        gateway = SpeakerGateway(config, on_query=handle_query)
-        asyncio.run(gateway.serve_forever())
+        if args.relay:
+            asyncio.run(
+                run_with_relay(
+                    config,
+                    on_query=handle_query,
+                    relay_url=args.relay,
+                    token_env=args.relay_token_env,
+                    also_serve_local=True,
+                )
+            )
+        else:
+            gateway = SpeakerGateway(config, on_query=handle_query)
+            asyncio.run(gateway.serve_forever())
         return 0
 
     return 1
