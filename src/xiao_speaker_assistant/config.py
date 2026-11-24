@@ -29,7 +29,7 @@ class SpeechConfig(BaseModel):
     kws_score: float = 2.5
     kws_threshold: float = 0.15
     vad_threshold: float = 0.2
-    vad_min_silence_ms: int = 700
+    vad_min_silence_ms: int = 500
     input_gain: float = 1.0
     conversation_timeout_sec: float = 25.0
 
