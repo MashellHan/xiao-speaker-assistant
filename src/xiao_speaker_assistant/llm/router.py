@@ -16,6 +16,11 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from xiao_speaker_assistant.config import LLMConfig, read_env_secret
+from xiao_speaker_assistant.llm.opencode_server import (
+    OpenCodeServerManager,
+    OpenCodeV2Client,
+    SessionNotFoundError,
+)
 
 
 @dataclass(frozen=True)
@@ -120,11 +125,46 @@ def resolve_binary(name_or_path: str) -> str:
 
 
 class LLMRouter:
-    def __init__(self, config: LLMConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: LLMConfig,
+        client: httpx.AsyncClient | None = None,
+        *,
+        mcp_url: str = "http://127.0.0.1:4397/mcp",
+    ) -> None:
         self._config = config
         self._client = client
+        self._mcp_url = mcp_url
+        self._opencode_mgr = OpenCodeServerManager(config.providers.opencode)
+        self._opencode_v2: OpenCodeV2Client | None = None
         self.opencode_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
+
+    async def start(self, *, mcp_url: str | None = None) -> None:
+        if mcp_url:
+            self._mcp_url = mcp_url
+        cfg = self._config.providers.opencode
+        if self._config.default_provider != "opencode" or not cfg.server_url.strip():
+            return
+        if self._client is not None:
+            self._opencode_v2 = OpenCodeV2Client(
+                cfg.server_url, client=self._client, timeout_sec=cfg.timeout_sec
+            )
+            return
+        base_url, password = await self._opencode_mgr.ensure_running(
+            mcp_url=self._mcp_url,
+            system_prompt=self._build_system_prompt(),
+        )
+        self._opencode_v2 = OpenCodeV2Client(
+            base_url, password=password, timeout_sec=cfg.timeout_sec
+        )
+
+    async def close(self) -> None:
+        await self._opencode_mgr.stop()
+
+    async def interrupt_active(self) -> None:
+        if self._opencode_v2 is not None and self.opencode_session_id:
+            await self._opencode_v2.interrupt(self.opencode_session_id)
 
     def reset_session(self) -> None:
         self.opencode_session_id = None
@@ -144,7 +184,12 @@ class LLMRouter:
     def _build_system_prompt(self) -> str:
         return (
             f"你是运行在用户 Mac 本机上的家庭语音助手 Nomi，回答将通过智能音箱朗读。"
-            f"你可以直接调用本机工具（例如查询 Mac 磁盘空间、读取本机允许目录的文件、查询邮件、抓取网页、使用 Codex 分析）来回答问题；"
+            f"你可以直接调用 xsa_tools 中的本机工具来回答问题：包括查询 Mac 磁盘空间（mac_disk_usage）、"
+            f"读取本机允许目录的文件（mac_list_recent_files / mac_read_text_file）、"
+            f"读取 Outlook 邮件（outlook_list_emails）、准备发邮件草稿（outlook_prepare_email）、"
+            f"搜索小红书（xiaohongshu_search / xiaohongshu_detail）、网页摘要与用 Edge 打开网页（browser_fetch_summary / browser_open_edge）、"
+            f"以及调用本地 Codex 做代码或技术分析（codex_analyze）。"
+            f"准备发送邮件时只能调用 outlook_prepare_email 生成待确认草稿，并请用户口头说“确认发送”或“取消”，切勿声称邮件已发送。"
             f"不要回答“我无法访问你的电脑”或“还在学习中”。"
             f"无论用户使用中文、英文还是中英混合提问，请一律使用自然流畅的简体中文回答（专有名词可保留英文）。"
             f"请直接给出核心结论，简短口语化，不要使用 Markdown、代码块或 URL，"
@@ -163,7 +208,10 @@ class LLMRouter:
         chosen = provider or self._config.default_provider
         system_prompt = self._build_system_prompt()
         if chosen == "opencode":
-            raw = await self._ask_opencode_cli(system_prompt, user_text)
+            if self._config.providers.opencode.server_url.strip():
+                raw = await self._ask_opencode_v2(system_prompt, user_text)
+            else:
+                raw = await self._ask_opencode_cli(system_prompt, user_text)
         elif chosen == "codex":
             raw = await self._ask_codex_cli(system_prompt, self._format_with_history(user_text))
         elif chosen == "codex_api":
@@ -198,7 +246,12 @@ class LLMRouter:
 
         if chosen == "opencode":
             collected: list[str] = []
-            async for piece in self._stream_opencode_cli(system_prompt, user_text):
+            stream_it = (
+                self._stream_opencode_v2(system_prompt, user_text)
+                if self._config.providers.opencode.server_url.strip()
+                else self._stream_opencode_cli(system_prompt, user_text)
+            )
+            async for piece in stream_it:
                 for sent in splitter.feed(piece):
                     collected.append(sent)
                     yield sent
@@ -238,6 +291,61 @@ class LLMRouter:
             yield sent
         for sent in splitter.flush():
             yield sent
+
+    async def _ensure_v2_client(self, system_prompt: str) -> OpenCodeV2Client:
+        if self._opencode_v2 is not None:
+            return self._opencode_v2
+        cfg = self._config.providers.opencode
+        if self._client is not None:
+            self._opencode_v2 = OpenCodeV2Client(
+                cfg.server_url, client=self._client, timeout_sec=cfg.timeout_sec
+            )
+            return self._opencode_v2
+        base_url, password = await self._opencode_mgr.ensure_running(
+            mcp_url=self._mcp_url,
+            system_prompt=system_prompt,
+        )
+        self._opencode_v2 = OpenCodeV2Client(
+            base_url, password=password, timeout_sec=cfg.timeout_sec
+        )
+        return self._opencode_v2
+
+    async def _stream_opencode_v2(self, system_prompt: str, user_text: str) -> AsyncIterator[str]:
+        cfg = self._config.providers.opencode
+        v2 = await self._ensure_v2_client(system_prompt)
+
+        for attempt in range(2):
+            if not self.opencode_session_id:
+                self.opencode_session_id = await v2.create_session(
+                    model=cfg.model,
+                    directory=str(self._opencode_mgr.agent_home),
+                    agent="nomi",
+                    title="xsa-voice",
+                )
+            sid = self.opencode_session_id
+            got_text = False
+            try:
+                async for delta in v2.stream_prompt(sid, user_text):
+                    if delta:
+                        got_text = True
+                        yield delta
+                if not got_text:
+                    yield "抱歉，这次没有拿到回复。"
+                return
+            except SessionNotFoundError:
+                self.opencode_session_id = None
+                if attempt == 0:
+                    continue
+                raise
+            except asyncio.CancelledError:
+                asyncio.create_task(v2.interrupt(sid))
+                raise
+
+    async def _ask_opencode_v2(self, system_prompt: str, user_text: str) -> str:
+        chunks: list[str] = []
+        async for piece in self._stream_opencode_v2(system_prompt, user_text):
+            chunks.append(piece)
+        return "".join(chunks).strip() or "抱歉，这次没有拿到回复。"
 
     async def _stream_opencode_cli(self, system_prompt: str, user_text: str) -> AsyncIterator[str]:
         cfg = self._config.providers.opencode

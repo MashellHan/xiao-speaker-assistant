@@ -20,13 +20,31 @@ def test_parse_opencode_jsonl_collects_text_parts() -> None:
 def test_cli_serve_wires_relay_and_asr_model_flags() -> None:
     captured = {}
 
+    class FakeRunner:
+        async def cleanup(self) -> None:
+            pass
+
+    async def fake_start_http(self, host="127.0.0.1", port=4397):
+        return FakeRunner(), 14397
+
+    async def fake_router_start(self, *, mcp_url=None) -> None:
+        captured["mcp_url"] = mcp_url
+
+    async def fake_router_close(self) -> None:
+        pass
+
     async def fake_run_with_relay(config, on_query, relay_url, **kwargs):
         captured["asr"] = config.speech.asr_provider
         captured["asr_model"] = config.speech.asr_model
         captured["relay_url"] = relay_url
         captured["also_serve_local"] = kwargs.get("also_serve_local")
 
-    with patch.object(cli, "run_with_relay", fake_run_with_relay):
+    with (
+        patch.object(cli.McpServer, "start_http_server", fake_start_http),
+        patch.object(cli.LLMRouter, "start", fake_router_start),
+        patch.object(cli.LLMRouter, "close", fake_router_close),
+        patch.object(cli, "run_with_relay", fake_run_with_relay),
+    ):
         rc = cli.main(
             [
                 "serve",
@@ -40,6 +58,7 @@ def test_cli_serve_wires_relay_and_asr_model_flags() -> None:
         )
     assert rc == 0
     assert captured == {
+        "mcp_url": "http://127.0.0.1:14397/mcp",
         "asr": "sense_voice",
         "asr_model": "paraformer",
         "relay_url": "wss://relay.example.com",
@@ -49,10 +68,11 @@ def test_cli_serve_wires_relay_and_asr_model_flags() -> None:
 
 def test_llm_router_tracks_opencode_session_and_resets() -> None:
     import asyncio
-    from xiao_speaker_assistant.config import LLMConfig
+    from xiao_speaker_assistant.config import LLMConfig, LLMProvidersConfig, OpencodeCliConfig
     from xiao_speaker_assistant.llm.router import LLMRouter
 
-    router = LLMRouter(LLMConfig())
+    cfg = LLMConfig(providers=LLMProvidersConfig(opencode=OpencodeCliConfig(server_url="")))
+    router = LLMRouter(cfg)
     calls = []
 
     class FakeProc:
