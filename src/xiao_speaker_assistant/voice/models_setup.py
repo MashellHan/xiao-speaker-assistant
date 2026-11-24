@@ -57,10 +57,11 @@ def generate_keywords_file(models_dir: Path, keywords: list[str]) -> Path:
     lines: list[str] = []
     for raw_kw, token_list in zip(keywords, encoded):
         joined = "".join(token_list)
+        tag = re.sub(r"\s+", "_", raw_kw.strip())
         if re.match(r"^[▁A-Z\s]+$", joined):
-            lines.append(" ".join(token_list) + f" @{raw_kw.strip()}")
+            lines.append(" ".join(token_list) + f" @{tag}")
         else:
-            lines.append(" ".join(token_list) + f" @{joined}")
+            lines.append(" ".join(token_list) + f" @{re.sub(r'\s+', '_', joined)}")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output
 
