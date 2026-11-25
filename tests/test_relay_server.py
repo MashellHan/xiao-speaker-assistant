@@ -55,6 +55,28 @@ def test_unauthorized_connection_rejected_with_4401(monkeypatch: pytest.MonkeyPa
                 4401,
                 headers={"Authorization": "Basic dXNlcjpwYXNz"},
             )
+            # Query-param token is accepted ONLY for /ws/speaker, never /ws/host
+            await _expect_close_code(f"{base}/ws/speaker?token=wrong-token", 4401)
+            await _expect_close_code(f"{base}/ws/host?token=top-secret-token", 4401)
+
+    asyncio.run(scenario())
+
+
+def test_speaker_query_token_auth_allows_forwarding() -> None:
+    token = "speaker-query-secret"
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(host="127.0.0.1", port=0, token=token) as relay:
+            base = f"ws://127.0.0.1:{relay.bound_port}"
+            async with (
+                websockets.connect(f"{base}/ws/speaker?token={token}") as speaker,
+                websockets.connect(
+                    f"{base}/ws/host",
+                    additional_headers={"Authorization": f"Bearer {token}"},
+                ) as host,
+            ):
+                await speaker.send('{"Event":{"id":"q1"}}')
+                assert await asyncio.wait_for(host.recv(), timeout=2.0) == '{"Event":{"id":"q1"}}'
 
     asyncio.run(scenario())
 

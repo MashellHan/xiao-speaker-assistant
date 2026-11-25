@@ -10,7 +10,7 @@ import os
 import sys
 from http import HTTPStatus
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import websockets
 from websockets.asyncio.server import Request, Response, Server, ServerConnection
@@ -69,16 +69,21 @@ class RelayServer:
             return self.port
         return int(self._server.sockets[0].getsockname()[1])
 
-    def _is_authorized(self, conn: ServerConnection) -> bool:
+    def _is_authorized(self, conn: ServerConnection, *, allow_query_token: bool = False) -> bool:
         if self._token is None:
             return True
         if conn.request is None:
             return False
         raw_header = conn.request.headers.get("Authorization", "")
         presented = _extract_bearer_token(raw_header)
-        if presented is None:
-            return False
-        return hmac.compare_digest(presented, self._token)
+        if presented is not None:
+            return hmac.compare_digest(presented, self._token)
+        if allow_query_token:
+            query_params = parse_qs(urlsplit(conn.request.path).query, keep_blank_values=False)
+            tokens = query_params.get("token")
+            if tokens and len(tokens) == 1 and tokens[0].strip():
+                return hmac.compare_digest(tokens[0].strip(), self._token)
+        return False
 
     def _get_conn(self, role: Role) -> ServerConnection | None:
         return self._speaker if role == "speaker" else self._host_conn
@@ -104,12 +109,12 @@ class RelayServer:
         return None
 
     async def _handle_connection(self, conn: ServerConnection) -> None:
-        if not self._is_authorized(conn):
+        path = urlsplit(conn.request.path).path if conn.request else ""
+        if not self._is_authorized(conn, allow_query_token=(path == "/ws/speaker")):
             logger.warning("Rejected unauthorized connection from %s", conn.remote_address)
             await conn.close(code=CLOSE_UNAUTHORIZED, reason="Unauthorized")
             return
 
-        path = urlsplit(conn.request.path).path if conn.request else ""
         if path == "/ws/speaker":
             role: Role = "speaker"
         elif path == "/ws/host":

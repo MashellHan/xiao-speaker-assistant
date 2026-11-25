@@ -1,0 +1,17 @@
+# Option A: Domain with HTTPS/WSS for Mac host (/ws/host) + plain WS on port 80
+# for stock open-xiaoai-client on OH2P (which lacks TLS/custom Authorization headers).
+http://relay.example.com:80 {
+    handle /ws/speaker* {
+        reverse_proxy 127.0.0.1:8765
+    }
+    handle /healthz {
+        reverse_proxy 127.0.0.1:8765
+    }
+    handle {
+        redir https://{host}{uri} 308
+    }
+}
+
+relay.example.com {
+    reverse_proxy 127.0.0.1:8765
+}

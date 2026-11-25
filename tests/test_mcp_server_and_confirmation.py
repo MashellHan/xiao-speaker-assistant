@@ -304,6 +304,19 @@ def test_mcp_server_xiaohongshu_disabled_and_enabled() -> None:
         ("get_feed_detail", {"feed_id": "n1", "xsec_token": "abc"}),
     ]
 
+    login_resp = asyncio.run(
+        enabled_server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "tools/call",
+                "params": {"name": "xiaohongshu_check_login", "arguments": {}},
+            }
+        )
+    )
+    assert login_resp is not None and login_resp["result"]["isError"] is False
+    assert fake_xhs.calls[-1] == ("check_login_status", {})
+
 
 def test_browser_fetch_summary_html_stripping_and_mcp_delegation() -> None:
     sample_html = """

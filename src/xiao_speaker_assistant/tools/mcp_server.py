@@ -223,6 +223,16 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "xiaohongshu_check_login",
+        "description": "Check whether the Xiaohongshu MCP server is logged in.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_snapshot",
+        "description": "Capture an accessibility snapshot of the active page via Playwright Edge MCP.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -362,6 +372,10 @@ class McpServer:
             return self._ok(req_id, await self._call_weather_query(args))
         if name == "web_search":
             return self._ok(req_id, await self._call_web_search(args))
+        if name == "xiaohongshu_check_login":
+            return self._ok(req_id, await self._call_xiaohongshu_check_login())
+        if name == "browser_snapshot":
+            return self._ok(req_id, await self._call_browser_snapshot())
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -474,6 +488,36 @@ class McpServer:
         except Exception as exc:
             return self._tool_result(
                 {"error": "xiaohongshu_mcp_error", "message": str(exc)},
+                is_error=True,
+            )
+        return self._tool_result(res)
+
+    async def _call_xiaohongshu_check_login(self) -> dict[str, Any]:
+        if not self._config.tools.xiaohongshu.enabled:
+            return self._xiaohongshu_disabled_result()
+        try:
+            res = await self._xiaohongshu.call_tool("check_login_status", {})
+        except Exception as exc:
+            return self._tool_result(
+                {"error": "xiaohongshu_mcp_error", "message": str(exc)},
+                is_error=True,
+            )
+        return self._tool_result(res)
+
+    async def _call_browser_snapshot(self) -> dict[str, Any]:
+        if not self._config.tools.browser.enabled:
+            return self._tool_result(
+                {
+                    "error": "browser_mcp_not_enabled",
+                    "message": "Browser MCP is not enabled. Set tools.browser.enabled: true and run scripts/start_mcp_services.sh.",
+                },
+                is_error=True,
+            )
+        try:
+            res = await self._browser.call_tool("browser_snapshot", {})
+        except Exception as exc:
+            return self._tool_result(
+                {"error": "browser_mcp_error", "message": str(exc)},
                 is_error=True,
             )
         return self._tool_result(res)
