@@ -670,6 +670,38 @@ class McpServer:
             except OSError:
                 pass
 
+    async def _fetch_open_meteo_7d(
+        self, client: httpx.AsyncClient, city: str
+    ) -> list[dict[str, Any]]:
+        geo = await client.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1, "language": "zh"},
+        )
+        geo.raise_for_status()
+        results = geo.json().get("results") or []
+        if not results:
+            return []
+        lat = results[0]["latitude"]
+        lon = results[0]["longitude"]
+        fc = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "timezone": "Asia/Shanghai",
+            },
+        )
+        fc.raise_for_status()
+        daily = fc.json().get("daily") or {}
+        dates = daily.get("time") or []
+        mins = daily.get("temperature_2m_min") or []
+        maxs = daily.get("temperature_2m_max") or []
+        return [
+            {"date": d, "min_c": lo, "max_c": hi}
+            for d, lo, hi in zip(dates, mins, maxs)
+        ]
+
     async def _call_weather_query(self, args: dict[str, Any]) -> dict[str, Any]:
         city = str(args.get("city") or "").strip()
         if not city:
@@ -680,32 +712,69 @@ class McpServer:
         owns_client = self._http_client is None
         client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
         try:
-            resp = await client.get(
-                f"https://wttr.in/{quote(city)}",
+            wttr_task = client.get(
+                f"https://wttr.in/{quote(city, safe='')}",
                 params={"format": "j1", "lang": "zh"},
                 headers={"User-Agent": "curl/8.5.0"},
             )
-            resp.raise_for_status()
-            data = resp.json()
-            cur = (data.get("current_condition") or [{}])[0]
-            weather_days = data.get("weather") or []
-            lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get("value", "")
-            today = weather_days[0] if len(weather_days) > 0 else {}
-            tomorrow = weather_days[1] if len(weather_days) > 1 else {}
-            return self._tool_result(
-                {
-                    "city": city,
-                    "current_temp_c": cur.get("temp_C"),
-                    "feels_like_c": cur.get("FeelsLikeC"),
-                    "condition": lang_desc,
-                    "humidity_pct": cur.get("humidity"),
-                    "wind_kmph": cur.get("windspeedKmph"),
-                    "today_min_c": today.get("mintempC"),
-                    "today_max_c": today.get("maxtempC"),
-                    "tomorrow_min_c": tomorrow.get("mintempC"),
-                    "tomorrow_max_c": tomorrow.get("maxtempC"),
-                }
+            meteo_task = self._fetch_open_meteo_7d(client, city)
+            wttr_res, meteo_res = await asyncio.gather(
+                wttr_task, meteo_task, return_exceptions=True
             )
+
+            forecast_by_date: dict[str, dict[str, Any]] = {}
+            if isinstance(meteo_res, list):
+                for day in meteo_res:
+                    d_str = str(day.get("date") or "")
+                    if d_str:
+                        forecast_by_date[d_str] = {
+                            "date": d_str,
+                            "min_c": day.get("min_c"),
+                            "max_c": day.get("max_c"),
+                        }
+
+            result: dict[str, Any] = {"city": city}
+            if isinstance(wttr_res, httpx.Response) and wttr_res.status_code < 400:
+                data = wttr_res.json()
+                cur = (data.get("current_condition") or [{}])[0]
+                weather_days = data.get("weather") or []
+                lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get(
+                    "value", ""
+                )
+                result.update(
+                    {
+                        "current_temp_c": cur.get("temp_C"),
+                        "feels_like_c": cur.get("FeelsLikeC"),
+                        "condition": lang_desc,
+                        "humidity_pct": cur.get("humidity"),
+                        "wind_kmph": cur.get("windspeedKmph"),
+                    }
+                )
+                for day in weather_days:
+                    d_str = str(day.get("date") or "")
+                    hourly = day.get("hourly") or []
+                    mid = hourly[len(hourly) // 2] if hourly else {}
+                    cond = (mid.get("lang_zh") or mid.get("weatherDesc") or [{}])[0].get(
+                        "value", ""
+                    )
+                    entry = forecast_by_date.setdefault(d_str, {"date": d_str})
+                    entry.setdefault("min_c", day.get("mintempC"))
+                    entry.setdefault("max_c", day.get("maxtempC"))
+                    if cond:
+                        entry["condition"] = cond
+
+            if not forecast_by_date and isinstance(wttr_res, Exception):
+                raise wttr_res
+
+            ordered = [forecast_by_date[k] for k in sorted(forecast_by_date)]
+            result["forecast"] = ordered
+            if len(ordered) > 0:
+                result["today_min_c"] = ordered[0].get("min_c")
+                result["today_max_c"] = ordered[0].get("max_c")
+            if len(ordered) > 1:
+                result["tomorrow_min_c"] = ordered[1].get("min_c")
+                result["tomorrow_max_c"] = ordered[1].get("max_c")
+            return self._tool_result(result)
         except Exception as exc:
             return self._tool_result(
                 {"error": "weather_error", "message": str(exc), "city": city},
@@ -727,8 +796,8 @@ class McpServer:
         client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
         try:
             resp = await client.get(
-                "https://cn.bing.com/search",
-                params={"q": query},
+                "https://www.bing.com/search",
+                params={"q": query, "mkt": "zh-CN"},
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
                     "Accept-Language": "zh-CN,zh;q=0.9",
@@ -736,8 +805,10 @@ class McpServer:
             )
             resp.raise_for_status()
             items: list[dict[str, str]] = []
-            for block in re.findall(r'<li class="b_algo"[^>]*>([\s\S]*?)</li>', resp.text):
-                m_link = re.search(r'<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', block)
+            for block in resp.text.split('<li class="b_algo"')[1:]:
+                m_link = re.search(
+                    r'<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', block
+                )
                 if not m_link:
                     continue
                 url = html.unescape(m_link.group(1))

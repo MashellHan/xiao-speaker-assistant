@@ -320,15 +320,30 @@ def test_mcp_weather_query_and_web_search_with_mock_http() -> None:
                         }
                     ],
                     "weather": [
-                        {"mintempC": "-1", "maxtempC": "10"},
-                        {"mintempC": "0", "maxtempC": "11"},
+                        {"date": "2026-11-25", "mintempC": "-1", "maxtempC": "10", "hourly": [{"lang_zh": [{"value": "晴"}]}]},
+                        {"date": "2026-11-26", "mintempC": "0", "maxtempC": "11", "hourly": [{"lang_zh": [{"value": "多云"}]}]},
+                        {"date": "2026-11-27", "mintempC": "-2", "maxtempC": "6", "hourly": [{"lang_zh": [{"value": "晴"}]}]},
                     ],
                 },
                 request=request,
             )
-        if "cn.bing.com/search" in str(request.url):
+        if "geocoding-api.open-meteo.com" in str(request.url):
+            return httpx.Response(200, json={"results": [{"latitude": 40.46, "longitude": 115.97}]}, request=request)
+        if "api.open-meteo.com" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "daily": {
+                        "time": ["2026-11-25", "2026-11-26", "2026-11-27", "2026-11-28"],
+                        "temperature_2m_min": [-2.0, 1.0, -3.0, -4.0],
+                        "temperature_2m_max": [8.0, 10.0, 5.0, 6.0],
+                    }
+                },
+                request=request,
+            )
+        if "www.bing.com/search" in str(request.url):
             html_body = (
-                '<ul><li class="b_algo"><h2><a href="https://example.com/news">北京今日天气</a></h2>'
+                '<ul><li class="b_algo"><ul><li>nested</li></ul><h2><a href="https://example.com/news">北京今日天气</a></h2>'
                 '<p>晴朗微风，最高气温10度。</p></li></ul>'
             )
             return httpx.Response(200, text=html_body, request=request)
@@ -342,21 +357,23 @@ def test_mcp_weather_query_and_web_search_with_mock_http() -> None:
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "tools/call",
-                    "params": {"name": "weather_query", "arguments": {"city": "北京"}},
+                    "params": {"name": "weather_query", "arguments": {"city": "延庆"}},
                 }
             )
             assert w_resp is not None and w_resp["result"]["isError"] is False
             w_data = json.loads(w_resp["result"]["content"][0]["text"])
             assert w_data["current_temp_c"] == "8"
             assert w_data["condition"] == "晴"
-            assert w_data["today_max_c"] == "10"
+            assert len(w_data["forecast"]) == 4
+            assert w_data["forecast"][2]["date"] == "2026-11-27"
+            assert w_data["forecast"][2]["condition"] == "晴"
 
             s_resp = await srv.handle_message(
                 {
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
-                    "params": {"name": "web_search", "arguments": {"query": "北京天气"}},
+                    "params": {"name": "web_search", "arguments": {"query": "延庆天气"}},
                 }
             )
             assert s_resp is not None and s_resp["result"]["isError"] is False
