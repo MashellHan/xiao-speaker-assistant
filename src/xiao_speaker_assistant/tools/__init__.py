@@ -10,6 +10,7 @@ from .browser import (
     validate_http_url,
 )
 from .confirmation import ConfirmationStore, is_cancel_utterance, is_confirm_utterance
+from .history import ConversationHistoryStore, HistoryEntry
 from .mac_local import (
     DEFAULT_ALLOWED_ROOTS,
     MacLocalAccessError,
@@ -27,8 +28,10 @@ from .reminders import ReminderEntry, ReminderScheduler, ReminderStore, is_quiet
 __all__ = [
     "ALL_TOOL_DEFINITIONS",
     "ConfirmationStore",
+    "ConversationHistoryStore",
     "DEFAULT_ALLOWED_ROOTS",
     "EDGE_APP_NAME",
+    "HistoryEntry",
     "HttpMcpClient",
     "LOCAL_TOOL_DEFINITIONS",
     "MacLocalAccessError",

@@ -15,14 +15,20 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from aiohttp import web
 
-from xiao_speaker_assistant.config import AppConfig, resolve_binary
+from xiao_speaker_assistant.config import (
+    AppConfig,
+    persist_runtime_settings,
+    read_env_secret,
+    resolve_binary,
+)
 from xiao_speaker_assistant.tools.browser import (
     async_fetch_webpage_summary,
     extract_html_summary,
@@ -31,6 +37,7 @@ from xiao_speaker_assistant.tools.browser import (
     validate_http_url,
 )
 from xiao_speaker_assistant.tools.confirmation import ConfirmationStore
+from xiao_speaker_assistant.tools.history import ConversationHistoryStore
 from xiao_speaker_assistant.tools.mac_local import (
     MacLocalAccessError,
     list_recent_files,
@@ -42,16 +49,32 @@ from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraf
 from xiao_speaker_assistant.tools.reminders import ReminderStore
 from xiao_speaker_assistant.voice.speaker_id import SpeakerProfileStore
 from xiao_speaker_assistant.voice.voice_catalog import (
+    EDGE_ZH_VOICES,
     list_voice_profiles_dicts,
     normalize_edge_rate,
     persist_speaker_voice_config,
     resolve_edge_voice,
 )
+from xiao_speaker_assistant.web import load_console_html
 
 logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "xiao-speaker-assistant", "version": "0.1.0"}
+
+AVAILABLE_MODELS: tuple[dict[str, str], ...] = (
+    {"id": "raven/gemini-4-hydrogen#medium", "label": "Gemini 4 Hydrogen · Medium (推荐均衡)"},
+    {"id": "raven/gemini-4-hydrogen#low", "label": "Gemini 4 Hydrogen · Low (低延迟)"},
+    {"id": "raven/gemini-4-hydrogen", "label": "Gemini 4 Hydrogen (默认)"},
+    {"id": "raven/gpt-6.1-sol#medium", "label": "GPT-6.1 Sol · Medium (约3.2s)"},
+    {"id": "raven/gpt-6.1-sol#low", "label": "GPT-6.1 Sol · Low (约2.9s)"},
+    {"id": "raven/gpt-6.1-sol", "label": "GPT-6.1 Sol (默认)"},
+    {"id": "raven/gpt-5.6-sol-fast", "label": "GPT-5.6 Sol Fast (约2.4s)"},
+    {"id": "raven/gpt-5.4-nano", "label": "GPT-5.4 Nano (极速)"},
+)
+_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:#[A-Za-z0-9._-]+)?$")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -431,9 +454,13 @@ class McpServer:
         memory_store: MemoryStore | None = None,
         reminder_store: ReminderStore | None = None,
         speaker_store: SpeakerProfileStore | None = None,
+        history_store: ConversationHistoryStore | None = None,
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
+        on_model_changed: Callable[[str], None] | None = None,
         config_path: str | Path | None = None,
+        speakers_path: str | Path | None = None,
+        reminders_path: str | Path | None = None,
         http_client: httpx.AsyncClient | None = None,
         include_local_tools: bool = False,
         mac_allowed_roots: Sequence[str | Path] | None = None,
@@ -455,9 +482,13 @@ class McpServer:
         self.speaker_store = speaker_store or SpeakerProfileStore(
             self._config.speech.speaker_profiles_file
         )
+        self.history_store = history_store or ConversationHistoryStore()
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
+        self._on_model_changed = on_model_changed
         self._config_path = config_path
+        self._speakers_path = Path(speakers_path).expanduser() if speakers_path is not None else None
+        self._reminders_path = Path(reminders_path).expanduser() if reminders_path is not None else None
         self._http_client = http_client
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
@@ -1371,6 +1402,283 @@ class McpServer:
         removed = self.speaker_store.delete_profile(target)
         return self._tool_result({"removed": removed, "name_or_id": target})
 
+    @staticmethod
+    def _validate_model_ref(raw_model: str) -> str:
+        cleaned = raw_model.strip()
+        if not cleaned or len(cleaned) > 120 or not _MODEL_REF_RE.fullmatch(cleaned):
+            raise ValueError(
+                f"Invalid model {raw_model!r}; expected format 'provider/model[#variant]', "
+                "e.g. 'raven/gemini-4-hydrogen#medium'."
+            )
+        return cleaned
+
+    @staticmethod
+    def _parse_memory_payload(body: dict[str, Any]) -> tuple[str, str, str]:
+        category = str(body.get("category") or "fact").strip() or "fact"
+        key = str(body.get("key") or "").strip()
+        value = str(body.get("value") or "").strip()
+        if key and value:
+            return key, value, category
+        fact = str(body.get("fact") or "").strip()
+        if not fact:
+            raise ValueError("Provide either 'fact' or both 'key' and 'value'.")
+        for sep in ("：", ":"):
+            if sep in fact:
+                left, right = fact.split(sep, 1)
+                if left.strip() and right.strip():
+                    return left.strip()[:80], right.strip(), category
+        derived_key = re.sub(r"\s+", " ", fact)[:24].strip() or "偏好"
+        return derived_key, fact, category
+
+    def _build_capabilities(self) -> list[dict[str, Any]]:
+        cfg = self._config
+        outlook_client_id_set = bool(read_env_secret(cfg.tools.outlook.client_id_env))
+        outlook_cache_ok = Path(cfg.tools.outlook.token_cache_file).expanduser().is_file()
+        edge_app_found = (
+            Path("/Applications/Microsoft Edge.app").exists() or shutil.which("msedge") is not None
+        )
+        try:
+            codex_bin = resolve_binary(cfg.llm.providers.codex.binary)
+            codex_ready = True
+        except RuntimeError:
+            codex_bin = ""
+            codex_ready = False
+        mem_count = len(self.memory_store.search("", limit=100))
+
+        return [
+            {
+                "id": "weather",
+                "name": "Weather 天气查询",
+                "enabled": True,
+                "status_label": "已就绪",
+                "description": "实时天气与未来7天预报（wttr.in + Open-Meteo）",
+                "detail": "weather_query · 免密钥直连",
+            },
+            {
+                "id": "web_search",
+                "name": "Web Search 联网搜索",
+                "enabled": True,
+                "status_label": "已就绪",
+                "description": "Bing 中文实时新闻、百科与价格检索",
+                "detail": "web_search · zh-CN",
+            },
+            {
+                "id": "memory",
+                "name": "Memory 长期记忆",
+                "enabled": bool(cfg.memory.enabled),
+                "status_label": "已启用" if cfg.memory.enabled else "已禁用",
+                "description": "持久化个人偏好与常用事实（0600 隔离存储）",
+                "detail": f"已存 {mem_count} 条 · 上限注入 {cfg.memory.max_prompt_items} 条",
+            },
+            {
+                "id": "voice_switching",
+                "name": "Voice Switching 音色切换",
+                "enabled": True,
+                "status_label": "已就绪",
+                "description": "支持对话与控制台实时切换 Edge-TTS 中文音色与语速",
+                "detail": f"{len(EDGE_ZH_VOICES)} 个精选音色 · 当前 {cfg.speaker.edge_voice}",
+            },
+            {
+                "id": "xiaohongshu",
+                "name": "Xiaohongshu MCP 小红书",
+                "enabled": bool(cfg.tools.xiaohongshu.enabled),
+                "status_label": "已启用" if cfg.tools.xiaohongshu.enabled else "未启用",
+                "description": "搜索小红书笔记与详情解析",
+                "detail": cfg.tools.xiaohongshu.mcp_url,
+            },
+            {
+                "id": "browser",
+                "name": "Edge Browser MCP 浏览器",
+                "enabled": bool(cfg.tools.browser.enabled or edge_app_found),
+                "status_label": "MCP 已启用" if cfg.tools.browser.enabled else ("本地 Edge 就绪" if edge_app_found else "HTTP 摘要可用"),
+                "description": "网页正文抓取与 Microsoft Edge 打开/页面快照",
+                "detail": cfg.tools.browser.mcp_url if cfg.tools.browser.enabled else "browser_fetch_summary + browser_open_edge",
+            },
+            {
+                "id": "outlook",
+                "name": "Outlook 邮件助手",
+                "enabled": bool(cfg.tools.outlook.enabled),
+                "status_label": "已启用" if cfg.tools.outlook.enabled else "已禁用",
+                "description": "读取最近邮件并在语音二次确认后发送邮件",
+                "detail": f"client_id={'已配置' if outlook_client_id_set else '未配置'} · cache={'存在' if outlook_cache_ok else '未登录'}",
+            },
+            {
+                "id": "codex",
+                "name": "Codex 代码分析",
+                "enabled": codex_ready,
+                "status_label": "已就绪" if codex_ready else "未检测到 CLI",
+                "description": "调用本地只读 Codex CLI 分析代码与技术问题",
+                "detail": codex_bin or cfg.llm.providers.codex.binary,
+            },
+            {
+                "id": "mac_local",
+                "name": "Mac Disk / Files 本机访问",
+                "enabled": True,
+                "status_label": "已就绪",
+                "description": "受限读取 ~/Desktop, ~/Downloads, ~/Documents 与磁盘空间",
+                "detail": "mac_disk_usage · mac_list_recent_files · mac_read_text_file",
+            },
+        ]
+
+    def _build_overview_payload(self) -> dict[str, Any]:
+        cfg = self._config
+        current_model = cfg.llm.providers.opencode.model
+        models = list(AVAILABLE_MODELS)
+        if current_model and all(m["id"] != current_model for m in models):
+            models.insert(0, {"id": current_model, "label": f"{current_model} (当前)"})
+        voice_name = next(
+            (v.name for v in EDGE_ZH_VOICES if v.id == cfg.speaker.edge_voice),
+            cfg.speaker.edge_voice,
+        )
+        return {
+            "assistant_name": cfg.persona.assistant_name,
+            "model": current_model,
+            "default_provider": cfg.llm.default_provider,
+            "available_models": models,
+            "voice": cfg.speaker.edge_voice,
+            "voice_name": voice_name,
+            "rate": cfg.speaker.edge_rate,
+            "available_voices": list_voice_profiles_dicts(),
+            "tts_provider": cfg.speaker.tts_provider,
+            "speaker_model": cfg.speaker.model,
+            "asr_provider": cfg.speech.asr_provider,
+            "asr_model": cfg.speech.asr_model,
+            "asr_language": cfg.speech.asr_language,
+            "aec_enabled": bool(cfg.speech.aec_enabled),
+            "capture_channels": cfg.speech.capture_channels,
+            "wakewords": {
+                "local": list(cfg.speech.local_keywords),
+                "english": list(cfg.speech.en_keywords) if cfg.speech.en_kws_enabled else [],
+                "en_kws_enabled": bool(cfg.speech.en_kws_enabled),
+            },
+            "config_path": str(self._config_path) if self._config_path else "config.yaml",
+            "stats": self.history_store.stats(),
+            "capabilities": self._build_capabilities(),
+        }
+
+    @staticmethod
+    def _sanitize_voiceprint(item: dict[str, Any], fallback_id: str = "") -> dict[str, Any]:
+        vp_id = str(item.get("id") or fallback_id or item.get("name") or "").strip()
+        embeddings = item.get("embeddings") or item.get("embedding")
+        sample_count = item.get("sample_count")
+        if sample_count is None and isinstance(embeddings, list):
+            sample_count = len(embeddings) if embeddings and isinstance(embeddings[0], list) else (1 if embeddings else 0)
+        return {
+            "id": vp_id,
+            "name": str(item.get("name") or vp_id or "未命名"),
+            "role": str(item.get("role") or ""),
+            "capabilities": list(item.get("capabilities") or []) if isinstance(item.get("capabilities"), list) else [],
+            "notes": str(item.get("notes") or ""),
+            "preferred_voice": item.get("preferred_voice"),
+            "sample_count": int(sample_count or 0),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+        }
+
+    def _read_voiceprints(self) -> list[dict[str, Any]]:
+        if self._speakers_path is None:
+            return self.speaker_store.list_profiles()
+        if not self._speakers_path.is_file():
+            return []
+        try:
+            raw = json.loads(self._speakers_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(raw, list):
+            return [self._sanitize_voiceprint(x) for x in raw if isinstance(x, dict)]
+        if isinstance(raw, dict):
+            nested = raw.get("speakers") or raw.get("voiceprints")
+            if isinstance(nested, list):
+                return [self._sanitize_voiceprint(x) for x in nested if isinstance(x, dict)]
+            return [
+                self._sanitize_voiceprint(val, fallback_id=str(k))
+                for k, val in raw.items()
+                if isinstance(val, dict)
+            ]
+        return []
+
+    def _delete_voiceprint(self, vp_id: str) -> bool:
+        target = vp_id.strip()
+        if not target:
+            return False
+        if self._speakers_path is None:
+            return self.speaker_store.delete_profile(target)
+        if not self._speakers_path.is_file():
+            return False
+        try:
+            raw = json.loads(self._speakers_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        removed = False
+        updated: Any = raw
+        if isinstance(raw, list):
+            kept = [
+                x
+                for x in raw
+                if not (isinstance(x, dict) and (str(x.get("id") or "") == target or str(x.get("name") or "") == target))
+            ]
+            removed = len(kept) < len(raw)
+            updated = kept
+        elif isinstance(raw, dict):
+            for key in ("speakers", "voiceprints"):
+                if isinstance(raw.get(key), list):
+                    items = raw[key]
+                    kept = [
+                        x
+                        for x in items
+                        if not (isinstance(x, dict) and (str(x.get("id") or "") == target or str(x.get("name") or "") == target))
+                    ]
+                    if len(kept) < len(items):
+                        removed = True
+                        updated = {**raw, key: kept}
+                    break
+            else:
+                if target in raw:
+                    updated = {k: v for k, v in raw.items() if k != target}
+                    removed = True
+                else:
+                    kept_map = {
+                        k: v
+                        for k, v in raw.items()
+                        if not (isinstance(v, dict) and (str(v.get("id") or "") == target or str(v.get("name") or "") == target))
+                    }
+                    if len(kept_map) < len(raw):
+                        removed = True
+                        updated = kept_map
+
+        if not removed:
+            return False
+
+        tmp_path = self._speakers_path.with_suffix(".tmp")
+        payload = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, self._speakers_path)
+        os.chmod(self._speakers_path, 0o600)
+        return True
+
+    def _read_reminders(self) -> list[dict[str, Any]]:
+        if self._reminders_path is None:
+            return [asdict(e) for e in self.reminder_store.list_entries()]
+        if not self._reminders_path.is_file():
+            return []
+        try:
+            raw = json.loads(self._reminders_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        if isinstance(raw, dict):
+            nested = raw.get("reminders")
+            if isinstance(nested, list):
+                return [x for x in nested if isinstance(x, dict)]
+        return []
+
     async def start_http_server(
         self,
         host: str = "127.0.0.1",
@@ -1378,7 +1686,7 @@ class McpServer:
         *,
         auth_token: str | None = None,
     ) -> tuple[web.AppRunner, int]:
-        """Start an in-process Streamable-HTTP MCP endpoint on `/mcp`."""
+        """Start an in-process Streamable-HTTP MCP endpoint on `/mcp` and Web Console on `/`."""
 
         def _check_security(request: web.Request) -> web.Response | None:
             # Reject any browser cross-origin / no-cors simple requests immediately.
@@ -1401,6 +1709,29 @@ class McpServer:
                         status=401,
                     )
             return None
+
+        def _check_console_write_security(request: web.Request) -> web.Response | None:
+            origin = request.headers.get("Origin")
+            if origin:
+                parsed = urlparse(origin)
+                if (parsed.hostname or "").lower() not in _LOOPBACK_HOSTS:
+                    return web.json_response(
+                        {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
+                        status=403,
+                    )
+            remote = (request.remote or "").strip()
+            if remote in _LOOPBACK_REMOTES:
+                return None
+            if auth_token:
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header.startswith("Bearer ") and hmac.compare_digest(
+                    auth_header[7:].strip(), auth_token
+                ):
+                    return None
+            return web.json_response(
+                {"error": "forbidden", "message": "Write API is restricted to loopback or Bearer token"},
+                status=403,
+            )
 
         async def handle_mcp_post(request: web.Request) -> web.Response:
             denied = _check_security(request)
@@ -1443,11 +1774,191 @@ class McpServer:
         async def handle_health(_request: web.Request) -> web.Response:
             return web.json_response({"ok": True, "server": SERVER_INFO})
 
+        async def handle_console_index(_request: web.Request) -> web.Response:
+            return web.Response(
+                text=load_console_html(),
+                content_type="text/html",
+                charset="utf-8",
+            )
+
+        async def handle_api_overview(_request: web.Request) -> web.Response:
+            return web.json_response(self._build_overview_payload())
+
+        async def handle_api_history_get(request: web.Request) -> web.Response:
+            raw_limit = request.query.get("limit", "50")
+            try:
+                limit = max(1, min(500, int(raw_limit)))
+            except ValueError:
+                return web.json_response({"error": "invalid_limit", "message": "Invalid limit parameter"}, status=400)
+            speaker = request.query.get("speaker", "")
+            entries = self.history_store.list(limit=limit, speaker=speaker)
+            return web.json_response(
+                {
+                    "turns": [asdict(e) for e in entries],
+                    "count": len(entries),
+                    "stats": self.history_store.stats(),
+                }
+            )
+
+        async def handle_api_history_delete(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            cleared = self.history_store.clear()
+            return web.json_response({"cleared": cleared, "stats": self.history_store.stats()})
+
+        async def handle_api_memories_get(request: web.Request) -> web.Response:
+            q = request.query.get("q", "")
+            raw_limit = request.query.get("limit", "100")
+            try:
+                limit = max(1, min(200, int(raw_limit)))
+            except ValueError:
+                limit = 100
+            items = self.memory_store.search(q, limit=limit) if self._config.memory.enabled else []
+            return web.json_response(
+                {
+                    "memories": [asdict(e) for e in items],
+                    "count": len(items),
+                    "enabled": bool(self._config.memory.enabled),
+                }
+            )
+
+        async def handle_api_memories_post(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            if not self._config.memory.enabled:
+                return web.json_response(
+                    {"error": "memory_disabled", "message": "Long-term memory is disabled."},
+                    status=400,
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+            try:
+                key, value, category = self._parse_memory_payload(body)
+                entry = self.memory_store.save(key, value, category=category)
+            except (ValueError, MemorySecurityError) as exc:
+                return web.json_response({"error": "memory_rejected", "message": str(exc)}, status=400)
+            if self._on_memory_changed is not None:
+                self._on_memory_changed()
+            return web.json_response({"memory": asdict(entry)}, status=201)
+
+        async def handle_api_memories_delete(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            mem_id = request.match_info.get("id", "").strip()
+            removed = self.memory_store.forget(mem_id)
+            if not removed:
+                return web.json_response({"error": "not_found", "removed": False, "id": mem_id}, status=404)
+            if self._on_memory_changed is not None:
+                self._on_memory_changed()
+            return web.json_response({"removed": True, "id": mem_id})
+
+        async def handle_api_settings_post(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+
+            has_model = "model" in body and str(body.get("model") or "").strip() != ""
+            has_voice = "edge_voice" in body and str(body.get("edge_voice") or "").strip() != ""
+            has_rate = "edge_rate" in body and str(body.get("edge_rate") or "").strip() != ""
+            if not (has_model or has_voice or has_rate):
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "Provide at least one of 'model', 'edge_voice', or 'edge_rate'."},
+                    status=400,
+                )
+
+            new_model = self._config.llm.providers.opencode.model
+            new_voice = self._config.speaker.edge_voice
+            new_rate = self._config.speaker.edge_rate
+
+            try:
+                if has_model:
+                    new_model = self._validate_model_ref(str(body["model"]))
+                if has_voice:
+                    new_voice = resolve_edge_voice(str(body["edge_voice"])).id
+                if has_rate:
+                    new_rate = normalize_edge_rate(str(body["edge_rate"]))
+            except ValueError as exc:
+                return web.json_response({"error": "invalid_settings", "message": str(exc)}, status=400)
+
+            self._config.llm.providers.opencode.model = new_model
+            self._config.speaker.edge_voice = new_voice
+            self._config.speaker.edge_rate = new_rate
+
+            should_persist = self._config_path is not None or Path("config.yaml").exists()
+            persisted = False
+            if should_persist:
+                await asyncio.to_thread(
+                    persist_runtime_settings,
+                    self._config_path,
+                    model=new_model if has_model else None,
+                    edge_voice=new_voice if has_voice else None,
+                    edge_rate=new_rate if has_rate else None,
+                )
+                persisted = True
+
+            if (has_voice or has_rate) and self._on_voice_changed is not None:
+                self._on_voice_changed(new_voice, new_rate)
+            if has_model and self._on_model_changed is not None:
+                self._on_model_changed(new_model)
+
+            return web.json_response(
+                {
+                    "status": "updated",
+                    "model": new_model,
+                    "edge_voice": new_voice,
+                    "edge_rate": new_rate,
+                    "persisted": persisted,
+                }
+            )
+
+        async def handle_api_voiceprints_get(_request: web.Request) -> web.Response:
+            items = self._read_voiceprints()
+            return web.json_response({"voiceprints": items, "count": len(items)})
+
+        async def handle_api_voiceprints_delete(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            vp_id = request.match_info.get("id", "").strip()
+            removed = self._delete_voiceprint(vp_id)
+            if not removed:
+                return web.json_response({"error": "not_found", "removed": False, "id": vp_id}, status=404)
+            return web.json_response({"removed": True, "id": vp_id})
+
+        async def handle_api_reminders_get(_request: web.Request) -> web.Response:
+            items = self._read_reminders()
+            return web.json_response({"reminders": items, "count": len(items)})
+
         app = web.Application()
         app.router.add_post("/mcp", handle_mcp_post)
         app.router.add_get("/mcp", handle_mcp_get)
         app.router.add_delete("/mcp", handle_mcp_delete)
         app.router.add_get("/health", handle_health)
+
+        app.router.add_get("/", handle_console_index)
+        app.router.add_get("/api/overview", handle_api_overview)
+        app.router.add_get("/api/history", handle_api_history_get)
+        app.router.add_delete("/api/history", handle_api_history_delete)
+        app.router.add_get("/api/memories", handle_api_memories_get)
+        app.router.add_post("/api/memories", handle_api_memories_post)
+        app.router.add_delete("/api/memories/{id}", handle_api_memories_delete)
+        app.router.add_post("/api/settings", handle_api_settings_post)
+        app.router.add_get("/api/voiceprints", handle_api_voiceprints_get)
+        app.router.add_delete("/api/voiceprints/{id}", handle_api_voiceprints_delete)
+        app.router.add_get("/api/reminders", handle_api_reminders_get)
 
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -1457,7 +1968,7 @@ class McpServer:
         actual_port = port
         if site._server and site._server.sockets:  # type: ignore[attr-defined]
             actual_port = int(site._server.sockets[0].getsockname()[1])  # type: ignore[attr-defined]
-        logger.info("Unified HTTP MCP server listening on http://%s:%d/mcp", host, actual_port)
+        logger.info("Unified HTTP MCP & Web Console listening on http://%s:%d/ (MCP at /mcp)", host, actual_port)
         return runner, actual_port
 
     async def serve_stdio(
