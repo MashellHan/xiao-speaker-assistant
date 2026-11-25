@@ -54,12 +54,12 @@ class SpeechConfig(BaseModel):
     capture_channels: Literal[1, 2] = 1
     capture_bits_per_sample: Literal[16, 32] = 16
     s32_shift: int = 16
-    kws_score: float = 2.5
-    kws_threshold: float = 0.15
-    vad_threshold: float = 0.20
+    kws_score: float = 2.0
+    kws_threshold: float = 0.20
+    vad_threshold: float = 0.03
     vad_min_silence_ms: int = 550
     input_gain: float = 1.0
-    agc_enabled: bool = True
+    agc_enabled: bool = False
     agc_target_rms: float = 0.10
     agc_max_gain: float = 48.0
     aec_enabled: bool = False

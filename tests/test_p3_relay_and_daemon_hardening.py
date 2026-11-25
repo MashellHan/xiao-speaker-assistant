@@ -78,7 +78,7 @@ def test_relay_host_client_sends_configured_start_recording_and_cleans_up() -> N
                     assert req["payload"]["pcm"] == "xsa_aec"
                     assert req["payload"]["channels"] == 2
                     assert req["payload"]["bits_per_sample"] == 32
-                    assert req["payload"]["period_size"] == 1600
+                    assert req["payload"]["period_size"] == 360
                     assert len(gw._sessions) == 1
                     assert len(gw._playbacks) == 1
             finally:

@@ -18,6 +18,7 @@ import httpx
 
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
+from xiao_speaker_assistant.llm.openai_bridge import OpenAIBridgeServer
 from xiao_speaker_assistant.llm.opencode_server import load_or_create_mcp_token
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import (
@@ -282,6 +283,19 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         confirmations.clear()
 
     try:
+        if args.command == "openai-bridge":
+            bridge = OpenAIBridgeServer(
+                ask_fn=handle_query,
+                speaker_config=config.speaker,
+                on_reset=reset_all,
+                auth_token=read_env_secret(args.token_env) if getattr(args, "token_env", None) else None,
+            )
+            bridge_runner, _ = await bridge.start(host=args.host, port=args.port)
+            try:
+                await asyncio.Future()
+            finally:
+                await bridge_runner.cleanup()
+            return
         if args.relay:
             await run_with_relay(
                 config,
@@ -348,6 +362,23 @@ def main(argv: list[str] | None = None) -> int:
         choices=["opencode", "codex", "codex_api", "gemini_api"],
         help="Override default LLM provider",
     )
+
+    bridge_p = sub.add_parser(
+        "openai-bridge",
+        help="Run local OpenAI-compatible HTTP bridge (/v1/chat/completions & /v1/audio/speech) for open-xiaoai-bridge",
+    )
+    bridge_p.add_argument("--host", default="127.0.0.1")
+    bridge_p.add_argument("--port", type=int, default=4395)
+    bridge_p.add_argument(
+        "--provider",
+        choices=["opencode", "codex", "codex_api", "gemini_api"],
+        help="Override default LLM provider",
+    )
+    bridge_p.add_argument(
+        "--token-env",
+        default="XSA_BRIDGE_TOKEN",
+        help="Optional env var for Bearer authentication (default: XSA_BRIDGE_TOKEN)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -394,6 +425,9 @@ def main(argv: list[str] | None = None) -> int:
                     await mcp_runner.cleanup()
 
         print(asyncio.run(_ask_once()))
+        return 0
+    if args.command == "openai-bridge":
+        asyncio.run(_serve_async(config, args))
         return 0
     if args.command == "serve":
         if args.host:

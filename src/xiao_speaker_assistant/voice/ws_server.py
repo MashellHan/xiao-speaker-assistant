@@ -243,8 +243,8 @@ class SpeakerGateway:
                 "channels": ch,
                 "bits_per_sample": bits,
                 "sample_rate": 16000,
-                "period_size": 1600,
-                "buffer_size": 3200,
+                "period_size": 360,
+                "buffer_size": 1440,
             },
         )
         sess.last_audio_at = time.monotonic()
@@ -268,8 +268,8 @@ class SpeakerGateway:
                         "channels": ch,
                         "bits_per_sample": bits,
                         "sample_rate": 16000,
-                        "period_size": 1600,
-                        "buffer_size": 3200,
+                        "period_size": 360,
+                        "buffer_size": 1440,
                     },
                 )
                 sess.last_audio_at = time.monotonic()
