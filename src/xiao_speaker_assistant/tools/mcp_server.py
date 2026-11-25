@@ -39,6 +39,12 @@ from xiao_speaker_assistant.tools.mac_local import (
 from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
+from xiao_speaker_assistant.voice.voice_catalog import (
+    list_voice_profiles_dicts,
+    normalize_edge_rate,
+    persist_speaker_voice_config,
+    resolve_edge_voice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +277,32 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["key_or_id"],
         },
     },
+    {
+        "name": "speaker_list_voices",
+        "description": "List available Edge-TTS Chinese voice profiles (name, ID, gender, style).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "speaker_set_voice",
+        "description": (
+            "Switch the speaker TTS voice and/or speech rate immediately (e.g. '晓伊', '云希', "
+            "'男声', '东北话', '+15%'), optionally persisting to config.yaml."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "voice": {
+                    "type": "string",
+                    "description": "Voice ID or friendly Chinese name (e.g. 晓伊, 云希, 云扬, 东北话)",
+                },
+                "rate": {
+                    "type": "string",
+                    "description": "Optional speech rate percentage, e.g. '+10%' or '-10%'",
+                },
+                "persist": {"type": "boolean", "default": True},
+            },
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -289,6 +321,8 @@ class McpServer:
         confirmation_store: ConfirmationStore | None = None,
         memory_store: MemoryStore | None = None,
         on_memory_changed: Callable[[], None] | None = None,
+        on_voice_changed: Callable[[str, str], None] | None = None,
+        config_path: str | Path | None = None,
         http_client: httpx.AsyncClient | None = None,
         include_local_tools: bool = False,
         mac_allowed_roots: Sequence[str | Path] | None = None,
@@ -305,6 +339,8 @@ class McpServer:
             self._config.memory.file_path
         )
         self._on_memory_changed = on_memory_changed
+        self._on_voice_changed = on_voice_changed
+        self._config_path = config_path
         self._http_client = http_client
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
@@ -432,6 +468,10 @@ class McpServer:
             return self._ok(req_id, await self._call_memory_search(args))
         if name == "memory_forget":
             return self._ok(req_id, await self._call_memory_forget(args))
+        if name == "speaker_list_voices":
+            return self._ok(req_id, self._call_speaker_list_voices())
+        if name == "speaker_set_voice":
+            return self._ok(req_id, await self._call_speaker_set_voice(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -969,6 +1009,61 @@ class McpServer:
         if removed and self._on_memory_changed is not None:
             self._on_memory_changed()
         return self._tool_result({"removed": removed, "key_or_id": key_or_id})
+
+    def _call_speaker_list_voices(self) -> dict[str, Any]:
+        return self._tool_result(
+            {
+                "current_voice": self._config.speaker.edge_voice,
+                "current_rate": self._config.speaker.edge_rate,
+                "voices": list_voice_profiles_dicts(),
+            }
+        )
+
+    async def _call_speaker_set_voice(self, args: dict[str, Any]) -> dict[str, Any]:
+        raw_voice = str(args.get("voice") or "").strip()
+        raw_rate = str(args.get("rate") or "").strip()
+        persist = bool(args.get("persist", True))
+        if not raw_voice and not raw_rate:
+            return self._tool_result(
+                {"error": "invalid_arguments", "message": "Provide 'voice' and/or 'rate'."},
+                is_error=True,
+            )
+        new_voice = self._config.speaker.edge_voice
+        new_rate = self._config.speaker.edge_rate
+        voice_label = new_voice
+        try:
+            if raw_voice:
+                profile = resolve_edge_voice(raw_voice)
+                new_voice = profile.id
+                voice_label = f"{profile.name} ({profile.style})"
+            if raw_rate:
+                new_rate = normalize_edge_rate(raw_rate)
+        except ValueError as exc:
+            return self._tool_result(
+                {"error": "invalid_voice_or_rate", "message": str(exc)},
+                is_error=True,
+            )
+
+        self._config.speaker.edge_voice = new_voice
+        self._config.speaker.edge_rate = new_rate
+        if persist:
+            await asyncio.to_thread(
+                persist_speaker_voice_config,
+                self._config_path,
+                edge_voice=new_voice,
+                edge_rate=new_rate,
+            )
+        if self._on_voice_changed is not None:
+            self._on_voice_changed(new_voice, new_rate)
+        return self._tool_result(
+            {
+                "status": "updated",
+                "voice": new_voice,
+                "voice_label": voice_label,
+                "rate": new_rate,
+                "persisted": persist,
+            }
+        )
 
     async def start_http_server(
         self,
