@@ -117,6 +117,7 @@ async def stream_edge_tts_pcm(
     text: str,
     *,
     voice: str = "zh-CN-XiaoxiaoNeural",
+    rate: str = "+0%",
     sample_rate: int = 24000,
     chunk_bytes: int = 4800,
 ) -> AsyncIterator[bytes]:
@@ -154,7 +155,7 @@ async def stream_edge_tts_pcm(
 
     async def feed_mp3() -> None:
         try:
-            comm = edge_tts.Communicate(text, voice)
+            comm = edge_tts.Communicate(text, voice, rate=rate)
             async for item in comm.stream():
                 if item.get("type") == "audio":
                     data = item.get("data")
@@ -207,6 +208,7 @@ async def synthesize_tts_pcm_stream(
     text: str,
     config: SpeakerConfig,
     *,
+    voice_override: str | None = None,
     chunk_bytes: int = 4800,
 ) -> AsyncIterator[bytes]:
     """Stream PCM chunks using configured TTS provider with offline macOS `say` fallback."""
@@ -215,7 +217,8 @@ async def synthesize_tts_pcm_stream(
             got_any = False
             async for chunk in stream_edge_tts_pcm(
                 text,
-                voice=config.edge_voice,
+                voice=voice_override or config.edge_voice,
+                rate=config.edge_rate,
                 sample_rate=config.tts_sample_rate,
                 chunk_bytes=chunk_bytes,
             ):

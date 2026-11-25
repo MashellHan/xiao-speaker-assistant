@@ -348,6 +348,110 @@ class LocalSpeechPipeline:
             if self._en_kws is not None and self._en_kws_stream is not None:
                 self._en_kws.reset_stream(self._en_kws_stream)
 
+    def update_config(self, new_config: SpeechConfig) -> None:
+        """Hot-reload speech thresholds, gain, AEC/AGC, and keywords safely under `_lock`."""
+        import sherpa_onnx
+
+        with self._lock:
+            old_cfg = self._config
+            self._config = new_config
+            models_dir = Path(new_config.models_dir).expanduser()
+
+            if (
+                new_config.local_keywords != old_cfg.local_keywords
+                or new_config.interrupt_keywords != old_cfg.interrupt_keywords
+                or new_config.kws_score != old_cfg.kws_score
+                or new_config.kws_threshold != old_cfg.kws_threshold
+            ):
+                self._wake_set = {
+                    _normalize_kws_tag(kw) for kw in new_config.local_keywords if kw.strip()
+                }
+                self._interrupt_set = {
+                    _normalize_kws_tag(kw) for kw in new_config.interrupt_keywords if kw.strip()
+                }
+                combined_keywords = list(
+                    dict.fromkeys([*new_config.local_keywords, *new_config.interrupt_keywords])
+                )
+                kw_file = generate_keywords_file(
+                    models_dir, combined_keywords, filename="keywords.txt"
+                )
+                self._kws = sherpa_onnx.KeywordSpotter(
+                    provider="cpu",
+                    num_threads=1,
+                    max_active_paths=8,
+                    keywords_score=new_config.kws_score,
+                    keywords_threshold=new_config.kws_threshold,
+                    num_trailing_blanks=0,
+                    keywords_file=str(kw_file),
+                    tokens=str(models_dir / "tokens.txt"),
+                    encoder=str(models_dir / "encoder.onnx"),
+                    decoder=str(models_dir / "decoder.onnx"),
+                    joiner=str(models_dir / "joiner.onnx"),
+                )
+                self._kws_stream = self._kws.create_stream()
+
+            if (
+                new_config.en_kws_enabled != old_cfg.en_kws_enabled
+                or new_config.en_keywords != old_cfg.en_keywords
+                or new_config.en_kws_score != old_cfg.en_kws_score
+                or new_config.en_kws_threshold != old_cfg.en_kws_threshold
+            ):
+                self._en_kws = None
+                self._en_kws_stream = None
+                if new_config.en_kws_enabled:
+                    en_dir = find_english_kws_dir(models_dir)
+                    if en_dir is not None:
+                        en_kw_file = generate_english_keywords_file(en_dir, new_config.en_keywords)
+                        self._en_kws = sherpa_onnx.KeywordSpotter(
+                            provider="cpu",
+                            num_threads=1,
+                            max_active_paths=8,
+                            keywords_score=new_config.en_kws_score,
+                            keywords_threshold=new_config.en_kws_threshold,
+                            num_trailing_blanks=0,
+                            keywords_file=str(en_kw_file),
+                            tokens=str(en_dir / "tokens.txt"),
+                            encoder=str(en_dir / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                            decoder=str(en_dir / "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                            joiner=str(en_dir / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                        )
+                        self._en_kws_stream = self._en_kws.create_stream()
+
+            if (
+                new_config.vad_threshold != old_cfg.vad_threshold
+                or new_config.vad_min_silence_ms != old_cfg.vad_min_silence_ms
+            ):
+                silero = sherpa_onnx.SileroVadModelConfig(
+                    model=str(models_dir / "silero_vad.onnx"),
+                    threshold=new_config.vad_threshold,
+                    min_silence_duration=new_config.vad_min_silence_ms / 1000.0,
+                    min_speech_duration=0.10,
+                    window_size=VAD_WINDOW_SAMPLES,
+                    max_speech_duration=20.0,
+                )
+                vad_cfg = sherpa_onnx.VadModelConfig(
+                    silero_vad=silero,
+                    sample_rate=SAMPLE_RATE,
+                    num_threads=1,
+                    provider="cpu",
+                )
+                self._vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=30.0)
+                self._vad_buffer = np.zeros(0, dtype=np.float32)
+
+            if new_config.agc_enabled:
+                self._agc = DynamicAGC(
+                    target_rms=new_config.agc_target_rms,
+                    max_gain=new_config.agc_max_gain,
+                )
+            else:
+                self._agc = None
+
+            if new_config.aec_enabled and new_config.capture_channels >= 2:
+                if self._aec is None:
+                    self._aec = LinearEchoCanceller()
+            else:
+                self._aec = None
+
     def feed_pcm(
         self,
         pcm_bytes: bytes,

@@ -15,12 +15,19 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from xiao_speaker_assistant.config import LLMConfig, read_env_secret
+from xiao_speaker_assistant.config import (
+    AppConfig,
+    LLMConfig,
+    PersonaConfig,
+    read_env_secret,
+)
 from xiao_speaker_assistant.llm.opencode_server import (
     OpenCodeServerManager,
     OpenCodeV2Client,
     SessionNotFoundError,
+    ensure_agent_home,
 )
+from xiao_speaker_assistant.tools.memory import MemoryStore
 
 
 @dataclass(frozen=True)
@@ -132,15 +139,43 @@ class LLMRouter:
         *,
         mcp_url: str = "http://127.0.0.1:4397/mcp",
         mcp_auth_token: str | None = None,
+        persona: PersonaConfig | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_enabled: bool = True,
+        memory_max_items: int = 12,
     ) -> None:
         self._config = config
         self._client = client
         self._mcp_url = mcp_url
         self._mcp_auth_token = mcp_auth_token
+        self._persona = persona or PersonaConfig()
+        self._memory_store = memory_store
+        self._memory_enabled = memory_enabled
+        self._memory_max_items = memory_max_items
         self._opencode_mgr = OpenCodeServerManager(config.providers.opencode)
         self._opencode_v2: OpenCodeV2Client | None = None
+        self._v2_active = False
         self.opencode_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
+
+    def sync_agent_home(self) -> None:
+        """Rewrite isolated `opencode.jsonc` when persona, config, or long-term memory changes."""
+        if self._client is not None or not self._v2_active:
+            return
+        ensure_agent_home(
+            self._config.providers.opencode,
+            mcp_url=self._mcp_url,
+            system_prompt=self._build_system_prompt(),
+            mcp_auth_token=self._mcp_auth_token,
+        )
+
+    def reload_runtime_config(self, new_config: AppConfig) -> None:
+        self._config = new_config.llm
+        self._persona = new_config.persona
+        self._memory_enabled = new_config.memory.enabled
+        self._memory_max_items = new_config.memory.max_prompt_items
+        self._opencode_mgr._config = new_config.llm.providers.opencode
+        self.sync_agent_home()
 
     async def is_opencode_server_healthy(self) -> bool:
         if self._client is not None:
@@ -173,6 +208,7 @@ class LLMRouter:
         self._opencode_v2 = OpenCodeV2Client(
             base_url, password=password, timeout_sec=cfg.timeout_sec
         )
+        self._v2_active = True
 
     async def close(self) -> None:
         await self._opencode_mgr.stop()
@@ -197,19 +233,40 @@ class LLMRouter:
         return "\n".join(lines)
 
     def _build_system_prompt(self) -> str:
+        name = self._persona.assistant_name.strip() or "Nomi"
+        style = self._persona.style.strip() or "亲切自然、简短口语化、直接给出核心结论"
+        address = (
+            f"请称呼用户为“{self._persona.address_user_as.strip()}”。"
+            if self._persona.address_user_as.strip()
+            else ""
+        )
+        extra = (
+            f"{self._persona.extra_instructions.strip()}"
+            if self._persona.extra_instructions.strip()
+            else ""
+        )
+        memory_block = ""
+        if self._memory_enabled and self._memory_store is not None and self._memory_max_items > 0:
+            formatted = self._memory_store.format_for_prompt(limit=self._memory_max_items)
+            if formatted:
+                memory_block = f"\n\n{formatted}"
         return (
-            f"你是运行在用户 Mac 本机上的家庭语音助手 Nomi，回答将通过智能音箱朗读。"
+            f"你是运行在用户 Mac 本机上的家庭语音助手 {name}，回答将通过智能音箱朗读。"
+            f"你的性格与表达风格：{style}。{address}{extra}"
             f"你可以直接调用 xsa_tools 中的本机工具来回答问题：包括查询城市实时天气（weather_query）、"
-            f"联网搜索实时信息（web_search）、查询 Mac 磁盘空间（mac_disk_usage）、"
+            f"联网搜索实时信息（web_search）、长期记忆管理（memory_save / memory_search / memory_forget）、"
+            f"查询 Mac 磁盘空间（mac_disk_usage）、"
             f"读取本机允许目录的文件（mac_list_recent_files / mac_read_text_file）、"
             f"读取 Outlook 邮件（outlook_list_emails）、准备发邮件草稿（outlook_prepare_email）、"
             f"搜索小红书（xiaohongshu_search / xiaohongshu_detail）、网页摘要与用 Edge 打开网页（browser_fetch_summary / browser_open_edge）、"
             f"以及调用本地 Codex 做代码或技术分析（codex_analyze）。"
+            f"当用户说“记住……”或表达个人长期偏好时，请调用 memory_save 保存；当用户询问之前记住的信息时调用 memory_search。"
             f"准备发送邮件时只能调用 outlook_prepare_email 生成待确认草稿，并请用户口头说“确认发送”或“取消”，切勿声称邮件已发送。"
             f"不要回答“我无法访问你的电脑”或“还在学习中”。"
             f"无论用户使用中文、英文还是中英混合提问，请一律使用自然流畅的简体中文回答（专有名词可保留英文）。"
             f"请直接给出核心结论，简短口语化，不要使用 Markdown、代码块或 URL，"
             f"尽量控制在 100 字以内（不超过 {self._config.spoken_max_chars} 字）。"
+            f"{memory_block}"
         )
 
     async def ask(

@@ -20,6 +20,7 @@ from .mac_local import (
 )
 from .mcp_client import HttpMcpClient
 from .mcp_server import ALL_TOOL_DEFINITIONS, LOCAL_TOOL_DEFINITIONS, TOOL_DEFINITIONS, McpServer
+from .memory import MemoryEntry, MemorySecurityError, MemoryStore
 from .outlook import OutlookClient, PendingEmailDraft
 
 __all__ = [
@@ -31,6 +32,9 @@ __all__ = [
     "LOCAL_TOOL_DEFINITIONS",
     "MacLocalAccessError",
     "McpServer",
+    "MemoryEntry",
+    "MemorySecurityError",
+    "MemoryStore",
     "OutlookClient",
     "PendingEmailDraft",
     "TOOL_DEFINITIONS",

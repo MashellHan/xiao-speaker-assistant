@@ -219,7 +219,13 @@ class PlaybackController:
             finally:
                 await self._close_stream()
 
-    async def speak(self, text: str, *, interrupt_native: bool = True) -> None:
+    async def speak(
+        self,
+        text: str,
+        *,
+        interrupt_native: bool = True,
+        voice_override: str | None = None,
+    ) -> None:
         if not text.strip():
             return
         epoch = self._cancel_epoch
@@ -244,8 +250,13 @@ class PlaybackController:
                 if not await self.ensure_stream_started(epoch=epoch):
                     return
 
+                tts_stream = (
+                    synthesize_tts_pcm_stream(text, self._config, voice_override=voice_override)
+                    if voice_override
+                    else synthesize_tts_pcm_stream(text, self._config)
+                )
                 await self._stream_chunks(
-                    synthesize_tts_pcm_stream(text, self._config),
+                    tts_stream,
                     epoch,
                     pad_tail_sec=0.22,
                 )
