@@ -74,9 +74,20 @@ def test_gateway_barge_in_interrupt_cancels_active_streaming_reply() -> None:
                 return
             msg = json.loads(raw)
             req = msg.get("Request") or {}
-            sent_commands.append(str(req.get("command") or ""))
-            if req.get("command") == "run_shell" and isinstance(req.get("payload"), str):
+            cmd = str(req.get("command") or "")
+            sent_commands.append(cmd)
+            if cmd == "run_shell" and isinstance(req.get("payload"), str):
                 sent_commands.append(req["payload"])
+            if cmd == "start_play" and isinstance(req.get("id"), str):
+                req_id = req["id"]
+                asyncio.get_running_loop().call_soon(
+                    lambda: asyncio.create_task(
+                        gw._handle_text_message(
+                            self,
+                            json.dumps({"Response": {"id": req_id, "code": 0}}),
+                        )
+                    )
+                )
 
     async def slow_stream(query: str):
         yield "第一句很长的话。"

@@ -132,6 +132,9 @@ class SpeakerGateway:
             run_shell=lambda script, wait, timeout: self.run_shell(
                 conn, script, wait_response=wait, timeout=timeout
             ),
+            send_rpc=lambda cmd, payload, wait, timeout: self.send_command(
+                conn, cmd, payload, wait_response=wait, timeout=timeout
+            ),
             on_playback_state=on_state,
         )
         self._playbacks[conn] = pb

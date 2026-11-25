@@ -137,3 +137,41 @@ def test_playback_controller_cancel_epoch_aborts_queued_waiters_and_chime_skips_
     assert spoken_texts == ["第一句"]
     assert any(m["Request"]["command"] == "stop_play" for m in sent_text)
     assert any("player_wakeup" in s for s in run_shells)
+
+
+def test_playback_controller_awaits_start_play_ack_and_pads_trailing_silence() -> None:
+    events: list[str] = []
+    sent_binary: list[dict] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary.append(json.loads(b.decode("utf-8")))
+        events.append("binary")
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def fake_send_rpc(cmd: str, payload, wait: bool, timeout: float):
+        events.append(f"rpc:{cmd}:wait={wait}:buf={payload.get('buffer_size') if isinstance(payload, dict) else None}")
+        await asyncio.sleep(0.01)
+        return {"code": 0}
+
+    pb = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=fake_send_rpc,
+    )
+
+    async def run() -> None:
+        await pb.play_chime()
+
+    asyncio.run(run())
+    assert events[0] == "rpc:start_play:wait=True:buf=4800"
+    assert events[1] == "binary"
+    # Total PCM bytes sent must exceed ALSA 4800-frame (9600-byte) buffer_size so chime plays immediately.
+    total_bytes = sum(len(frame["bytes"]) for frame in sent_binary)
+    assert total_bytes >= 15000
