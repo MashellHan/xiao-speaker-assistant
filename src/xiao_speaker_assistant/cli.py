@@ -21,7 +21,10 @@ from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secre
 from xiao_speaker_assistant.config_watcher import ConfigWatcher
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
 from xiao_speaker_assistant.llm.openai_bridge import OpenAIBridgeServer
-from xiao_speaker_assistant.llm.opencode_server import load_or_create_mcp_token
+from xiao_speaker_assistant.llm.opencode_server import (
+    load_or_create_console_password,
+    load_or_create_mcp_token,
+)
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import (
     ConfirmationStore,
@@ -230,6 +233,12 @@ def cmd_doctor(config: AppConfig) -> int:
         f"  Browser / Edge:   mcp={'enabled' if config.tools.browser.enabled else 'disabled'}, "
         f"edge_app={'found' if edge_exists else 'not found'}, npx={'found' if npx_found else 'missing'}"
     )
+    agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
+    console_pw_file = agent_home / "console.token"
+    print(
+        f"  Web Console:      http://127.0.0.1:{config.tools.mcp_http_port}/ "
+        f"(remote password: XSA_CONSOLE_PASSWORD or {console_pw_file})"
+    )
     return 0
 
 
@@ -255,6 +264,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     history_store = ConversationHistoryStore()
     agent_home = Path(active_config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
+    console_password = load_or_create_console_password(agent_home)
 
     router: LLMRouter | None = None
     gateway: SpeakerGateway | None = None
@@ -283,6 +293,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         reminder_store=reminder_store,
         speaker_store=speaker_store,
         history_store=history_store,
+        console_password=console_password,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         on_model_changed=on_model_changed,

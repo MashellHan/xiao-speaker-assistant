@@ -24,39 +24,62 @@
       --dur-micro: 120ms;
       --dur-short: 220ms;
 
-      /* Furrow material tokens */
-      --color-paper: #f5f0e6;
-      --color-paper-2: #fdfbf7;
-      --color-paper-3: #ebe4d6;
-      --color-ink: #1f1b18;
-      --color-ink-2: #3b342f;
-      --color-muted: #665c54;
-      --color-rule: #d9d0c1;
+      /* Astryx Stone + Hallmark editorial tokens (Light default, Dark via [data-theme="dark"]) */
+      --color-paper: #f5f5f4;
+      --color-paper-2: #ffffff;
+      --color-paper-3: #eaeaec;
+      --color-ink: #25252a;
+      --color-ink-2: #3b3b42;
+      --color-muted: #6e6e75;
+      --color-rule: #e2e2e8;
       --color-accent: #e05d28;
       --color-accent-ink: #1f1b18;
-      --color-accent-soft: #f9dfd2;
+      --color-accent-soft: #ffede4;
       --color-focus: #c94c1a;
-      --color-green: #3f7d42;
-      --color-green-soft: #e1efe2;
+      --color-green: #528b49;
+      --color-green-soft: #e6f2e4;
       --color-error: #b83227;
       --color-error-soft: #f7dfdc;
-      --color-grid: #e5ddce;
-      --color-sheet: #fffdf9;
+      --color-grid: #e8e8ec;
+      --color-sheet: #ffffff;
 
-      --font-display: "Red Hat Display", "Red Hat Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+      --font-display: "Red Hat Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
       --font-body: "Red Hat Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
       --font-outlier: "Red Hat Mono", "SF Mono", Menlo, Monaco, Consolas, ui-monospace, monospace;
 
       --radius-card: 10px;
-      --radius-entry: 14px;
-      --radius-pill: 6px;
+      --radius-entry: 12px;
+      --radius-pill: 999px;
       --rule-hair: 1px;
-      --shadow-card: 0 1px 2px rgba(31, 27, 24, 0.08), 0 14px 28px -16px rgba(31, 27, 24, 0.22);
-      --shadow-lift: 0 1px 1px rgba(31, 27, 24, 0.1), 0 2px 4px -1px rgba(31, 27, 24, 0.1), 0 24px 44px -20px rgba(31, 27, 24, 0.34);
+      --shadow-card: 0 1px 2px rgba(37, 37, 42, 0.04), 0 8px 20px -14px rgba(37, 37, 42, 0.14);
+      --shadow-lift: 0 1px 2px rgba(37, 37, 42, 0.06), 0 16px 32px -18px rgba(37, 37, 42, 0.20);
       --tracking-display: -0.025em;
       --display-weight: 600;
       --container: 1200px;
       --gutter: 32px;
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --color-paper: #141417;
+      --color-paper-2: #1d1d22;
+      --color-paper-3: #27272e;
+      --color-ink: #f2f2f5;
+      --color-ink-2: #d3d3da;
+      --color-muted: #9898a2;
+      --color-rule: #2e2e36;
+      --color-accent: #e87a4e;
+      --color-accent-ink: #141417;
+      --color-accent-soft: #3a241b;
+      --color-focus: #f08e67;
+      --color-green: #6fb164;
+      --color-green-soft: #1d311c;
+      --color-error: #e56b60;
+      --color-error-soft: #3a1f1d;
+      --color-grid: #2a2a32;
+      --color-sheet: #232329;
+      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 24px -16px rgba(0, 0, 0, 0.55);
+      --shadow-lift: 0 1px 2px rgba(0, 0, 0, 0.45), 0 18px 34px -18px rgba(0, 0, 0, 0.65);
     }
 
     *, *::before, *::after { box-sizing: border-box; }
@@ -115,7 +138,7 @@
     /* Header & Tabs */
     .topbar {
       background: var(--color-paper-2);
-      border-bottom: var(--rule-hair) solid var(--color-ink);
+      border-bottom: var(--rule-hair) solid var(--color-rule);
       position: sticky;
       top: 0;
       z-index: 200;
@@ -595,6 +618,29 @@
       margin-bottom: var(--space-md);
     }
 
+    .login-gate {
+      min-height: 70vh;
+      display: grid;
+      place-items: center;
+      padding: var(--space-xl) var(--space-md);
+    }
+
+    .login-card {
+      width: 100%;
+      max-width: 420px;
+      display: grid;
+      gap: var(--space-md);
+    }
+
+    .login-error {
+      font-size: var(--text-sm);
+      color: var(--color-error);
+      background: var(--color-error-soft);
+      border: var(--rule-hair) solid color-mix(in oklab, var(--color-error) 35%, var(--color-rule));
+      border-radius: var(--radius-card);
+      padding: var(--space-xs) var(--space-sm);
+    }
+
     @media (max-width: 60rem) {
       :root { --gutter: 16px; }
       .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -634,10 +680,12 @@
             <span class="status-dot" aria-hidden="true"></span>
             <span id="serverStatusText">已连接</span>
           </span>
+          <button type="button" class="btn btn--sm" id="themeToggleBtn" aria-label="切换浅色/深色主题">深色</button>
           <button type="button" class="btn btn--sm" id="refreshBtn">刷新数据</button>
+          <button type="button" class="btn btn--sm btn--danger" id="logoutBtn" hidden>退出登录</button>
         </div>
       </div>
-      <nav class="tabs-bar" role="tablist" aria-label="控制台栏目">
+      <nav class="tabs-bar" id="tabsBar" role="tablist" aria-label="控制台栏目" hidden>
         <button type="button" class="tab-btn" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" data-tab="overview">概览与统计</button>
         <button type="button" class="tab-btn" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" data-tab="history">对话历史</button>
         <button type="button" class="tab-btn" role="tab" id="tab-capabilities" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">能力矩阵</button>
@@ -646,7 +694,24 @@
     </div>
   </header>
 
-  <main class="container">
+  <section id="loginGate" class="login-gate" hidden>
+    <article class="card card--notebook login-card">
+      <div>
+        <h2>远端访问验证</h2>
+        <div class="card-sub">检测到经由远端通道或非本机直连访问，请输入控制台口令（Mac 本机保存在 console.token 或 XSA_CONSOLE_PASSWORD）。</div>
+      </div>
+      <div id="loginError" class="login-error" hidden></div>
+      <form id="loginForm" class="panel" style="gap: var(--space-sm);">
+        <div class="field">
+          <label for="loginPassword">访问口令</label>
+          <input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入控制口令" required>
+        </div>
+        <button type="submit" class="btn btn--primary" id="loginSubmitBtn">验证并进入控制台</button>
+      </form>
+    </article>
+  </section>
+
+  <main class="container" id="mainApp" hidden>
     <!-- 1. Overview & Stats -->
     <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
       <div class="grid-4">
@@ -809,9 +874,26 @@
         voiceprints: [],
         reminders: [],
         activeTab: "overview",
+        authRequired: false,
       };
 
       const $ = (id) => document.getElementById(id);
+
+      function applyTheme(theme) {
+        const next = theme === "dark" ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", next);
+        $("themeToggleBtn").textContent = next === "dark" ? "浅色" : "深色";
+        try { localStorage.setItem("xsa_console_theme", next); } catch {}
+      }
+      try {
+        applyTheme(localStorage.getItem("xsa_console_theme") || "light");
+      } catch {
+        applyTheme("light");
+      }
+      $("themeToggleBtn").addEventListener("click", () => {
+        const cur = document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        applyTheme(cur === "dark" ? "light" : "dark");
+      });
 
       function escapeHtml(raw) {
         const s = String(raw ?? "");
@@ -848,10 +930,38 @@
           ...options,
         });
         const data = await resp.json().catch(() => ({}));
+        if (resp.status === 401 && url !== "/api/login" && url !== "/api/auth/status") {
+          showLoginGate("登录状态已过期，请重新验证");
+          throw new Error(data.message || "需要登录");
+        }
         if (!resp.ok) {
           throw new Error(data.message || data.error || `HTTP ${resp.status}`);
         }
         return data;
+      }
+
+      function showLoginGate(errMsg = "") {
+        $("mainApp").hidden = true;
+        $("tabsBar").hidden = true;
+        $("logoutBtn").hidden = true;
+        $("loginGate").hidden = false;
+        $("serverStatus").classList.add("is-off");
+        $("serverStatusText").textContent = "待验证";
+        const errBox = $("loginError");
+        if (errMsg) {
+          errBox.textContent = errMsg;
+          errBox.hidden = false;
+        } else {
+          errBox.hidden = true;
+        }
+      }
+
+      function showDashboard(authRequired) {
+        state.authRequired = Boolean(authRequired);
+        $("loginGate").hidden = true;
+        $("tabsBar").hidden = false;
+        $("mainApp").hidden = false;
+        $("logoutBtn").hidden = !state.authRequired;
       }
 
       function switchTab(tabName) {
@@ -1030,15 +1140,30 @@
           <div class="ruled">
             ${items
               .map(
-                (vp) => `
-                  <div class="ruled-row">
-                    <div>
-                      <div><strong>${escapeHtml(vp.name || vp.id)}</strong> ${vp.role ? `<span class="chip">${escapeHtml(vp.role)}</span>` : ""}</div>
-                      <div class="card-sub num">ID: ${escapeHtml(vp.id)}${vp.sample_count ? ` · 样本 ${vp.sample_count}` : ""}</div>
+                (vp) => {
+                  const caps = Array.isArray(vp.capabilities)
+                    ? vp.capabilities.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")
+                    : "";
+                  const meta = [
+                    `ID: ${vp.id}`,
+                    vp.sample_count ? `样本 ${vp.sample_count}` : "",
+                    vp.preferred_voice ? `音色 ${vp.preferred_voice}` : "",
+                  ].filter(Boolean).join(" · ");
+                  return `
+                    <div class="ruled-row">
+                      <div>
+                        <div class="chips">
+                          <strong>${escapeHtml(vp.name || vp.id)}</strong>
+                          ${vp.role ? `<span class="chip chip--speaker">${escapeHtml(vp.role)}</span>` : ""}
+                          ${caps}
+                        </div>
+                        <div class="card-sub num">${escapeHtml(meta)}</div>
+                        ${vp.notes ? `<div class="card-sub">${escapeHtml(vp.notes)}</div>` : ""}
+                      </div>
+                      <button type="button" class="btn btn--sm btn--danger" data-del-vp="${escapeHtml(vp.id)}">移除</button>
                     </div>
-                    <button type="button" class="btn btn--sm btn--danger" data-del-vp="${escapeHtml(vp.id)}">移除</button>
-                  </div>
-                `
+                  `;
+                }
               )
               .join("")}
           </div>
@@ -1201,7 +1326,44 @@
         }
       });
 
-      loadAll();
+      $("loginForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const pw = $("loginPassword").value;
+        try {
+          await apiFetch("/api/login", {
+            method: "POST",
+            body: JSON.stringify({ password: pw }),
+          });
+          $("loginPassword").value = "";
+          showDashboard(true);
+          await loadAll();
+          showToast("登录成功");
+        } catch (err) {
+          showLoginGate(err.message || "口令错误");
+        }
+      });
+
+      $("logoutBtn").addEventListener("click", async () => {
+        await fetch("/api/logout", { method: "POST" }).catch(() => {});
+        showLoginGate("");
+        showToast("已退出登录");
+      });
+
+      async function bootstrap() {
+        try {
+          const auth = await apiFetch("/api/auth/status");
+          if (auth.authenticated) {
+            showDashboard(auth.auth_required);
+            await loadAll();
+          } else {
+            showLoginGate("");
+          }
+        } catch (err) {
+          showLoginGate(err.message || "");
+        }
+      }
+
+      bootstrap();
     })();
   </script>
 </body>

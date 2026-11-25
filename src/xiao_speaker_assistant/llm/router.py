@@ -247,6 +247,7 @@ class LLMRouter:
             f"你可以直接调用 xsa_tools 中的本机工具来回答问题：包括查询城市实时天气（weather_query）、"
             f"联网搜索实时信息（web_search）、长期记忆管理（memory_save / memory_search / memory_forget）、"
             f"切换音箱播报音色与语速（speaker_list_voices / speaker_set_voice）、"
+            f"查看与切换对话大模型（speaker_list_models / speaker_set_model）、"
             f"设置定时提醒/倒计时/每日早报（reminder_set / reminder_list / reminder_cancel）、"
             f"家庭成员声纹识别与管理（speaker_enroll_voiceprint / speaker_list_voiceprints / "
             f"speaker_update_voiceprint / speaker_delete_voiceprint）、"
