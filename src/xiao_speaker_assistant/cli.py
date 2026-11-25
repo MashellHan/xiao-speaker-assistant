@@ -314,6 +314,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     async def apply_hot_reload(new_cfg: AppConfig) -> None:
         nonlocal active_config, tools, clients, outlook_client
+        prev_model = active_config.llm.providers.opencode.model
         if getattr(args, "host", None):
             new_cfg.speaker.ws_host = args.host
         if getattr(args, "port", None):
@@ -325,6 +326,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         active_config = new_cfg
         mcp_server.reload_config(new_cfg)
         await asyncio.to_thread(router.reload_runtime_config, new_cfg)
+        if new_cfg.llm.providers.opencode.model != prev_model:
+            router.opencode_session_id = None
         if gateway is not None:
             await asyncio.to_thread(gateway.reload_config, new_cfg)
         if scheduler is not None:

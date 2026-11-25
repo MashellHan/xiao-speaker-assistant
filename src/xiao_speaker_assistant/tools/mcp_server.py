@@ -460,7 +460,7 @@ class McpServer:
         on_model_changed: Callable[[str], None] | None = None,
         config_path: str | Path | None = None,
         speakers_path: str | Path = "~/.local/share/xiao-speaker-assistant/speakers.json",
-        reminders_path: str | Path = "~/.local/share/xiao-speaker-assistant/reminders.json",
+        reminders_path: str | Path | None = None,
         http_client: httpx.AsyncClient | None = None,
         include_local_tools: bool = False,
         mac_allowed_roots: Sequence[str | Path] | None = None,
@@ -488,7 +488,7 @@ class McpServer:
         self._on_model_changed = on_model_changed
         self._config_path = config_path
         self._speakers_path = Path(speakers_path).expanduser()
-        self._reminders_path = Path(reminders_path).expanduser()
+        self._reminders_path = Path(reminders_path).expanduser() if reminders_path is not None else None
         self._http_client = http_client
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
@@ -1657,6 +1657,8 @@ class McpServer:
         return True
 
     def _read_reminders(self) -> list[dict[str, Any]]:
+        if self._reminders_path is None:
+            return [asdict(e) for e in self.reminder_store.list_entries()]
         if not self._reminders_path.is_file():
             return []
         try:

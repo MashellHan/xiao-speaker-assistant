@@ -1061,7 +1061,7 @@
                   <div class="ruled-row">
                     <div>
                       <div><strong>${escapeHtml(r.message || r.title || r.text || "提醒")}</strong></div>
-                      <div class="card-sub num">${escapeHtml(r.trigger_at || r.due_at || r.time || r.cron || "—")}</div>
+                      <div class="card-sub num">${escapeHtml(r.daily_hhmm ? `每日 ${r.daily_hhmm}` : typeof r.trigger_at === "number" ? formatTime(r.trigger_at) : r.trigger_at || r.due_at || r.time || r.cron || "—")}</div>
                     </div>
                     <span class="chip ${r.enabled === false ? "" : "chip--ok"}">${escapeHtml(r.status || (r.enabled === false ? "已停用" : "生效中"))}</span>
                   </div>
