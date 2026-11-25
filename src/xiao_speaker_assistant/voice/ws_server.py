@@ -41,11 +41,6 @@ WAKE_FRAGMENT_WORDS = {
     "关家",
     "诺米",
     "糯米",
-    "糯米糯米",
-    "诺米诺米",
-    "nomi",
-    "nuomi",
-    "naomi",
 }
 FILLER_NOISE_WORDS = {"嗯", "啊", "哦", "呃", "额", "唉", "唔", "哈", "嘿", "喂", "嗯嗯", "啊啊", "哦哦", "哈哈"}
 EXIT_EXACT_WORDS = {
@@ -296,7 +291,15 @@ class SpeakerGateway:
     ) -> None:
         pb = self._get_playback(conn)
         sess = self._get_session(conn)
-        await pb.speak(text, interrupt_native=interrupt, voice_override=sess.active_voice)
+        voice_override = sess.active_voice
+        if voice_override is None:
+            spk = CURRENT_SPEAKER.get()
+            if spk is not None and spk.preferred_voice:
+                try:
+                    voice_override = resolve_edge_voice(spk.preferred_voice).id
+                except ValueError:
+                    pass
+        await pb.speak(text, interrupt_native=interrupt, voice_override=voice_override)
 
     async def abort_and_speak(self, conn: Any, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
@@ -629,11 +632,6 @@ class SpeakerGateway:
                     speaker_match.role,
                     speaker_match.score,
                 )
-                if speaker_match.preferred_voice and sess.active_voice is None:
-                    try:
-                        sess.active_voice = resolve_edge_voice(speaker_match.preferred_voice).id
-                    except ValueError:
-                        pass
 
         # Full-duplex barge-in: if Nomi is currently speaking or thinking, cancel current reply
         # without resetting session context and immediately answer the new follow-up utterance.

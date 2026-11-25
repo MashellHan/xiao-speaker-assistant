@@ -83,6 +83,15 @@ def test_speaker_profile_store_enroll_previous_update_and_identify(tmp_path: Pat
     assert updated.preferred_voice == "晓伊"
     assert "english_words" in updated.capabilities
 
+    # target="previous" must refuse to enroll caller's own voice when only 1 utterance exists.
+    single_store = SpeakerProfileStore(tmp_path / "single.json")
+    single_store.record_utterance("记住刚才说话的是拳拳", host_vec)
+    try:
+        single_store.enroll_from_recent("拳拳", role="child", target="previous")
+        raise AssertionError("Expected ValueError when fewer than 2 embeddings exist")
+    except ValueError:
+        pass
+
     assert reloaded.delete_profile("拳拳") is True
     assert reloaded.identify(child_vec, threshold=0.45) is None
 
@@ -149,12 +158,30 @@ def test_mcp_voiceprint_tools_and_gateway_speaker_context(tmp_path: Path) -> Non
 
     cfg = AppConfig()
     cfg.speaker.tts_provider = "say"
+    cfg.speaker.edge_voice = "zh-CN-YunxiNeural"
     gw = SpeakerGateway(cfg, on_query=on_query, speaker_store=store)
 
+    # Enroll host with default voice (preferred_voice=None) and verify voice does NOT stick across turns.
+    store.enroll("大雄", host_vec, role="host")
+    spoken_voices: list[str | None] = []
+    orig_speak = gw._get_playback
+
     async def run() -> None:
+        from unittest.mock import patch
+
         conn = FakeConn()
         gw._connections.add(conn)  # type: ignore[arg-type]
-        await gw._process_local_utterance(conn, "再讲一个恐龙故事", embedding=child_vec)
+        pb = orig_speak(conn)
+
+        async def fake_pb_speak(txt: str, *, interrupt_native: bool = True, voice_override: str | None = None) -> None:
+            spoken_voices.append(voice_override)
+
+        with patch.object(pb, "speak", side_effect=fake_pb_speak):
+            await gw._process_local_utterance(conn, "再讲一个恐龙故事", embedding=child_vec)
+            await gw._process_local_utterance(conn, "我问个工作问题", embedding=host_vec)
+            # Bare wake word "糯米糯米" must reach match_wakeup_phrase and trigger chime instead of fragment drop.
+            await gw._process_local_utterance(conn, "糯米糯米")
 
     asyncio.run(run())
-    assert seen_speakers == ["拳拳:child"]
+    assert seen_speakers == ["拳拳:child", "大雄:host"]
+    assert spoken_voices == ["zh-CN-XiaoyiNeural", None]

@@ -228,10 +228,11 @@ class SpeakerProfileStore:
         norm_target = target.strip().lower()
         if norm_target == "current":
             return with_emb[-1]
-        # Default "previous": select the utterance right before the enrollment command itself.
+        # "previous": strictly require an earlier utterance before the enrollment command;
+        # never fall back to with_emb[-1] (which is the caller's own enrollment utterance).
         if len(with_emb) >= 2:
             return with_emb[-2]
-        return with_emb[-1]
+        return None
 
     def enroll(
         self,
