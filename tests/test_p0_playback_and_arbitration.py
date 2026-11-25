@@ -13,6 +13,8 @@ def test_match_wakeup_phrase_tolerates_punctuation_in_chinese_keywords() -> None
     assert match_wakeup_phrase("你好，管家。", ["你好管家"]) == ("你好管家", "")
     assert match_wakeup_phrase("你好，管家！帮我查一下", ["你好管家"]) == ("你好管家", "帮我查一下")
     assert match_wakeup_phrase("你好，小助手，今天星期几", ["你好小助手"]) == ("你好小助手", "今天星期几")
+    assert match_wakeup_phrase("Hno米，今天北京天气", ["你好管家"]) == ("hi nomi", "今天北京天气")
+    assert match_wakeup_phrase("你好，老米查一下磁盘", ["你好管家"]) == ("hi nomi", "查一下磁盘")
 
 
 def test_generate_chime_pcm_produces_16bit_mono_audio() -> None:

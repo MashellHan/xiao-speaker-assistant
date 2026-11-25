@@ -42,12 +42,18 @@ class SpeechConfig(BaseModel):
     local_keywords: list[str] = Field(
         default_factory=lambda: ["你好管家", "你好诺米", "你好糯米", "嗨糯米"]
     )
+    en_kws_enabled: bool = True
+    en_keywords: list[str] = Field(
+        default_factory=lambda: ["HI NOMI", "HI NAOMI", "HI KNOW ME", "HI NO ME", "HEY NOMI", "HI NOAMI"]
+    )
+    en_kws_score: float = 2.0
+    en_kws_threshold: float = 0.25
     interrupt_keywords: list[str] = Field(
         default_factory=lambda: ["退出", "停止", "闭嘴", "退下", "别说了", "再见"]
     )
     asr_provider: Literal["sense_voice", "xiaoai_asr"] = "sense_voice"
     asr_model: Literal["sense_voice", "paraformer", "doubao_flash", "openai_whisper"] = "sense_voice"
-    asr_language: str = "zh"
+    asr_language: str = "auto"
     whisper_base_url: str = "https://api.openai.com/v1"
     whisper_api_key_env: str | None = "OPENAI_API_KEY"
     whisper_model: str = "whisper-1"

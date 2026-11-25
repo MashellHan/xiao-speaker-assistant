@@ -127,7 +127,8 @@ def test_ignores_short_filler_noise_in_local_utterance() -> None:
 
     async def run() -> None:
         await gw._process_local_utterance(FakeConn(), "嗯。")
-        await gw._process_local_utterance(FakeConn(), "读在。")
+        await gw._process_local_utterance(FakeConn(), "嗯嗯。")
+        await gw._process_local_utterance(FakeConn(), "关家。")
         await gw._process_local_utterance(FakeConn(), "我有未读邮件吗？")
 
     asyncio.run(run())

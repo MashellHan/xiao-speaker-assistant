@@ -201,6 +201,10 @@ class PlaybackController:
             if epoch != self._cancel_epoch:
                 return
             self._cancel_event.clear()
+            # Ensure native XiaoAI audio (if active) stops cleanly before Nomi chimes in.
+            await self._run_shell(STOP_NATIVE_SCRIPT, False, 3.0)
+            if epoch != self._cancel_epoch or self._cancel_event.is_set():
+                return
             if not await self.ensure_stream_started(epoch=epoch):
                 return
 

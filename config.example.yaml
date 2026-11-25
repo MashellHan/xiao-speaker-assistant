@@ -26,7 +26,8 @@ speech:
     - 再见
   asr_provider: sense_voice # sense_voice | xiaoai_asr
   asr_model: sense_voice # sense_voice | paraformer | doubao_flash | openai_whisper
-  asr_language: zh
+  asr_language: auto # auto | zh | en
+  en_kws_enabled: true
   capture_channels: 1
   capture_bits_per_sample: 16
   input_gain: 16.0

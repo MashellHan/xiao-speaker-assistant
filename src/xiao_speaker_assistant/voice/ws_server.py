@@ -29,7 +29,8 @@ QueryHandler = Callable[[str], Awaitable[str]]
 StreamQueryHandler = Callable[[str], AsyncIterator[str]]
 
 IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
-FILLER_NOISE_WORDS = {"嗯", "啊", "哦", "呃", "额", "唉", "唔", "哈", "嘿", "喂"}
+WAKE_FRAGMENT_WORDS = {"管家", "关家", "诺米", "糯米", "老米", "纳米", "nomi", "naomi"}
+FILLER_NOISE_WORDS = {"嗯", "啊", "哦", "呃", "额", "唉", "唔", "哈", "嘿", "喂", "嗯嗯", "啊啊", "哦哦", "哈哈"}
 EXIT_EXACT_WORDS = {
     "退出",
     "退下",
@@ -59,6 +60,7 @@ class SpeakerSession:
     query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     mute_native_until: float = 0.0
     last_audio_at: float = 0.0
+    last_chime_at: float = 0.0
     active_reply_task: asyncio.Task[None] | None = None
     interrupted: bool = False
 
@@ -201,6 +203,8 @@ class SpeakerGateway:
         )
 
     async def play_wakeup_chime(self, conn: Any) -> None:
+        sess = self._get_session(conn)
+        sess.last_chime_at = time.monotonic()
         pb = self._get_playback(conn)
         await pb.play_chime()
 
@@ -447,7 +451,11 @@ class SpeakerGateway:
             await self.speak_sentence(conn, "好的，已退出。", interrupt=True, wait_response=True)
             return
         cleaned = text.strip(" ，。！？,.!?")
-        if cleaned in FILLER_NOISE_WORDS or (len(cleaned) <= 2 and cleaned not in {"确认", "取消", "是的", "好"}):
+        if (
+            len(cleaned) <= 1
+            or cleaned in FILLER_NOISE_WORDS
+            or cleaned.lower() in WAKE_FRAGMENT_WORDS
+        ):
             logger.info("Ignoring short filler/noise utterance: %s", text)
             if self._pipeline is not None:
                 self._pipeline.refresh_activity()
@@ -456,7 +464,8 @@ class SpeakerGateway:
         if matched:
             _, rest = matched
             if not rest:
-                await self.play_wakeup_chime(conn)
+                if (time.monotonic() - sess.last_chime_at) >= 2.0:
+                    await self.play_wakeup_chime(conn)
                 if self._pipeline is not None:
                     self._pipeline.refresh_activity()
                 return
