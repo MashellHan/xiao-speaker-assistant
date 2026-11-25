@@ -71,7 +71,7 @@ class SpeechConfig(BaseModel):
     agc_target_rms: float = 0.10
     agc_max_gain: float = 48.0
     aec_enabled: bool = False
-    conversation_timeout_sec: float = 25.0
+    conversation_timeout_sec: float = 45.0
 
 
 class OpencodeCliConfig(BaseModel):

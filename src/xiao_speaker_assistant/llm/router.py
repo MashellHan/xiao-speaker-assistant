@@ -359,7 +359,13 @@ class LLMRouter:
                 if attempt == 0:
                     continue
                 raise
-            except (asyncio.CancelledError, GeneratorExit):
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.wait_for(asyncio.shield(v2.interrupt(sid)), timeout=2.0)
+                except BaseException:
+                    pass
+                raise
+            except GeneratorExit:
                 asyncio.create_task(v2.interrupt(sid))
                 raise
 
