@@ -8,6 +8,11 @@ speaker:
   auth_token_env: XSA_SPEAKER_TOKEN
   tts_provider: edge # edge | say | xiaoai | openai | mlx_audio
   edge_voice: zh-CN-XiaoxiaoNeural
+  edge_rate: "+8%"
+  # Optional per-wake-word voice routing:
+  # voice_routes:
+  #   你好管家: zh-CN-YunxiNeural
+  #   hi_nomi: zh-CN-XiaoyiNeural
   say_voice: Tingting
   tts_sample_rate: 24000
 
@@ -71,3 +76,14 @@ tools:
     enabled: false
     mcp_url: http://127.0.0.1:8931/mcp
     preferred_browser: msedge
+
+persona:
+  assistant_name: Nomi
+  address_user_as: ""
+  style: 亲切自然、简短口语化、直接给出核心结论
+  extra_instructions: ""
+
+memory:
+  enabled: true
+  file_path: ~/.local/share/xiao-speaker-assistant/memory.json
+  max_prompt_items: 12

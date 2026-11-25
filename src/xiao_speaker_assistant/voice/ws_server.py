@@ -67,6 +67,7 @@ class SpeakerSession:
     last_playback_ended_at: float = 0.0
     active_reply_task: asyncio.Task[None] | None = None
     interrupted: bool = False
+    active_voice: str | None = None
     recent_spoken_texts: deque[tuple[float, str]] = field(default_factory=deque)
 
 
@@ -136,6 +137,24 @@ class SpeakerGateway:
             sess = SpeakerSession()
             self._sessions[conn] = sess
         return sess
+
+    def reload_config(self, new_config: AppConfig) -> None:
+        self._config = new_config
+        for pb in self._playbacks.values():
+            pb._config = new_config.speaker
+        if self._pipeline is not None:
+            self._pipeline.update_config(new_config.speech)
+
+    def _resolve_voice_for_keyword(self, keyword: str) -> str | None:
+        routes = self._config.speaker.voice_routes
+        if not routes:
+            return None
+        norm = keyword.strip().lower().replace(" ", "_")
+        for route_key, voice in routes.items():
+            rk = route_key.strip().lower().replace(" ", "_")
+            if rk == norm or rk.replace("_", "") == norm.replace("_", "") or rk in norm:
+                return voice.strip() or None
+        return None
 
     def _get_playback(self, conn: Any) -> PlaybackController:
         pb = self._playbacks.get(conn)
@@ -248,7 +267,8 @@ class SpeakerGateway:
         wait_response: bool = True,
     ) -> None:
         pb = self._get_playback(conn)
-        await pb.speak(text, interrupt_native=interrupt)
+        sess = self._get_session(conn)
+        await pb.speak(text, interrupt_native=interrupt, voice_override=sess.active_voice)
 
     async def abort_and_speak(self, conn: Any, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
@@ -383,6 +403,7 @@ class SpeakerGateway:
 
         def on_wakeup(keyword: str) -> None:
             logger.info("Local wake word detected: %s", keyword)
+            sess.active_voice = self._resolve_voice_for_keyword(keyword)
             sess.mute_native_until = time.monotonic() + 8.0
             loop.call_soon_threadsafe(lambda: loop.create_task(self.play_wakeup_chime(conn)))
 
@@ -394,6 +415,7 @@ class SpeakerGateway:
 
         def on_sleep() -> None:
             logger.info("Returned silently to wake-word idle")
+            sess.active_voice = None
             if self._on_session_reset is not None:
                 loop.call_soon_threadsafe(self._on_session_reset)
 
@@ -403,6 +425,7 @@ class SpeakerGateway:
 
         def on_barge_in_wakeup(keyword: str) -> None:
             logger.info("Barge-in wake word triggered (%s)", keyword)
+            sess.active_voice = self._resolve_voice_for_keyword(keyword)
             loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_barge_in_wakeup(conn)))
 
         await loop.run_in_executor(
@@ -517,7 +540,10 @@ class SpeakerGateway:
 
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
-            _, rest = matched
+            wake_label, rest = matched
+            routed = self._resolve_voice_for_keyword(wake_label)
+            if routed:
+                sess.active_voice = routed
             if not rest:
                 if is_speaking_now:
                     await self._handle_barge_in_wakeup(conn)

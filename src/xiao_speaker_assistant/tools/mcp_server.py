@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import quote
@@ -38,6 +38,7 @@ from xiao_speaker_assistant.tools.mac_local import (
     read_local_text_file,
 )
 from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
+from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,44 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "memory_save",
+        "description": (
+            "Save or update a persistent long-term user fact or preference "
+            "(e.g. home city, frequent contact email, nickname). Never store secrets or passwords."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Short topic key, e.g. 常住城市, 张三邮箱"},
+                "value": {"type": "string", "description": "Fact or preference to remember"},
+                "category": {"type": "string", "default": "fact"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "memory_search",
+        "description": "Search saved long-term user memories and preferences.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "default": "", "description": "Optional search keyword"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+        },
+    },
+    {
+        "name": "memory_forget",
+        "description": "Delete a saved long-term memory entry by key or id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key_or_id": {"type": "string", "description": "Memory key or ID to remove"},
+            },
+            "required": ["key_or_id"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -239,6 +278,8 @@ class McpServer:
         xiaohongshu_client: HttpMcpClient | None = None,
         browser_client: HttpMcpClient | None = None,
         confirmation_store: ConfirmationStore | None = None,
+        memory_store: MemoryStore | None = None,
+        on_memory_changed: Callable[[], None] | None = None,
         http_client: httpx.AsyncClient | None = None,
         include_local_tools: bool = False,
         mac_allowed_roots: Sequence[str | Path] | None = None,
@@ -251,11 +292,21 @@ class McpServer:
         )
         self._browser = browser_client or HttpMcpClient(self._config.tools.browser.mcp_url)
         self.confirmation_store = confirmation_store or ConfirmationStore()
+        self.memory_store = memory_store or MemoryStore(
+            self._config.memory.file_path
+        )
+        self._on_memory_changed = on_memory_changed
         self._http_client = http_client
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
         self._edge_dry_run = edge_dry_run
         self._http_sessions: set[str] = set()
+
+    def reload_config(self, new_config: AppConfig) -> None:
+        self._config = new_config
+        self._outlook = OutlookClient(new_config.tools.outlook)
+        self._xiaohongshu = HttpMcpClient(new_config.tools.xiaohongshu.mcp_url)
+        self._browser = HttpMcpClient(new_config.tools.browser.mcp_url)
 
     @staticmethod
     def _ok(req_id: Any, result: Any) -> dict[str, Any]:
@@ -362,6 +413,12 @@ class McpServer:
             return self._ok(req_id, await self._call_weather_query(args))
         if name == "web_search":
             return self._ok(req_id, await self._call_web_search(args))
+        if name == "memory_save":
+            return self._ok(req_id, await self._call_memory_save(args))
+        if name == "memory_search":
+            return self._ok(req_id, await self._call_memory_search(args))
+        if name == "memory_forget":
+            return self._ok(req_id, await self._call_memory_forget(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -832,6 +889,43 @@ class McpServer:
         finally:
             if owns_client:
                 await client.aclose()
+
+    async def _call_memory_save(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self._config.memory.enabled:
+            return self._tool_result({"error": "memory_disabled", "message": "Long-term memory is disabled."}, is_error=True)
+        key = str(args.get("key") or "").strip()
+        value = str(args.get("value") or "").strip()
+        category = str(args.get("category") or "fact").strip()
+        try:
+            entry = self.memory_store.save(key, value, category=category)
+        except (ValueError, MemorySecurityError) as exc:
+            return self._tool_result({"error": "memory_rejected", "message": str(exc)}, is_error=True)
+        if self._on_memory_changed is not None:
+            self._on_memory_changed()
+        return self._tool_result({"status": "saved", "id": entry.id, "key": entry.key, "value": entry.value})
+
+    async def _call_memory_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self._config.memory.enabled:
+            return self._tool_result({"memories": [], "count": 0})
+        query = str(args.get("query") or "").strip()
+        limit = max(1, min(50, int(args.get("limit", 10))))
+        items = self.memory_store.search(query, limit=limit)
+        return self._tool_result(
+            {
+                "memories": [
+                    {"id": e.id, "key": e.key, "value": e.value, "category": e.category}
+                    for e in items
+                ],
+                "count": len(items),
+            }
+        )
+
+    async def _call_memory_forget(self, args: dict[str, Any]) -> dict[str, Any]:
+        key_or_id = str(args.get("key_or_id") or "").strip()
+        removed = self.memory_store.forget(key_or_id)
+        if removed and self._on_memory_changed is not None:
+            self._on_memory_changed()
+        return self._tool_result({"removed": removed, "key_or_id": key_or_id})
 
     async def start_http_server(
         self,
