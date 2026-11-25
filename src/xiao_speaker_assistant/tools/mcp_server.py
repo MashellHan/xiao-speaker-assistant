@@ -1274,13 +1274,15 @@ class McpServer:
 
         self._config.speaker.edge_voice = new_voice
         self._config.speaker.edge_rate = new_rate
-        if persist:
+        persisted = False
+        if persist and self._config_path is not None:
             await asyncio.to_thread(
                 persist_speaker_voice_config,
                 self._config_path,
                 edge_voice=new_voice,
                 edge_rate=new_rate,
             )
+            persisted = True
         if self._on_voice_changed is not None:
             self._on_voice_changed(new_voice, new_rate)
         return self._tool_result(
@@ -1289,7 +1291,7 @@ class McpServer:
                 "voice": new_voice,
                 "voice_label": voice_label,
                 "rate": new_rate,
-                "persisted": persist,
+                "persisted": persisted,
             }
         )
 
@@ -1503,12 +1505,14 @@ class McpServer:
             )
 
         self._config.llm.providers.opencode.model = new_model
-        if persist:
+        persisted = False
+        if persist and self._config_path is not None:
             await asyncio.to_thread(
                 persist_runtime_settings,
                 self._config_path,
                 model=new_model,
             )
+            persisted = True
         if self._on_model_changed is not None:
             self._on_model_changed(new_model)
         label = next((m["label"] for m in AVAILABLE_MODELS if m["id"] == new_model), new_model)
@@ -1517,7 +1521,7 @@ class McpServer:
                 "status": "updated",
                 "model": new_model,
                 "label": label,
-                "persisted": persist,
+                "persisted": persisted,
             }
         )
 
@@ -2164,7 +2168,7 @@ class McpServer:
             self._config.speaker.edge_voice = new_voice
             self._config.speaker.edge_rate = new_rate
 
-            should_persist = self._config_path is not None or Path("config.yaml").exists()
+            should_persist = self._config_path is not None
             persisted = False
             if should_persist:
                 await asyncio.to_thread(
