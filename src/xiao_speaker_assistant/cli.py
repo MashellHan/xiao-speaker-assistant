@@ -205,17 +205,19 @@ def cmd_doctor(config: AppConfig) -> int:
         f"(client_id={'set' if client_id_present else 'unset'}, cache={cache_path} [{cache_status}])"
     )
 
+    xhs_bin = Path("~/.local/bin/xiaohongshu-mcp-darwin-arm64").expanduser().is_file()
     if config.tools.xiaohongshu.enabled:
         ok, detail = _check_http_reachable(config.tools.xiaohongshu.mcp_url)
         tag = "OK" if ok else "UNREACHABLE"
-        print(f"  Xiaohongshu MCP:  [{tag}] {config.tools.xiaohongshu.mcp_url} ({detail})")
+        print(f"  Xiaohongshu MCP:  [{tag}] {config.tools.xiaohongshu.mcp_url} ({detail}, bin={'found' if xhs_bin else 'missing'})")
     else:
-        print(f"  Xiaohongshu MCP:  disabled ({config.tools.xiaohongshu.mcp_url})")
+        print(f"  Xiaohongshu MCP:  disabled ({config.tools.xiaohongshu.mcp_url}, bin={'found' if xhs_bin else 'missing'})")
 
     edge_exists = Path("/Applications/Microsoft Edge.app").exists() or shutil.which("msedge") is not None
+    npx_found = shutil.which("npx") is not None
     print(
         f"  Browser / Edge:   mcp={'enabled' if config.tools.browser.enabled else 'disabled'}, "
-        f"edge_app={'found' if edge_exists else 'not found'}"
+        f"edge_app={'found' if edge_exists else 'not found'}, npx={'found' if npx_found else 'missing'}"
     )
     return 0
 

@@ -5,10 +5,11 @@ Stateless WebSocket relay that bridges the speaker (`/ws/speaker`) and the Mac h
 ## Protocol & Security
 
 - **Endpoints**:
-  - `wss://<your-domain>/ws/speaker`: Xiaomi Smart Speaker client (`open-xiaoai`)
-  - `wss://<your-domain>/ws/host`: Mac host dialing outbound via `RelayHostClient`
+  - `ws://<your-domain>/ws/speaker?token=<XSA_RELAY_TOKEN>` (or `wss://...` if client supports TLS): Xiaomi Smart Speaker client (`open-xiaoai`). Note: stock `open-xiaoai-client` v1.0.0 (`connect_async(url)`) does not compile TLS or send custom `Authorization` headers, so `/ws/speaker` accepts `?token=<XSA_RELAY_TOKEN>` (validated with `hmac.compare_digest`).
+  - `wss://<your-domain>/ws/host`: Mac host dialing outbound via `RelayHostClient` (`Authorization: Bearer <XSA_RELAY_TOKEN>`)
   - `GET /healthz`: Plain HTTP `200 ok` health check for load balancers / Container Apps
-- **Authentication**: Set `XSA_RELAY_TOKEN` to a strong random secret. Both `/ws/speaker` and `/ws/host` must present `Authorization: Bearer <XSA_RELAY_TOKEN>`, or the relay closes the socket with code `4401`.
+- **Authentication**: Set `XSA_RELAY_TOKEN` to a strong random secret. `/ws/host` requires `Authorization: Bearer <XSA_RELAY_TOKEN>`, while `/ws/speaker` accepts either `Authorization: Bearer` or `?token=<XSA_RELAY_TOKEN>`. Invalid/missing tokens close with `4401`.
+- **Reverse proxy examples**: See `relay/Caddyfile.example` and `relay/nginx.conf.example`, or run `./scripts/deploy_azure_relay.sh --help`.
 - **Reconnection**: If a speaker or host reconnects, the relay cleanly replaces the older connection for that role without disturbing the peer.
 
 Generate a token:
