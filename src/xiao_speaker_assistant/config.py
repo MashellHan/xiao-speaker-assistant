@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -178,3 +179,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 def read_env_secret(env_name: str) -> str | None:
     value = os.environ.get(env_name, "").strip()
     return value or None
+
+
+def resolve_binary(name_or_path: str) -> str:
+    found = shutil.which(name_or_path)
+    if found:
+        return found
+    local_bin = Path("~/.local/bin").expanduser() / name_or_path
+    if local_bin.is_file():
+        return str(local_bin)
+    raise RuntimeError(f"CLI binary not found: {name_or_path}")

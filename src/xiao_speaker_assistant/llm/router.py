@@ -20,6 +20,7 @@ from xiao_speaker_assistant.config import (
     LLMConfig,
     PersonaConfig,
     read_env_secret,
+    resolve_binary,
 )
 from xiao_speaker_assistant.llm.opencode_server import (
     OpenCodeServerManager,
@@ -119,16 +120,6 @@ def parse_opencode_jsonl(stdout: str) -> str:
             if isinstance(text, str) and text.strip():
                 chunks.append(text.strip())
     return "\n".join(chunks).strip()
-
-
-def resolve_binary(name_or_path: str) -> str:
-    found = shutil.which(name_or_path)
-    if found:
-        return found
-    local_bin = Path("~/.local/bin").expanduser() / name_or_path
-    if local_bin.is_file():
-        return str(local_bin)
-    raise RuntimeError(f"CLI binary not found: {name_or_path}")
 
 
 class LLMRouter:
