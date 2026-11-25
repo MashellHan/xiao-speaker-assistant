@@ -35,7 +35,12 @@ from xiao_speaker_assistant.tools import (
     is_cancel_utterance,
     is_confirm_utterance,
 )
-from xiao_speaker_assistant.voice import SpeakerGateway, run_with_relay
+from xiao_speaker_assistant.voice import (
+    CURRENT_SPEAKER,
+    SpeakerGateway,
+    SpeakerProfileStore,
+    run_with_relay,
+)
 from xiao_speaker_assistant.voice.models_setup import (
     download_models,
     find_english_kws_dir,
@@ -229,6 +234,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     confirmations = ConfirmationStore()
     memory_store = MemoryStore(config.memory.file_path)
     reminder_store = ReminderStore(config.reminders.file_path)
+    speaker_store = SpeakerProfileStore(config.speech.speaker_profiles_file)
     agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
 
@@ -251,6 +257,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         confirmation_store=confirmations,
         memory_store=memory_store,
         reminder_store=reminder_store,
+        speaker_store=speaker_store,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         config_path=getattr(args, "config", None),
@@ -315,11 +322,13 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 confirmations.clear()
                 return "好的，已取消发送邮件。"
 
+        spk = CURRENT_SPEAKER.get()
         return await router.ask(
             query,
             provider=args.provider,
             tools=tools,
             executor=lambda name, t_args: execute_tool(clients, name, t_args),
+            speaker_context=spk.format_context_prefix() if spk is not None else None,
         )
 
     async def stream_query(query: str):
@@ -335,11 +344,13 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 yield "好的，已取消发送邮件。"
                 return
 
+        spk = CURRENT_SPEAKER.get()
         async for sentence in router.stream_ask(
             query,
             provider=args.provider,
             tools=tools,
             executor=lambda name, t_args: execute_tool(clients, name, t_args),
+            speaker_context=spk.format_context_prefix() if spk is not None else None,
         ):
             yield sentence
 
@@ -393,6 +404,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             on_query=handle_query,
             on_stream_query=stream_query,
             on_session_reset=reset_all,
+            speaker_store=speaker_store,
         )
         if args.relay:
             await run_with_relay(

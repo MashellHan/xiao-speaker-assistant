@@ -40,6 +40,7 @@ from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 from xiao_speaker_assistant.tools.reminders import ReminderStore
+from xiao_speaker_assistant.voice.speaker_id import SpeakerProfileStore
 from xiao_speaker_assistant.voice.voice_catalog import (
     list_voice_profiles_dicts,
     normalize_edge_rate,
@@ -343,6 +344,74 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["id_or_keyword"],
         },
     },
+    {
+        "name": "speaker_enroll_voiceprint",
+        "description": (
+            "Save or update a family member's voiceprint from recent speaker audio. "
+            "Use target='previous' when the user says '刚才和你说话的是拳拳', or target='current' "
+            "when the user says '我是大雄，记住我的声音'. Supports extensible role, style_hint, "
+            "capabilities (e.g. ['storytelling', 'kid_safe_only']), notes, and preferred_voice."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Member name, e.g. 拳拳, 大雄, 爱人, 爷爷"},
+                "role": {
+                    "type": "string",
+                    "default": "family",
+                    "description": "Member role: host | spouse | child | elder | guest | custom",
+                },
+                "style_hint": {"type": "string", "description": "Optional addressing/tone instruction"},
+                "capabilities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Extensible capability or policy tags for this member",
+                },
+                "notes": {"type": "string", "description": "Extra preferences or restrictions"},
+                "preferred_voice": {"type": "string", "description": "Optional Edge-TTS voice for this member"},
+                "target": {
+                    "type": "string",
+                    "enum": ["previous", "current"],
+                    "default": "previous",
+                    "description": "'previous' for the previous speaker ('刚才说话的是...'), 'current' for current speaker ('我是...')",
+                },
+                "keyword": {"type": "string", "description": "Optional phrase snippet spoken by that member"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "speaker_list_voiceprints",
+        "description": "List enrolled family member voiceprints, roles, capabilities, and recent utterance history.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "speaker_update_voiceprint",
+        "description": "Update an enrolled member's role, style_hint, capabilities, notes, or preferred_voice.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name_or_id": {"type": "string", "description": "Enrolled member name or ID"},
+                "role": {"type": "string"},
+                "style_hint": {"type": "string"},
+                "capabilities": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "string"},
+                "preferred_voice": {"type": "string"},
+            },
+            "required": ["name_or_id"],
+        },
+    },
+    {
+        "name": "speaker_delete_voiceprint",
+        "description": "Delete an enrolled family member voiceprint by name or ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name_or_id": {"type": "string", "description": "Member name or ID to delete"},
+            },
+            "required": ["name_or_id"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -361,6 +430,7 @@ class McpServer:
         confirmation_store: ConfirmationStore | None = None,
         memory_store: MemoryStore | None = None,
         reminder_store: ReminderStore | None = None,
+        speaker_store: SpeakerProfileStore | None = None,
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
         config_path: str | Path | None = None,
@@ -381,6 +451,9 @@ class McpServer:
         )
         self.reminder_store = reminder_store or ReminderStore(
             self._config.reminders.file_path
+        )
+        self.speaker_store = speaker_store or SpeakerProfileStore(
+            self._config.speech.speaker_profiles_file
         )
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
@@ -522,6 +595,14 @@ class McpServer:
             return self._ok(req_id, self._call_reminder_list())
         if name == "reminder_cancel":
             return self._ok(req_id, self._call_reminder_cancel(args))
+        if name == "speaker_enroll_voiceprint":
+            return self._ok(req_id, self._call_speaker_enroll_voiceprint(args))
+        if name == "speaker_list_voiceprints":
+            return self._ok(req_id, self._call_speaker_list_voiceprints())
+        if name == "speaker_update_voiceprint":
+            return self._ok(req_id, self._call_speaker_update_voiceprint(args))
+        if name == "speaker_delete_voiceprint":
+            return self._ok(req_id, self._call_speaker_delete_voiceprint(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1169,6 +1250,126 @@ class McpServer:
         target = str(args.get("id_or_keyword") or "").strip()
         removed = self.reminder_store.cancel(target)
         return self._tool_result({"removed": removed, "id_or_keyword": target})
+
+    def _call_speaker_enroll_voiceprint(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "").strip()
+        role = str(args.get("role") or "family").strip() or "family"
+        style_hint = str(args.get("style_hint") or "").strip()
+        notes = str(args.get("notes") or "").strip()
+        target = str(args.get("target") or "previous").strip() or "previous"
+        keyword = str(args.get("keyword") or "").strip()
+        raw_caps = args.get("capabilities")
+        capabilities = (
+            [str(c).strip() for c in raw_caps if str(c).strip()]
+            if isinstance(raw_caps, list)
+            else None
+        )
+        raw_voice = args.get("preferred_voice")
+        preferred_voice: str | None = None
+        if isinstance(raw_voice, str) and raw_voice.strip():
+            try:
+                preferred_voice = resolve_edge_voice(raw_voice.strip()).id
+            except ValueError as exc:
+                return self._tool_result(
+                    {"error": "invalid_voice", "message": str(exc)}, is_error=True
+                )
+        try:
+            profile, rec = self.speaker_store.enroll_from_recent(
+                name,
+                role=role,
+                style_hint=style_hint,
+                capabilities=capabilities,
+                notes=notes,
+                preferred_voice=preferred_voice,
+                target=target,
+                keyword=keyword,
+            )
+        except ValueError as exc:
+            return self._tool_result(
+                {"error": "voiceprint_enroll_failed", "message": str(exc)},
+                is_error=True,
+            )
+        return self._tool_result(
+            {
+                "status": "enrolled",
+                "id": profile.id,
+                "name": profile.name,
+                "role": profile.role,
+                "style_hint": profile.style_hint,
+                "capabilities": profile.capabilities,
+                "notes": profile.notes,
+                "preferred_voice": profile.preferred_voice,
+                "sample_count": profile.sample_count,
+                "captured_utterance": rec.text,
+            }
+        )
+
+    def _call_speaker_list_voiceprints(self) -> dict[str, Any]:
+        profiles = self.speaker_store.list_profiles()
+        recent = self.speaker_store.recent_utterances()
+        return self._tool_result(
+            {
+                "profiles": profiles,
+                "count": len(profiles),
+                "recent_utterances": recent,
+            }
+        )
+
+    def _call_speaker_update_voiceprint(self, args: dict[str, Any]) -> dict[str, Any]:
+        name_or_id = str(args.get("name_or_id") or "").strip()
+        if not name_or_id:
+            return self._tool_result(
+                {"error": "invalid_arguments", "message": "'name_or_id' is required."},
+                is_error=True,
+            )
+        raw_caps = args.get("capabilities")
+        capabilities = (
+            [str(c).strip() for c in raw_caps if str(c).strip()]
+            if isinstance(raw_caps, list)
+            else None
+        )
+        raw_voice = args.get("preferred_voice")
+        preferred_voice: str | None = None
+        if isinstance(raw_voice, str):
+            if raw_voice.strip():
+                try:
+                    preferred_voice = resolve_edge_voice(raw_voice.strip()).id
+                except ValueError as exc:
+                    return self._tool_result(
+                        {"error": "invalid_voice", "message": str(exc)}, is_error=True
+                    )
+            else:
+                preferred_voice = ""
+        updated = self.speaker_store.update_profile(
+            name_or_id,
+            role=str(args["role"]) if "role" in args and args["role"] is not None else None,
+            style_hint=str(args["style_hint"]) if "style_hint" in args and args["style_hint"] is not None else None,
+            capabilities=capabilities,
+            notes=str(args["notes"]) if "notes" in args and args["notes"] is not None else None,
+            preferred_voice=preferred_voice,
+        )
+        if updated is None:
+            return self._tool_result(
+                {"error": "not_found", "message": f"No voiceprint found for {name_or_id!r}."},
+                is_error=True,
+            )
+        return self._tool_result(
+            {
+                "status": "updated",
+                "id": updated.id,
+                "name": updated.name,
+                "role": updated.role,
+                "style_hint": updated.style_hint,
+                "capabilities": updated.capabilities,
+                "notes": updated.notes,
+                "preferred_voice": updated.preferred_voice,
+            }
+        )
+
+    def _call_speaker_delete_voiceprint(self, args: dict[str, Any]) -> dict[str, Any]:
+        target = str(args.get("name_or_id") or "").strip()
+        removed = self.speaker_store.delete_profile(target)
+        return self._tool_result({"removed": removed, "name_or_id": target})
 
     async def start_http_server(
         self,

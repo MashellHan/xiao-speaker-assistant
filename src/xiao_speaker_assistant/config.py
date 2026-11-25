@@ -43,14 +43,21 @@ class SpeechConfig(BaseModel):
         ]
     )
     local_keywords: list[str] = Field(
-        default_factory=lambda: ["你好管家", "你好诺米", "你好糯米", "嗨糯米", "嗨纳米"]
+        default_factory=lambda: [
+            "糯米糯米",
+            "诺米诺米",
+        ]
     )
     en_kws_enabled: bool = True
     en_keywords: list[str] = Field(
-        default_factory=lambda: ["HI NOMI", "HI NAOMI", "HI KNOW ME", "HI NO ME", "HEY NOMI", "HI NOAMI"]
+        default_factory=lambda: ["HEY NUOMI", "HEY NOMI", "HEY NOUMI", "HEY NAOMI"]
     )
     en_kws_score: float = 1.5
     en_kws_threshold: float = 0.20
+    speaker_id_enabled: bool = True
+    speaker_id_model: str = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+    speaker_id_threshold: float = 0.45
+    speaker_profiles_file: str = "~/.local/share/xiao-speaker-assistant/speakers.json"
     interrupt_keywords: list[str] = Field(
         default_factory=lambda: ["退出", "停止", "闭嘴", "退下", "别说了", "再见"]
     )

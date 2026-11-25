@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import logging
@@ -26,13 +27,21 @@ from xiao_speaker_assistant.voice.audio_pipeline import (
     match_wakeup_phrase,
 )
 from xiao_speaker_assistant.voice.playback import PlaybackController
+from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch, SpeakerProfileStore
+from xiao_speaker_assistant.voice.voice_catalog import resolve_edge_voice
 
 logger = logging.getLogger(__name__)
 QueryHandler = Callable[[str], Awaitable[str]]
 StreamQueryHandler = Callable[[str], AsyncIterator[str]]
+CURRENT_SPEAKER: ContextVar[SpeakerMatch | None] = ContextVar("xsa_current_speaker", default=None)
 
 IGNORE_BARE_WORDS = {"小爱同学", "小爱"}
-WAKE_FRAGMENT_WORDS = {"管家", "关家", "诺米", "糯米", "老米", "纳米", "nomi", "naomi"}
+WAKE_FRAGMENT_WORDS = {
+    "管家",
+    "关家",
+    "诺米",
+    "糯米",
+}
 FILLER_NOISE_WORDS = {"嗯", "啊", "哦", "呃", "额", "唉", "唔", "哈", "嘿", "喂", "嗯嗯", "啊啊", "哦哦", "哈哈"}
 EXIT_EXACT_WORDS = {
     "退出",
@@ -105,6 +114,7 @@ class SpeakerGateway:
         on_stream_query: StreamQueryHandler | None = None,
         on_session_reset: Callable[[], None] | None = None,
         *,
+        speaker_store: SpeakerProfileStore | None = None,
         audio_watchdog_interval: float = 3.0,
         audio_stall_timeout: float = 4.0,
     ) -> None:
@@ -114,6 +124,7 @@ class SpeakerGateway:
         self._on_query = on_query
         self._on_stream_query = on_stream_query
         self._on_session_reset = on_session_reset
+        self._speaker_store = speaker_store
         self._audio_watchdog_interval = audio_watchdog_interval
         self._audio_stall_timeout = audio_stall_timeout
         self._connections: set[ServerConnection] = set()
@@ -280,7 +291,15 @@ class SpeakerGateway:
     ) -> None:
         pb = self._get_playback(conn)
         sess = self._get_session(conn)
-        await pb.speak(text, interrupt_native=interrupt, voice_override=sess.active_voice)
+        voice_override = sess.active_voice
+        if voice_override is None:
+            spk = CURRENT_SPEAKER.get()
+            if spk is not None and spk.preferred_voice:
+                try:
+                    voice_override = resolve_edge_voice(spk.preferred_voice).id
+                except ValueError:
+                    pass
+        await pb.speak(text, interrupt_native=interrupt, voice_override=voice_override)
 
     async def abort_and_speak(self, conn: Any, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
@@ -445,10 +464,12 @@ class SpeakerGateway:
             sess.mute_native_until = time.monotonic() + 8.0
             loop.call_soon_threadsafe(lambda: loop.create_task(self.play_wakeup_chime(conn)))
 
-        def on_utterance(text: str) -> None:
+        def on_utterance(text: str, embedding: list[float] | None = None) -> None:
             logger.info("Local ASR recognized: %s", text)
             loop.call_soon_threadsafe(
-                lambda t=text: loop.create_task(self._process_local_utterance(conn, t))
+                lambda t=text, emb=embedding: loop.create_task(
+                    self._process_local_utterance(conn, t, embedding=emb)
+                )
             )
 
         def on_sleep() -> None:
@@ -471,7 +492,7 @@ class SpeakerGateway:
             lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
                 pcm,
                 on_wakeup=on_wakeup,
-                on_utterance=on_utterance,
+                on_utterance_embedding=on_utterance,
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
                 on_barge_in_wakeup=on_barge_in_wakeup,
@@ -548,7 +569,13 @@ class SpeakerGateway:
         now = time.monotonic()
         return [t for ts, t in sess.recent_spoken_texts if (now - ts) <= 15.0]
 
-    async def _process_local_utterance(self, conn: Any, text: str) -> None:
+    async def _process_local_utterance(
+        self,
+        conn: Any,
+        text: str,
+        *,
+        embedding: list[float] | None = None,
+    ) -> None:
         sess = self._get_session(conn)
         if self.is_exit_command(text):
             await self._handle_interrupt(conn)
@@ -591,6 +618,21 @@ class SpeakerGateway:
                 return
             text = rest
 
+        speaker_match: SpeakerMatch | None = None
+        if self._speaker_store is not None:
+            if embedding is not None and self._config.speech.speaker_id_enabled:
+                speaker_match = self._speaker_store.identify(
+                    embedding, threshold=self._config.speech.speaker_id_threshold
+                )
+            self._speaker_store.record_utterance(text, embedding, matched=speaker_match)
+            if speaker_match is not None:
+                logger.info(
+                    "Identified speaker: %s (role=%s, score=%.2f)",
+                    speaker_match.name,
+                    speaker_match.role,
+                    speaker_match.score,
+                )
+
         # Full-duplex barge-in: if Nomi is currently speaking or thinking, cancel current reply
         # without resetting session context and immediately answer the new follow-up utterance.
         if is_speaking_now:
@@ -613,7 +655,7 @@ class SpeakerGateway:
                     pass
 
         sess.mute_native_until = time.monotonic() + 10.0
-        await self._run_query_and_speak(conn, text)
+        await self._run_query_and_speak(conn, text, speaker_match=speaker_match)
 
     async def _handle_text_message(self, conn: Any, raw: str) -> None:
         try:
@@ -778,12 +820,19 @@ class SpeakerGateway:
 
         await self._run_query_and_speak(conn, query)
 
-    async def _run_query_and_speak(self, conn: Any, query: str) -> None:
+    async def _run_query_and_speak(
+        self,
+        conn: Any,
+        query: str,
+        *,
+        speaker_match: SpeakerMatch | None = None,
+    ) -> None:
         sess = self._get_session(conn)
         async with sess.query_lock:
             sess.interrupted = False
             task = asyncio.current_task()
             sess.active_reply_task = task
+            token = CURRENT_SPEAKER.set(speaker_match)
             try:
                 if self._on_stream_query is not None:
                     await self._run_streaming_reply(conn, query)
@@ -801,6 +850,7 @@ class SpeakerGateway:
                 logger.exception("Error handling query %r", query)
                 await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
             finally:
+                CURRENT_SPEAKER.reset(token)
                 if self._pipeline is not None and not sess.interrupted:
                     self._pipeline.refresh_activity()
                 if sess.active_reply_task is task:
