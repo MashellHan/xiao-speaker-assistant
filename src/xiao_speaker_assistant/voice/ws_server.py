@@ -145,6 +145,14 @@ class SpeakerGateway:
         if self._pipeline is not None:
             self._pipeline.update_config(new_config.speech)
 
+    def apply_voice_change(self, voice: str, rate: str) -> None:
+        self._config.speaker.edge_voice = voice
+        self._config.speaker.edge_rate = rate
+        for pb in self._playbacks.values():
+            pb._config = self._config.speaker
+        for sess in self._sessions.values():
+            sess.active_voice = None
+
     def _resolve_voice_for_keyword(self, keyword: str) -> str | None:
         routes = self._config.speaker.voice_routes
         if not routes:

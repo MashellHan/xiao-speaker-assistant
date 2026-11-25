@@ -230,12 +230,24 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     router: LLMRouter | None = None
     gateway: SpeakerGateway | None = None
+    bridge: OpenAIBridgeServer | None = None
+
+    def on_voice_changed(voice: str, rate: str) -> None:
+        config.speaker.edge_voice = voice
+        config.speaker.edge_rate = rate
+        if gateway is not None:
+            gateway.apply_voice_change(voice, rate)
+        if bridge is not None:
+            bridge._speaker_config.edge_voice = voice
+            bridge._speaker_config.edge_rate = rate
 
     mcp_server = McpServer(
         config,
         confirmation_store=confirmations,
         memory_store=memory_store,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
+        on_voice_changed=on_voice_changed,
+        config_path=getattr(args, "config", None),
         include_local_tools=True,
     )
     mcp_runner, mcp_port = await mcp_server.start_http_server(
@@ -260,7 +272,6 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     tools, clients = build_tool_registry(config, confirmation_store=confirmations)
     outlook_client = clients.get("outlook") or OutlookClient(config.tools.outlook)
-    bridge: OpenAIBridgeServer | None = None
 
     async def apply_hot_reload(new_cfg: AppConfig) -> None:
         nonlocal tools, clients, outlook_client
