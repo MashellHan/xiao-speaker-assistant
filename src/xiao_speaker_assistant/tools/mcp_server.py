@@ -22,8 +22,7 @@ from urllib.parse import quote
 import httpx
 from aiohttp import web
 
-from xiao_speaker_assistant.config import AppConfig
-from xiao_speaker_assistant.llm.router import resolve_binary
+from xiao_speaker_assistant.config import AppConfig, resolve_binary
 from xiao_speaker_assistant.tools.browser import (
     async_fetch_webpage_summary,
     extract_html_summary,
