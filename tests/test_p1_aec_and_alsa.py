@@ -86,7 +86,7 @@ def test_asound_xsa_conf_includes_system_alsa_and_routes_ch0_and_ch3_loopback() 
     assert "unset ALSA_CONFIG_PATH" in boot
 
 
-def test_aec_enabled_2ch_mutes_vad_for_echo_guard_with_short_tail() -> None:
+def test_aec_enabled_2ch_keeps_vad_open_for_full_duplex_barge_in() -> None:
     cfg = AppConfig()
     cfg.speech.aec_enabled = True
     cfg.speech.capture_channels = 2
@@ -109,9 +109,7 @@ def test_aec_enabled_2ch_mutes_vad_for_echo_guard_with_short_tail() -> None:
     assert pb._on_playback_state is not None
     pb._on_playback_state(True)
     pb._on_playback_state(False)
-    fake_pipeline.set_muted.assert_any_call(True)
-    fake_pipeline.mute_for.assert_called_once_with(0.15)
-    fake_pipeline.set_muted.assert_any_call(False)
+    fake_pipeline.set_muted.assert_not_called()
 
 
 def test_linear_aec_converges_on_quiet_oh2p_amplitude_signal() -> None:

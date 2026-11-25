@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 import logging
+import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -63,6 +65,31 @@ class SpeakerSession:
     last_chime_at: float = 0.0
     active_reply_task: asyncio.Task[None] | None = None
     interrupted: bool = False
+    recent_spoken_texts: deque[tuple[float, str]] = field(default_factory=deque)
+
+
+_ECHO_STRIP_RE = re.compile(r"[\s，,。.!！？?、；;：:\"'`~～]+")
+
+
+def is_self_echo(asr_text: str, recent_spoken: Iterable[str]) -> bool:
+    """Return True if `asr_text` looks like a residual TTS self-echo fragment."""
+    norm_asr = _ECHO_STRIP_RE.sub("", asr_text).lower()
+    if len(norm_asr) < 2:
+        return False
+    combined = ""
+    for spoken in recent_spoken:
+        norm_spoken = _ECHO_STRIP_RE.sub("", spoken).lower()
+        if not norm_spoken:
+            continue
+        if norm_asr in norm_spoken:
+            return True
+        combined += norm_spoken
+    if len(norm_asr) >= 3 and combined:
+        bigrams = [norm_asr[i : i + 2] for i in range(len(norm_asr) - 1)]
+        hits = sum(1 for bg in bigrams if bg in combined)
+        if hits / len(bigrams) >= 0.65:
+            return True
+    return False
 
 
 class SpeakerGateway:
@@ -114,17 +141,15 @@ class SpeakerGateway:
         def on_state(playing: bool) -> None:
             if self._pipeline is None:
                 return
-            # Always keep VAD muted during playback to prevent nonlinear residual echo self-talk;
-            # unified KWS still runs unmuted on the AEC-cleaned signal for low-volume barge-in.
+            # When 2ch hardware ch3 AEC is active, keep VAD unmuted so the user can interrupt
+            # with direct follow-ups ("北京呢？") while Nomi is speaking; self-echoes are filtered
+            # via LinearEchoCanceller + is_self_echo().
+            if self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2:
+                return
             if playing:
                 self._pipeline.set_muted(True)
             else:
-                tail = (
-                    0.15
-                    if (self._config.speech.aec_enabled and self._config.speech.capture_channels >= 2)
-                    else 0.25
-                )
-                self._pipeline.mute_for(tail)
+                self._pipeline.mute_for(0.25)
                 self._pipeline.set_muted(False)
 
         pb = PlaybackController(
@@ -444,6 +469,18 @@ class SpeakerGateway:
         if self._on_session_reset is not None:
             self._on_session_reset()
 
+    def _record_spoken(self, sess: SpeakerSession, text: str) -> None:
+        now = time.monotonic()
+        sess.recent_spoken_texts.append((now, text))
+        while len(sess.recent_spoken_texts) > 8 or (
+            sess.recent_spoken_texts and (now - sess.recent_spoken_texts[0][0]) > 15.0
+        ):
+            sess.recent_spoken_texts.popleft()
+
+    def _recent_spoken_list(self, sess: SpeakerSession) -> list[str]:
+        now = time.monotonic()
+        return [t for ts, t in sess.recent_spoken_texts if (now - ts) <= 15.0]
+
     async def _process_local_utterance(self, conn: Any, text: str) -> None:
         sess = self._get_session(conn)
         if self.is_exit_command(text):
@@ -460,6 +497,9 @@ class SpeakerGateway:
             if self._pipeline is not None:
                 self._pipeline.refresh_activity()
             return
+        if is_self_echo(text, self._recent_spoken_list(sess)):
+            logger.info("Ignoring residual TTS self-echo: %s", text)
+            return
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
             _, rest = matched
@@ -470,6 +510,32 @@ class SpeakerGateway:
                     self._pipeline.refresh_activity()
                 return
             text = rest
+
+        # Full-duplex barge-in: if Nomi is currently speaking or thinking, cancel current reply
+        # without resetting session context and immediately answer the new follow-up utterance.
+        pb = self._playbacks.get(conn)
+        old_task = sess.active_reply_task
+        is_speaking_now = (old_task is not None and not old_task.done()) or (
+            pb is not None and pb.is_playing
+        )
+        if is_speaking_now:
+            logger.info("Full-duplex follow-up barge-in: %s", text)
+            sess.interrupted = True
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+            for fut in self._pending_rpc.get(conn, {}).values():
+                if not fut.done():
+                    fut.cancel()
+            if pb is not None:
+                await pb.stop_playback(stop_native=True)
+            if old_task is not None and not old_task.done():
+                try:
+                    await old_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
         sess.mute_native_until = time.monotonic() + 10.0
         await self._run_query_and_speak(conn, text)
 
@@ -649,6 +715,7 @@ class SpeakerGateway:
                 assert self._on_query is not None
                 reply = await self._on_query(query)
                 logger.info("LLM reply: %s", reply)
+                self._record_spoken(sess, reply)
                 sess.mute_native_until = time.monotonic() + 8.0
                 await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
             except asyncio.CancelledError:
@@ -689,6 +756,7 @@ class SpeakerGateway:
                 if sentence is None or sess.interrupted:
                     break
                 logger.info("Streaming TTS sentence: %s", sentence)
+                self._record_spoken(sess, sentence)
                 sess.mute_native_until = time.monotonic() + 8.0
                 await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
                 first_spoken = False
