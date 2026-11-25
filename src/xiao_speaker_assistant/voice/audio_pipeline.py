@@ -40,6 +40,7 @@ HI_NOMI_REGEX = re.compile(
 _PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a", "chen", "han", "an"}
 _PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao", "lao"}
 _PINYIN_THIRD = {"mi", "min", "mei", "ming"}
+_NON_ZH_EN_HALLUCINATION_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff]")
 
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
@@ -534,4 +535,8 @@ class LocalSpeechPipeline:
         stream = self._asr.create_stream()
         stream.accept_waveform(SAMPLE_RATE, samples)
         self._asr.decode_stream(stream)
-        return stream.result.text.strip()
+        text = stream.result.text.strip()
+        if text and _NON_ZH_EN_HALLUCINATION_RE.search(text):
+            logger.debug("Dropping non-zh/en SenseVoice hallucination: %s", text)
+            return ""
+        return text
