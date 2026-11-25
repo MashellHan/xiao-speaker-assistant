@@ -4,6 +4,7 @@ server {
 
     # Stock open-xiaoai-client on OH2P does not include TLS; authenticate via ?token=
     location /ws/speaker {
+        access_log off;
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
@@ -26,6 +27,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
 
     location /ws/ {
+        access_log off;
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

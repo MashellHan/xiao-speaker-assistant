@@ -419,6 +419,19 @@ def test_browser_fetch_summary_html_stripping_and_mcp_delegation() -> None:
     assert mcp_data["result"]["snapshot"] == "Page Title"
     assert fake_browser.calls == [("browser_navigate", {"url": "https://example.com"})]
 
+    snap_resp = asyncio.run(
+        browser_server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 33,
+                "method": "tools/call",
+                "params": {"name": "browser_snapshot", "arguments": {}},
+            }
+        )
+    )
+    assert snap_resp is not None and snap_resp["result"]["isError"] is False
+    assert fake_browser.calls[-1] == ("browser_snapshot", {})
+
 
 def test_stdio_loop_and_cli_mcp_server_subcommand(monkeypatch) -> None:
     stdin = io.StringIO(

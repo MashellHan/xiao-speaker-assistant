@@ -210,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Prevent websockets handshake logs from recording ?token= or Authorization headers at DEBUG.
+    logging.getLogger("websockets").setLevel(logging.INFO)
 
     relay = RelayServer(host=args.host, port=args.port)
     try:
