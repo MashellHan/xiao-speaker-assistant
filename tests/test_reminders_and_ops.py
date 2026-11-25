@@ -108,10 +108,39 @@ def test_mcp_reminder_tools_and_proactive_speak(tmp_path: Path) -> None:
 
     async def run() -> None:
         conn = FakeConn()
+        # 1. When no speaker is connected, reminder is deferred rather than dropped.
+        sched = ReminderScheduler(
+            store,
+            lambda e: gw.proactive_speak(f"提醒：{e.message}"),
+            retry_backoff_sec=10.0,
+        )
+        due_ts = store.list_entries()[0].trigger_at + 1  # type: ignore[operator]
+        assert await sched.tick_once(now_ts=due_ts) == 0
+        assert len(store.list_entries()) == 1
+
+        # 2. Within backoff window it waits; once backoff passes and speaker is idle it delivers.
         gw._connections.add(conn)  # type: ignore[arg-type]
-        sched = ReminderScheduler(store, lambda e: gw.proactive_speak(f"提醒：{e.message}"))
-        count = await sched.tick_once(now_ts=store.list_entries()[0].trigger_at + 1)  # type: ignore[operator]
-        assert count == 1
+        assert await sched.tick_once(now_ts=due_ts + 2) == 0
+        assert len(store.list_entries()) == 1
+        assert await sched.tick_once(now_ts=due_ts + 11) == 1
+        assert store.list_entries() == []
 
     asyncio.run(run())
     assert "start_play" in sent_cmds and "stop_play" in sent_cmds
+
+
+def test_start_mac_gateway_bash32_empty_pass_args() -> None:
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "start_mac_gateway.sh"
+    res = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, check=False)
+    assert res.returncode == 0, res.stderr
+    # Simulate empty PASS_ARGS under macOS bash `set -u`
+    empty_check = subprocess.run(
+        ["bash", "-c", 'set -euo pipefail; PASS_ARGS=(); set -- ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}; echo $#'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert empty_check.returncode == 0 and empty_check.stdout.strip() == "0"

@@ -288,18 +288,25 @@ class SpeakerGateway:
     async def send_tts(self, conn: Any, text: str) -> None:
         await self.abort_and_speak(conn, text)
 
+    def _is_conn_idle(self, conn: Any) -> bool:
+        sess = self._get_session(conn)
+        pb = self._playbacks.get(conn)
+        busy = (sess.active_reply_task is not None and not sess.active_reply_task.done()) or (
+            pb is not None and pb.is_playing
+        )
+        return not busy
+
+    def has_idle_speaker(self) -> bool:
+        return any(self._is_conn_idle(conn) for conn in list(self._connections))
+
     async def proactive_speak(self, text: str) -> bool:
         """Speak an unsolicited proactive reminder/briefing on an idle connected speaker."""
         if not text.strip():
             return False
         for conn in list(self._connections):
-            sess = self._get_session(conn)
-            pb = self._playbacks.get(conn)
-            busy = (sess.active_reply_task is not None and not sess.active_reply_task.done()) or (
-                pb is not None and pb.is_playing
-            )
-            if busy:
+            if not self._is_conn_idle(conn):
                 continue
+            sess = self._get_session(conn)
             self._record_spoken(sess, text)
             sess.mute_native_until = time.monotonic() + 8.0
             await self.play_wakeup_chime(conn)

@@ -59,6 +59,7 @@ class ReminderStore:
         self._max_entries = max_entries
         self._lock = threading.RLock()
         self._entries: list[ReminderEntry] = []
+        self._retry_after: dict[str, float] = {}
         self._load()
 
     def _load(self) -> None:
@@ -187,13 +188,14 @@ class ReminderStore:
                 self._persist()
             return removed
 
-    def pop_due(
+    def peek_due(
         self,
         *,
         now_ts: float | None = None,
         local_now: datetime | None = None,
         quiet_start_hhmm: str = "23:00",
         quiet_end_hhmm: str = "07:00",
+        max_late_sec: float = 900.0,
     ) -> list[ReminderEntry]:
         ts_now = time.time() if now_ts is None else now_ts
         dt_now = datetime.now() if local_now is None else local_now
@@ -203,32 +205,92 @@ class ReminderStore:
         quiet = is_quiet_hours(dt_now, quiet_start_hhmm, quiet_end_hhmm)
 
         due: list[ReminderEntry] = []
-        changed = False
+        expired_changed = False
         with self._lock:
             remaining: list[ReminderEntry] = []
             for entry in self._entries:
+                retry_until = self._retry_after.get(entry.id, 0.0)
                 if entry.daily_hhmm:
                     hh, mm = (int(x) for x in entry.daily_hhmm.split(":"))
                     target_minutes = hh * 60 + mm
                     in_window = 0 <= (cur_minutes - target_minutes) <= 10
                     if (
                         not quiet
+                        and ts_now >= retry_until
                         and entry.last_fired_date != today_str
                         and cur_hhmm >= entry.daily_hhmm
                         and in_window
                     ):
-                        entry.last_fired_date = today_str
                         due.append(entry)
-                        changed = True
                     remaining.append(entry)
                 elif entry.trigger_at is not None and ts_now >= entry.trigger_at:
-                    due.append(entry)
-                    changed = True
+                    if ts_now - entry.trigger_at > max_late_sec:
+                        self._retry_after.pop(entry.id, None)
+                        expired_changed = True
+                        continue
+                    if ts_now >= retry_until:
+                        due.append(entry)
+                    remaining.append(entry)
                 else:
                     remaining.append(entry)
-            if changed:
+            if expired_changed:
                 self._entries = remaining
                 self._persist()
+        return due
+
+    def defer_retry(
+        self,
+        entry_id: str,
+        *,
+        delay_sec: float = 10.0,
+        now_ts: float | None = None,
+    ) -> None:
+        ts_now = time.time() if now_ts is None else now_ts
+        with self._lock:
+            self._retry_after[entry_id] = ts_now + max(0.0, delay_sec)
+
+    def mark_delivered(
+        self,
+        entry_id: str,
+        *,
+        local_now: datetime | None = None,
+    ) -> bool:
+        dt_now = datetime.now() if local_now is None else local_now
+        today_str = dt_now.strftime("%Y-%m-%d")
+        with self._lock:
+            self._retry_after.pop(entry_id, None)
+            new_entries: list[ReminderEntry] = []
+            found = False
+            for entry in self._entries:
+                if entry.id != entry_id:
+                    new_entries.append(entry)
+                    continue
+                found = True
+                if entry.daily_hhmm:
+                    entry.last_fired_date = today_str
+                    new_entries.append(entry)
+                # One-shot reminders are removed once delivered.
+            if found:
+                self._entries = new_entries
+                self._persist()
+            return found
+
+    def pop_due(
+        self,
+        *,
+        now_ts: float | None = None,
+        local_now: datetime | None = None,
+        quiet_start_hhmm: str = "23:00",
+        quiet_end_hhmm: str = "07:00",
+    ) -> list[ReminderEntry]:
+        due = self.peek_due(
+            now_ts=now_ts,
+            local_now=local_now,
+            quiet_start_hhmm=quiet_start_hhmm,
+            quiet_end_hhmm=quiet_end_hhmm,
+        )
+        for entry in due:
+            self.mark_delivered(entry.id, local_now=local_now)
         return due
 
 
@@ -243,18 +305,20 @@ class ReminderScheduler:
         quiet_start_hhmm: str = "23:00",
         quiet_end_hhmm: str = "07:00",
         poll_interval: float = 1.0,
+        retry_backoff_sec: float = 10.0,
     ) -> None:
         self._store = store
         self._on_due = on_due
         self.quiet_start_hhmm = quiet_start_hhmm
         self.quiet_end_hhmm = quiet_end_hhmm
         self._poll_interval = poll_interval
+        self._retry_backoff_sec = retry_backoff_sec
         self._task: asyncio.Task[None] | None = None
 
     async def tick_once(
         self, *, now_ts: float | None = None, local_now: datetime | None = None
     ) -> int:
-        due_entries = self._store.pop_due(
+        due_entries = self._store.peek_due(
             now_ts=now_ts,
             local_now=local_now,
             quiet_start_hhmm=self.quiet_start_hhmm,
@@ -264,10 +328,19 @@ class ReminderScheduler:
         for entry in due_entries:
             try:
                 ok = await self._on_due(entry)
-                if ok:
-                    dispatched += 1
             except Exception:
                 logger.exception("Failed delivering proactive reminder %s", entry.id)
+                self._store.defer_retry(
+                    entry.id, delay_sec=self._retry_backoff_sec, now_ts=now_ts
+                )
+                continue
+            if ok:
+                self._store.mark_delivered(entry.id, local_now=local_now)
+                dispatched += 1
+            else:
+                self._store.defer_retry(
+                    entry.id, delay_sec=self._retry_backoff_sec, now_ts=now_ts
+                )
         return dispatched
 
     def start(self) -> asyncio.Task[None]:

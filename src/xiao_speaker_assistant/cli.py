@@ -348,7 +348,9 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         confirmations.clear()
 
     async def deliver_proactive_reminder(entry: ReminderEntry) -> bool:
-        if gateway is None:
+        if not mcp_server._config.reminders.enabled:
+            return False
+        if gateway is None or not gateway.has_idle_speaker():
             return False
         if entry.kind == "morning_briefing":
             briefing_prompt = (

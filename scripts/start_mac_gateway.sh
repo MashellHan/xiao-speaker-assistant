@@ -27,7 +27,7 @@ if [ "$WITH_MCP" = "true" ]; then
   MCP_PID=$!
 fi
 
-uv run xsa serve --host 127.0.0.1 --port 4398 "${PASS_ARGS[@]}" &
+uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
 SRV_PID=$!
 
 cleanup() {
