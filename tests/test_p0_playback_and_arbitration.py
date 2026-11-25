@@ -135,6 +135,8 @@ def test_playback_controller_cancel_epoch_aborts_queued_waiters_and_chime_skips_
 
     asyncio.run(run())
     assert spoken_texts == ["第一句"]
+    # Aborted speak() must NOT call on_playback_state(False), which would re-mute/wipe VAD during barge-in.
+    assert states == [True]
     assert any(m["Request"]["command"] == "stop_play" for m in sent_text)
     assert any("player_wakeup" in s for s in run_shells)
 

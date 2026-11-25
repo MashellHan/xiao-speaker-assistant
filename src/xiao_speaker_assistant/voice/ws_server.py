@@ -383,6 +383,7 @@ class SpeakerGateway:
     async def _handle_barge_in_wakeup(self, conn: Any) -> None:
         sess = self._get_session(conn)
         sess.interrupted = True
+        sess.mute_native_until = time.monotonic() + 8.0
         if sess.active_reply_task is not None and not sess.active_reply_task.done():
             sess.active_reply_task.cancel()
         for fut in self._pending_rpc.get(conn, {}).values():
@@ -393,9 +394,6 @@ class SpeakerGateway:
             await pb.stop_playback(stop_native=True)
         else:
             await self.stop_native_audio(conn)
-        if self._pipeline is not None:
-            self._pipeline.set_awake(True)
-            self._pipeline.set_muted(False)
         await self.play_wakeup_chime(conn)
 
     async def _handle_interrupt(self, conn: Any) -> None:
