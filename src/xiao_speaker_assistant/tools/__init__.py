@@ -22,6 +22,7 @@ from .mcp_client import HttpMcpClient
 from .mcp_server import ALL_TOOL_DEFINITIONS, LOCAL_TOOL_DEFINITIONS, TOOL_DEFINITIONS, McpServer
 from .memory import MemoryEntry, MemorySecurityError, MemoryStore
 from .outlook import OutlookClient, PendingEmailDraft
+from .reminders import ReminderEntry, ReminderScheduler, ReminderStore, is_quiet_hours
 
 __all__ = [
     "ALL_TOOL_DEFINITIONS",
@@ -37,6 +38,10 @@ __all__ = [
     "MemoryStore",
     "OutlookClient",
     "PendingEmailDraft",
+    "ReminderEntry",
+    "ReminderScheduler",
+    "ReminderStore",
+    "is_quiet_hours",
     "TOOL_DEFINITIONS",
     "build_edge_open_command",
     "extract_html_summary",

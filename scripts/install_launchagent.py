@@ -38,11 +38,14 @@ def build_program_arguments(
     asr_model: str | None = None,
     relay: str | None = None,
     keep_awake: bool = False,
+    with_mcp: bool = False,
 ) -> list[str]:
     args: list[str] = []
     if keep_awake:
         args.extend(["/usr/bin/caffeinate", "-s"])
     args.append(str(gateway_script))
+    if with_mcp:
+        args.append("--with-mcp")
     if asr:
         args.extend(["--asr", asr])
     if asr_model:
@@ -59,6 +62,7 @@ def build_launchagent_dict(
     asr_model: str | None = None,
     relay: str | None = None,
     keep_awake: bool = False,
+    with_mcp: bool = False,
     env_file: Path | None = None,
 ) -> dict[str, Any]:
     root = (repo_root or default_repo_root()).resolve()
@@ -70,6 +74,7 @@ def build_launchagent_dict(
         asr_model=asr_model,
         relay=relay,
         keep_awake=keep_awake,
+        with_mcp=with_mcp,
     )
     local_bin = Path.home() / ".local" / "bin"
     path_env = f"{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -95,6 +100,7 @@ def render_launchagent_plist(
     asr_model: str | None = None,
     relay: str | None = None,
     keep_awake: bool = False,
+    with_mcp: bool = False,
     env_file: Path | None = None,
 ) -> bytes:
     payload = build_launchagent_dict(
@@ -103,6 +109,7 @@ def render_launchagent_plist(
         asr_model=asr_model,
         relay=relay,
         keep_awake=keep_awake,
+        with_mcp=with_mcp,
         env_file=env_file,
     )
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
@@ -185,6 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Wrap start_mac_gateway.sh with `caffeinate -s` to prevent system sleep on AC power.",
     )
     parser.add_argument(
+        "--with-mcp",
+        action="store_true",
+        help="Also launch local Xiaohongshu & Playwright Edge MCP servers alongside the gateway.",
+    )
+    parser.add_argument(
         "--plist-path",
         type=Path,
         default=DEFAULT_PLIST_PATH,
@@ -227,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         asr_model=args.asr_model,
         relay=args.relay,
         keep_awake=args.keep_awake,
+        with_mcp=args.with_mcp,
         env_file=validated_env,
     )
 

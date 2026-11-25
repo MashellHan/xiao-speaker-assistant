@@ -29,6 +29,9 @@ from xiao_speaker_assistant.tools import (
     MemoryStore,
     OutlookClient,
     PendingEmailDraft,
+    ReminderEntry,
+    ReminderScheduler,
+    ReminderStore,
     is_cancel_utterance,
     is_confirm_utterance,
 )
@@ -225,12 +228,14 @@ def cmd_doctor(config: AppConfig) -> int:
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     confirmations = ConfirmationStore()
     memory_store = MemoryStore(config.memory.file_path)
+    reminder_store = ReminderStore(config.reminders.file_path)
     agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
 
     router: LLMRouter | None = None
     gateway: SpeakerGateway | None = None
     bridge: OpenAIBridgeServer | None = None
+    scheduler: ReminderScheduler | None = None
 
     def on_voice_changed(voice: str, rate: str) -> None:
         config.speaker.edge_voice = voice
@@ -245,6 +250,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         config,
         confirmation_store=confirmations,
         memory_store=memory_store,
+        reminder_store=reminder_store,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         config_path=getattr(args, "config", None),
@@ -287,6 +293,9 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         await asyncio.to_thread(router.reload_runtime_config, new_cfg)
         if gateway is not None:
             await asyncio.to_thread(gateway.reload_config, new_cfg)
+        if scheduler is not None:
+            scheduler.quiet_start_hhmm = new_cfg.reminders.quiet_start_hhmm
+            scheduler.quiet_end_hhmm = new_cfg.reminders.quiet_end_hhmm
         if bridge is not None:
             bridge._speaker_config = new_cfg.speaker
         tools, clients = build_tool_registry(new_cfg, confirmation_store=confirmations)
@@ -338,6 +347,30 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         router.reset_session()
         confirmations.clear()
 
+    async def deliver_proactive_reminder(entry: ReminderEntry) -> bool:
+        if gateway is None:
+            return False
+        if entry.kind == "morning_briefing":
+            briefing_prompt = (
+                f"现在到了每日早报时间，主题是“{entry.message}”。"
+                "请先查一下用户常住城市（若记忆里没有则查北京）今天的天气，"
+                "再列出今天已设置的待办提醒；如果配置了 Outlook 则顺便简要汇报未读重要邮件。"
+                "整理成一段不超过150字的口语早报。"
+            )
+            text = await handle_query(briefing_prompt)
+        else:
+            text = f"提醒时间到：{entry.message}"
+        return await gateway.proactive_speak(text)
+
+    if config.reminders.enabled and args.command != "openai-bridge":
+        scheduler = ReminderScheduler(
+            reminder_store,
+            deliver_proactive_reminder,
+            quiet_start_hhmm=config.reminders.quiet_start_hhmm,
+            quiet_end_hhmm=config.reminders.quiet_end_hhmm,
+        )
+        scheduler.start()
+
     try:
         if args.command == "openai-bridge":
             bridge = OpenAIBridgeServer(
@@ -353,25 +386,28 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             finally:
                 await bridge_runner.cleanup()
             return
+        gateway = SpeakerGateway(
+            config,
+            on_query=handle_query,
+            on_stream_query=stream_query,
+            on_session_reset=reset_all,
+        )
         if args.relay:
             await run_with_relay(
                 config,
                 on_query=handle_query,
                 relay_url=args.relay,
+                gateway=gateway,
                 on_stream_query=stream_query,
                 on_session_reset=reset_all,
                 token_env=args.relay_token_env,
                 also_serve_local=True,
             )
         else:
-            gateway = SpeakerGateway(
-                config,
-                on_query=handle_query,
-                on_stream_query=stream_query,
-                on_session_reset=reset_all,
-            )
             await gateway.serve_forever()
     finally:
+        if scheduler is not None:
+            await scheduler.stop()
         await watcher.stop()
         await router.close()
         await mcp_runner.cleanup()

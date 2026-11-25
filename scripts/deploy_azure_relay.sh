@@ -55,6 +55,8 @@ az containerapp up \\
   --target-port 8765 \\
   --env-vars XSA_RELAY_TOKEN="\$XSA_RELAY_TOKEN"
 az containerapp update --name "$APP_NAME" --resource-group "$RG" --min-replicas 1 --max-replicas 1
+# Allow plain ws:// on port 80 for stock open-xiaoai-client (which lacks TLS):
+az containerapp ingress update --name "$APP_NAME" --resource-group "$RG" --allow-insecure
 EOF
   exit 0
 fi
