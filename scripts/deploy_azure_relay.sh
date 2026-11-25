@@ -55,6 +55,9 @@ az containerapp up \\
   --target-port 8765 \\
   --env-vars XSA_RELAY_TOKEN="\$XSA_RELAY_TOKEN"
 az containerapp update --name "$APP_NAME" --resource-group "$RG" --min-replicas 1 --max-replicas 1
+# WARNING: Plain ws:// over public networks exposes audio frames and ?token= in cleartext.
+# Only enable --allow-insecure for stock open-xiaoai-client (which lacks TLS) when no TLS-terminating proxy is used:
+az containerapp ingress update --name "$APP_NAME" --resource-group "$RG" --allow-insecure
 EOF
   exit 0
 fi

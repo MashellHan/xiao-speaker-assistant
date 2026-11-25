@@ -87,3 +87,9 @@ memory:
   enabled: true
   file_path: ~/.local/share/xiao-speaker-assistant/memory.json
   max_prompt_items: 12
+
+reminders:
+  enabled: true
+  file_path: ~/.local/share/xiao-speaker-assistant/reminders.json
+  quiet_start_hhmm: "23:00"
+  quiet_end_hhmm: "07:00"

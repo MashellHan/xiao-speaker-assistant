@@ -11,11 +11,27 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
-uv run xsa serve --host 127.0.0.1 --port 4398 "$@" &
+WITH_MCP="false"
+PASS_ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--with-mcp" ]; then
+    WITH_MCP="true"
+  else
+    PASS_ARGS+=("$arg")
+  fi
+done
+
+MCP_PID=""
+if [ "$WITH_MCP" = "true" ]; then
+  ./scripts/start_mcp_services.sh &
+  MCP_PID=$!
+fi
+
+uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
 SRV_PID=$!
 
 cleanup() {
-  kill "$SRV_PID" >/dev/null 2>&1 || true
+  kill "$SRV_PID" ${MCP_PID:+"$MCP_PID"} >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 

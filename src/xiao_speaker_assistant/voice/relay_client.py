@@ -194,6 +194,7 @@ async def run_with_relay(
     on_query: QueryHandler | None = None,
     relay_url: str = "",
     *,
+    gateway: SpeakerGateway | None = None,
     on_stream_query: StreamQueryHandler | None = None,
     on_session_reset: Callable[[], None] | None = None,
     auth_token: str | None = None,
@@ -201,20 +202,20 @@ async def run_with_relay(
     also_serve_local: bool = False,
 ) -> None:
     """Run SpeakerGateway connected outbound to the Azure relay (optionally also local WS)."""
-    gateway = SpeakerGateway(
+    gw = gateway or SpeakerGateway(
         config,
         on_query=on_query,
         on_stream_query=on_stream_query,
         on_session_reset=on_session_reset,
     )
-    gateway.ensure_pipeline()
+    gw.ensure_pipeline()
     client = RelayHostClient(
-        gateway,
+        gw,
         relay_url=relay_url,
         auth_token=auth_token,
         token_env=token_env,
     )
     if also_serve_local:
-        await asyncio.gather(gateway.serve_forever(), client.serve_forever())
+        await asyncio.gather(gw.serve_forever(), client.serve_forever())
     else:
         await client.serve_forever()

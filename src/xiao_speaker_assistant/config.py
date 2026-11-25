@@ -159,6 +159,13 @@ class MemoryConfig(BaseModel):
     max_prompt_items: int = 12
 
 
+class ReminderConfig(BaseModel):
+    enabled: bool = True
+    file_path: str = "~/.local/share/xiao-speaker-assistant/reminders.json"
+    quiet_start_hhmm: str = "23:00"
+    quiet_end_hhmm: str = "07:00"
+
+
 class AppConfig(BaseModel):
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     speech: SpeechConfig = Field(default_factory=SpeechConfig)
@@ -166,6 +173,7 @@ class AppConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    reminders: ReminderConfig = Field(default_factory=ReminderConfig)
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:

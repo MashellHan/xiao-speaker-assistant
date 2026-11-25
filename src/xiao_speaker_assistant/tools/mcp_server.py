@@ -39,6 +39,7 @@ from xiao_speaker_assistant.tools.mac_local import (
 from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
+from xiao_speaker_assistant.tools.reminders import ReminderStore
 from xiao_speaker_assistant.voice.voice_catalog import (
     list_voice_profiles_dicts,
     normalize_edge_rate,
@@ -303,6 +304,45 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "reminder_set",
+        "description": (
+            "Schedule a proactive voice reminder, countdown timer, or daily morning briefing on the speaker. "
+            "Provide one of delay_seconds (e.g. 1200 for 20 min), trigger_at_iso (YYYY-MM-DDTHH:MM:SS), "
+            "or daily_hhmm (e.g. '08:30')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "What to announce when due"},
+                "delay_seconds": {"type": "integer", "minimum": 1, "description": "Countdown seconds"},
+                "trigger_at_iso": {"type": "string", "description": "Local ISO-8601 timestamp"},
+                "daily_hhmm": {"type": "string", "description": "Daily 24h HH:MM schedule"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["reminder", "morning_briefing"],
+                    "default": "reminder",
+                },
+            },
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "reminder_list",
+        "description": "List all active scheduled voice reminders, timers, and daily briefings.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "reminder_cancel",
+        "description": "Cancel scheduled reminders matching an ID or keyword.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id_or_keyword": {"type": "string", "description": "Reminder ID or message keyword"},
+            },
+            "required": ["id_or_keyword"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -320,6 +360,7 @@ class McpServer:
         browser_client: HttpMcpClient | None = None,
         confirmation_store: ConfirmationStore | None = None,
         memory_store: MemoryStore | None = None,
+        reminder_store: ReminderStore | None = None,
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
         config_path: str | Path | None = None,
@@ -337,6 +378,9 @@ class McpServer:
         self.confirmation_store = confirmation_store or ConfirmationStore()
         self.memory_store = memory_store or MemoryStore(
             self._config.memory.file_path
+        )
+        self.reminder_store = reminder_store or ReminderStore(
+            self._config.reminders.file_path
         )
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
@@ -472,6 +516,12 @@ class McpServer:
             return self._ok(req_id, self._call_speaker_list_voices())
         if name == "speaker_set_voice":
             return self._ok(req_id, await self._call_speaker_set_voice(args))
+        if name == "reminder_set":
+            return self._ok(req_id, self._call_reminder_set(args))
+        if name == "reminder_list":
+            return self._ok(req_id, self._call_reminder_list())
+        if name == "reminder_cancel":
+            return self._ok(req_id, self._call_reminder_cancel(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1064,6 +1114,61 @@ class McpServer:
                 "persisted": persist,
             }
         )
+
+    def _call_reminder_set(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self._config.reminders.enabled:
+            return self._tool_result(
+                {"error": "reminders_disabled", "message": "Reminders are disabled in config."},
+                is_error=True,
+            )
+        message = str(args.get("message") or "").strip()
+        delay_seconds = args.get("delay_seconds")
+        trigger_at_iso = args.get("trigger_at_iso")
+        daily_hhmm = args.get("daily_hhmm")
+        kind = str(args.get("kind") or "reminder").strip()
+        try:
+            entry = self.reminder_store.add(
+                message,
+                delay_seconds=int(delay_seconds) if delay_seconds is not None else None,
+                trigger_at_iso=str(trigger_at_iso) if trigger_at_iso else None,
+                daily_hhmm=str(daily_hhmm) if daily_hhmm else None,
+                kind=kind,
+            )
+        except ValueError as exc:
+            return self._tool_result({"error": "invalid_reminder", "message": str(exc)}, is_error=True)
+        return self._tool_result(
+            {
+                "status": "scheduled",
+                "id": entry.id,
+                "message": entry.message,
+                "kind": entry.kind,
+                "daily_hhmm": entry.daily_hhmm,
+                "trigger_at": entry.trigger_at,
+            }
+        )
+
+    def _call_reminder_list(self) -> dict[str, Any]:
+        items = self.reminder_store.list_entries()
+        return self._tool_result(
+            {
+                "reminders": [
+                    {
+                        "id": e.id,
+                        "message": e.message,
+                        "kind": e.kind,
+                        "daily_hhmm": e.daily_hhmm,
+                        "trigger_at": e.trigger_at,
+                    }
+                    for e in items
+                ],
+                "count": len(items),
+            }
+        )
+
+    def _call_reminder_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
+        target = str(args.get("id_or_keyword") or "").strip()
+        removed = self.reminder_store.cancel(target)
+        return self._tool_result({"removed": removed, "id_or_keyword": target})
 
     async def start_http_server(
         self,
