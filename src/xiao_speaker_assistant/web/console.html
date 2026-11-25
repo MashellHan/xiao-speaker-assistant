@@ -3,8 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Xiao Speaker Assistant Nomi 本地与远端控制台，查看实时对话历史、延迟统计、硬件声学链路、模型与音色热更新以及家庭声纹记忆管理。">
   <title>Nomi 控制台 · Xiao Speaker Assistant</title>
   <style>
+    /* Hallmark · shape: app screen · genre: editorial · theme: Editorial (deal 1/3, seed calm-editorial-smart-speaker-841a·714a2625·2026-11-25·r0) · redesign: full
+     * nav: editorial masthead with centered typographic tabs · signature: heavy-ruled 4-column telemetry ledger + asymmetrical workspace · states: loading, empty, remote-login-gate, dark-mode, toast-error · axes: light/display-condensed/chromatic-green · posture: restrained · contrast: pass · v2.0.0 */
+    /* Hallmark · pre-emit critique: P10 H9 E9 S10 R10 V9 · weakest: CJK display face relies on system PingFang SC fallback; paired with Bricolage Grotesque & Source Serif 4 and strict Editorial 0px geometry + 4px/1px rules. */
+
     :root {
       color-scheme: light;
       --space-3xs: 2px;
@@ -14,82 +19,93 @@
       --space-md: 16px;
       --space-lg: 24px;
       --space-xl: 40px;
+      --space-2xl: 64px;
+      --space-3xl: 96px;
+
       --text-xs: 0.75rem;
       --text-sm: 0.875rem;
       --text-md: 1rem;
       --text-lg: 1.2rem;
       --text-xl: 1.44rem;
       --text-2xl: 1.728rem;
+      --text-3xl: 2.074rem;
+      --text-display-s: 1.44rem;
+      --text-display: 1.728rem;
+      --text-section: 1.2rem;
+      --text-title: 1rem;
+      --text-lead: 1rem;
+
       --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
       --dur-micro: 120ms;
       --dur-short: 220ms;
 
-      /* Astryx Stone + Hallmark editorial tokens (Light default, Dark via [data-theme="dark"]) */
-      --color-paper: #f5f5f4;
-      --color-paper-2: #ffffff;
-      --color-paper-3: #eaeaec;
-      --color-ink: #25252a;
-      --color-ink-2: #3b3b42;
-      --color-muted: #6e6e75;
-      --color-rule: #e2e2e8;
-      --color-accent: #e05d28;
-      --color-accent-ink: #1f1b18;
-      --color-accent-soft: #ffede4;
-      --color-focus: #c94c1a;
-      --color-green: #528b49;
-      --color-green-soft: #e6f2e4;
-      --color-error: #b83227;
-      --color-error-soft: #f7dfdc;
-      --color-grid: #e8e8ec;
-      --color-sheet: #ffffff;
+      --container: 1280px;
+      --gutter: 40px;
+      --gap-columns: 32px;
 
-      --font-display: "Red Hat Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
-      --font-body: "Red Hat Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
-      --font-outlier: "Red Hat Mono", "SF Mono", Menlo, Monaco, Consolas, ui-monospace, monospace;
+      --z-base: 1;
+      --z-sticky-nav: 300;
+      --z-toast: 500;
 
-      --radius-card: 10px;
-      --radius-entry: 12px;
-      --radius-pill: 999px;
+      /* Editorial palette tokens (warm uncoated paper + printed ink + printer green signal) */
+      --color-paper: oklch(97% 0.007 86);
+      --color-paper-2: oklch(94% 0.010 86);
+      --color-paper-3: oklch(91% 0.012 84);
+      --color-ink: oklch(16% 0.012 280);
+      --color-ink-2: oklch(29% 0.011 280);
+      --color-muted: oklch(46% 0.010 75);
+      --color-rule: oklch(85% 0.009 85);
+      --color-rule-2: oklch(64% 0.010 80);
+      --color-accent: oklch(46% 0.130 152);
+      --color-accent-soft: oklch(92% 0.032 152);
+      --color-accent-ink: oklch(98% 0.005 88);
+      --color-focus: oklch(49% 0.135 152);
+      --color-error: oklch(48% 0.18 27);
+      --color-error-soft: oklch(93% 0.035 27);
+
+      --font-display: "Bricolage Grotesque", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+      --font-body: "Source Serif 4", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+      --font-ui: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+      --radius-card: 0;
+      --radius-pill: 0;
       --rule-hair: 1px;
-      --shadow-card: 0 1px 2px rgba(37, 37, 42, 0.04), 0 8px 20px -14px rgba(37, 37, 42, 0.14);
-      --shadow-lift: 0 1px 2px rgba(37, 37, 42, 0.06), 0 16px 32px -18px rgba(37, 37, 42, 0.20);
-      --tracking-display: -0.025em;
-      --display-weight: 600;
-      --container: 1200px;
-      --gutter: 32px;
+      --rule-heavy: 4px;
+      --shadow-card: none;
+      --tracking-display: -0.02em;
+      --display-weight: 700;
     }
 
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --color-paper: #141417;
-      --color-paper-2: #1d1d22;
-      --color-paper-3: #27272e;
-      --color-ink: #f2f2f5;
-      --color-ink-2: #d3d3da;
-      --color-muted: #9898a2;
-      --color-rule: #2e2e36;
-      --color-accent: #e87a4e;
-      --color-accent-ink: #141417;
-      --color-accent-soft: #3a241b;
-      --color-focus: #f08e67;
-      --color-green: #6fb164;
-      --color-green-soft: #1d311c;
-      --color-error: #e56b60;
-      --color-error-soft: #3a1f1d;
-      --color-grid: #2a2a32;
-      --color-sheet: #232329;
-      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 24px -16px rgba(0, 0, 0, 0.55);
-      --shadow-lift: 0 1px 2px rgba(0, 0, 0, 0.45), 0 18px 34px -18px rgba(0, 0, 0, 0.65);
+      --color-paper: oklch(16% 0.008 280);
+      --color-paper-2: oklch(20% 0.009 280);
+      --color-paper-3: oklch(24% 0.010 280);
+      --color-ink: oklch(94% 0.006 86);
+      --color-ink-2: oklch(82% 0.007 86);
+      --color-muted: oklch(64% 0.008 86);
+      --color-rule: oklch(30% 0.009 280);
+      --color-rule-2: oklch(44% 0.010 280);
+      --color-accent: oklch(68% 0.140 152);
+      --color-accent-soft: oklch(25% 0.040 152);
+      --color-accent-ink: oklch(14% 0.010 280);
+      --color-focus: oklch(72% 0.145 152);
+      --color-error: oklch(70% 0.15 27);
+      --color-error-soft: oklch(25% 0.05 27);
     }
 
     *, *::before, *::after { box-sizing: border-box; }
     html, body { overflow-x: clip; }
-    html { scrollbar-color: var(--color-muted) var(--color-paper); }
+    html {
+      scrollbar-color: var(--color-muted) var(--color-paper);
+      scroll-padding-top: var(--space-3xl);
+    }
     body {
       margin: 0;
       background: var(--color-paper);
-      color: var(--color-ink);
-      font-family: var(--font-body);
+      color: var(--color-ink-2);
+      font-family: var(--font-ui);
       font-size: var(--text-md);
       line-height: 1.55;
       -webkit-font-smoothing: antialiased;
@@ -110,21 +126,24 @@
       margin: 0;
       font-family: var(--font-display);
       font-weight: var(--display-weight);
+      font-synthesis: none;
       letter-spacing: var(--tracking-display);
-      line-height: 1.15;
+      color: var(--color-ink);
+      line-height: 1.1;
       overflow-wrap: break-word;
       min-width: 0;
+      text-wrap: balance;
     }
-    h1 { font-size: var(--text-xl); }
-    h2 { font-size: var(--text-lg); }
-    h3 { font-size: var(--text-md); font-weight: 600; }
+    h1 { font-size: var(--text-2xl); max-width: 24ch; }
+    h2 { font-size: var(--text-lg); max-width: 30ch; }
+    h3 { font-size: var(--text-md); max-width: 40ch; line-height: 1.25; }
 
-    p { margin: 0; }
+    p { margin: 0; text-wrap: pretty; }
     button, input, select { font: inherit; color: inherit; }
     [hidden] { display: none !important; }
 
     .num {
-      font-family: var(--font-outlier);
+      font-family: var(--font-mono);
       font-variant-numeric: tabular-nums;
     }
 
@@ -135,396 +154,478 @@
       padding-inline: var(--gutter);
     }
 
-    /* Header & Tabs */
+    /* Masthead (Astryx horizontal editorial bar + 1px bottom hairline) */
     .topbar {
-      background: var(--color-paper-2);
+      background: var(--color-paper);
       border-bottom: var(--rule-hair) solid var(--color-rule);
       position: sticky;
       top: 0;
-      z-index: 200;
+      z-index: var(--z-sticky-nav);
     }
 
     .topbar-inner {
-      display: flex;
-      flex-wrap: wrap;
+      min-height: var(--space-2xl);
+      display: grid;
+      grid-template-columns: auto 1fr auto;
       align-items: center;
-      justify-content: space-between;
-      gap: var(--space-md);
-      padding-block: var(--space-md);
+      gap: var(--space-lg);
+      padding-block: var(--space-sm);
     }
 
     .brand {
       display: flex;
-      align-items: center;
+      align-items: baseline;
       gap: var(--space-sm);
+      min-width: 0;
     }
 
-    .brand-mark {
-      width: 36px;
-      height: 36px;
-      border-radius: var(--radius-pill);
-      background: var(--color-accent);
-      color: var(--color-accent-ink);
-      border: var(--rule-hair) solid color-mix(in oklab, var(--color-accent) 70%, var(--color-ink));
-      display: grid;
-      place-items: center;
+    .brand-title {
       font-family: var(--font-display);
-      font-weight: 700;
-      font-size: var(--text-lg);
-      box-shadow: inset 0 1px 0 rgba(255, 253, 249, 0.35);
-      flex-shrink: 0;
+      font-weight: var(--display-weight);
+      font-size: var(--text-xl);
+      color: var(--color-ink);
+      letter-spacing: var(--tracking-display);
+      white-space: nowrap;
     }
 
     .brand-sub {
       font-size: var(--text-xs);
       color: var(--color-muted);
-      margin-top: 2px;
-    }
-
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: var(--space-sm);
-      flex-wrap: wrap;
-    }
-
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 10px;
-      border-radius: var(--radius-pill);
-      font-size: var(--text-xs);
-      font-weight: 500;
-      background: var(--color-green-soft);
-      color: var(--color-green);
-      border: var(--rule-hair) solid color-mix(in oklab, var(--color-green) 28%, transparent);
-    }
-
-    .status-pill.is-off {
-      background: var(--color-paper-3);
-      color: var(--color-muted);
-      border-color: var(--color-rule);
-    }
-
-    .status-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: currentColor;
+      white-space: nowrap;
     }
 
     .tabs-bar {
       display: flex;
-      gap: var(--space-xs);
-      padding-bottom: var(--space-sm);
+      justify-content: center;
+      align-items: center;
+      gap: var(--space-lg);
       overflow-x: auto;
     }
 
     .tab-btn {
       min-height: 40px;
-      padding: 0 var(--space-md);
-      border-radius: var(--radius-pill);
-      border: var(--rule-hair) solid var(--color-rule);
-      background: var(--color-paper);
-      color: var(--color-ink-2);
+      padding: var(--space-xs) var(--space-2xs);
+      border: 0;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      background: transparent;
+      color: var(--color-muted);
       font-size: var(--text-sm);
       font-weight: 500;
       cursor: pointer;
       white-space: nowrap;
-      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+      transition: color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out);
     }
 
     .tab-btn:hover {
-      background: var(--color-paper-3);
-    }
-
-    .tab-btn:active {
-      transform: translateY(1px);
+      color: var(--color-ink);
     }
 
     .tab-btn[aria-selected="true"] {
-      background: var(--color-accent);
-      color: var(--color-accent-ink);
-      border-color: color-mix(in oklab, var(--color-accent) 75%, var(--color-ink));
-      box-shadow: inset 0 1px 0 rgba(255, 253, 249, 0.35), inset 0 -1px 0 rgba(31, 27, 24, 0.12);
+      color: var(--color-ink);
+      border-bottom-color: var(--color-ink);
+      font-weight: 600;
     }
 
-    /* Moulded buttons */
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xs);
+      flex-wrap: wrap;
+    }
+
+    .status-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: var(--space-2xs) var(--space-xs);
+      font-size: var(--text-xs);
+      font-weight: 500;
+      background: var(--color-accent-soft);
+      color: var(--color-accent);
+      border: var(--rule-hair) solid color-mix(in oklab, var(--color-accent) 28%, transparent);
+    }
+
+    .status-tag.is-off {
+      background: var(--color-paper-2);
+      color: var(--color-muted);
+      border-color: var(--color-rule);
+    }
+
+    /* Editorial Square Controls (zero rounded stadium ovals) */
     .btn {
       min-height: 44px;
-      border: var(--rule-hair) solid var(--color-rule);
+      border: var(--rule-hair) solid var(--color-ink);
       border-radius: var(--radius-pill);
-      padding: 0 var(--space-md);
+      padding: 0 var(--space-lg);
       font-size: var(--text-sm);
       font-weight: 500;
-      background: var(--color-paper-2);
+      background: transparent;
       color: var(--color-ink);
       cursor: pointer;
-      box-shadow: inset 0 1px 0 var(--color-sheet), 0 1px 1px var(--color-rule);
-      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+      transition: background-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out), opacity var(--dur-micro) var(--ease-out);
     }
 
-    .btn:hover {
-      background: var(--color-paper-3);
+    .btn:hover:not(:disabled) {
+      background: var(--color-paper-2);
     }
 
-    .btn:active {
+    .btn:active:not(:disabled) {
       transform: translateY(1px);
     }
 
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
     .btn--sm {
-      min-height: 34px;
+      min-height: 36px;
       padding: 0 var(--space-sm);
       font-size: var(--text-xs);
+      border-color: var(--color-rule-2);
     }
 
     .btn--primary {
-      background: var(--color-accent);
-      color: var(--color-accent-ink);
-      border-color: color-mix(in oklab, var(--color-accent) 78%, var(--color-ink));
-      box-shadow: inset 0 1px 0 rgba(255, 253, 249, 0.32), inset 0 -1px 0 rgba(31, 27, 24, 0.12);
+      background: var(--color-ink);
+      color: var(--color-paper);
+      border-color: var(--color-ink);
     }
 
-    .btn--primary:hover {
-      background: color-mix(in oklab, var(--color-accent) 92%, var(--color-ink));
+    .btn--primary:hover:not(:disabled) {
+      background: var(--color-ink-2);
+      color: var(--color-paper);
     }
 
     .btn--danger {
-      background: var(--color-paper-2);
+      border-color: var(--color-error);
       color: var(--color-error);
-      border-color: color-mix(in oklab, var(--color-error) 35%, var(--color-rule));
     }
 
-    .btn--danger:hover {
+    .btn--danger:hover:not(:disabled) {
       background: var(--color-error-soft);
     }
 
-    /* Main content */
+    /* Page layout */
     main {
-      padding-block: var(--space-lg) var(--space-xl);
+      padding-block: var(--space-xl) var(--space-2xl);
     }
 
     .panel {
       display: grid;
-      gap: var(--space-lg);
+      gap: var(--space-xl);
     }
 
-    .grid-4 {
+    .page-intro {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-md);
+      padding-bottom: var(--space-md);
+      border-bottom: var(--rule-heavy) solid var(--color-ink);
+    }
+
+    .page-intro-sub {
+      font-size: var(--text-sm);
+      color: var(--color-muted);
+    }
+
+    /* Editorial 4-column hairline ledger (no boxes, no shadows) */
+    .metrics-strip {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: var(--space-md);
+      border-bottom: var(--rule-hair) solid var(--color-rule);
+      padding-block: var(--space-md) var(--space-lg);
     }
 
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: var(--space-lg);
+    .metric-cell {
+      padding-inline: var(--space-lg);
+      border-left: var(--rule-hair) solid var(--color-rule);
+      min-width: 0;
     }
 
-    .grid-3 {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: var(--space-md);
+    .metric-cell:first-child {
+      padding-left: 0;
+      border-left: 0;
     }
 
-    .card {
-      background: var(--color-paper-2);
-      border: var(--rule-hair) solid var(--color-rule);
-      border-radius: var(--radius-card);
-      padding: var(--space-md);
-      box-shadow: var(--shadow-card);
+    .metric-cell:last-child {
+      padding-right: 0;
     }
 
-    .card--notebook {
-      border-radius: var(--radius-entry);
-      border-color: var(--color-ink);
-      box-shadow: var(--shadow-lift);
-      background:
-        linear-gradient(var(--color-grid) 1px, transparent 1px) 0 0 / 8px 8px,
-        linear-gradient(90deg, var(--color-grid) 1px, transparent 1px) 0 0 / 8px 8px,
-        var(--color-paper-2);
+    .metric-value {
+      font-family: var(--font-display);
+      font-size: var(--text-3xl);
+      font-weight: var(--display-weight);
+      font-variant-numeric: tabular-nums;
+      color: var(--color-ink);
+      line-height: 1.05;
+      margin-bottom: var(--space-2xs);
     }
 
-    .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--space-sm);
-      padding-bottom: var(--space-sm);
-      margin-bottom: var(--space-sm);
-      border-bottom: var(--rule-hair) solid var(--color-ink);
-    }
-
-    .card-sub {
-      font-size: var(--text-xs);
-      color: var(--color-muted);
-    }
-
-    .stat-card {
-      background: var(--color-paper-2);
-      border: var(--rule-hair) solid var(--color-rule);
-      border-top: 2px solid var(--color-ink);
-      border-radius: var(--radius-card);
-      padding: var(--space-md);
-    }
-
-    .stat-label {
-      font-size: var(--text-xs);
+    .metric-unit {
+      font-size: var(--text-sm);
       font-weight: 500;
       color: var(--color-muted);
-      margin-bottom: var(--space-xs);
+      margin-left: var(--space-2xs);
     }
 
-    .stat-value {
-      font-size: var(--text-2xl);
-      font-weight: 600;
-      line-height: 1.1;
-      color: var(--color-ink);
-    }
-
-    .stat-unit {
+    .metric-label {
       font-size: var(--text-xs);
       color: var(--color-muted);
-      margin-left: 4px;
-      font-family: var(--font-body);
     }
 
-    /* Fields (Furrow label-inside-box style) */
+    /* Asymmetric Editorial Workspace: 1.4fr primary left / 1fr quiet spec right */
+    .workspace-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+      gap: var(--space-xl);
+      align-items: start;
+    }
+
+    .col-stack {
+      display: grid;
+      gap: var(--space-xl);
+      min-width: 0;
+    }
+
+    .well {
+      background: var(--color-paper-2);
+      border-top: var(--rule-hair) solid var(--color-rule-2);
+      padding: var(--space-lg);
+    }
+
+    .section-band {
+      border-top: var(--rule-heavy) solid var(--color-ink);
+      padding-top: var(--space-md);
+    }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-md);
+      margin-bottom: var(--space-md);
+      flex-wrap: wrap;
+    }
+
+    .section-meta {
+      font-size: var(--text-xs);
+      color: var(--color-muted);
+      overflow-wrap: anywhere;
+      min-width: 0;
+    }
+
+    /* Form Controls — flat 44px sharp rectangles */
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: var(--space-sm);
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.35fr) minmax(0, 0.7fr);
+      gap: var(--space-md);
       align-items: end;
     }
 
     .field {
-      position: relative;
-      background: var(--color-sheet);
-      border: var(--rule-hair) solid var(--color-muted);
-      border-radius: var(--radius-pill);
-      min-height: 54px;
-      padding: 20px var(--space-sm) 6px;
+      display: grid;
+      gap: var(--space-2xs);
+      min-width: 0;
     }
 
     .field label {
-      position: absolute;
-      left: var(--space-sm);
-      top: 6px;
       font-size: var(--text-xs);
-      font-weight: 500;
-      color: var(--color-muted);
-      pointer-events: none;
+      font-weight: 600;
+      color: var(--color-ink-2);
     }
 
-    .field select,
-    .field input {
+    .field input,
+    .field select {
       width: 100%;
-      border: 0;
-      background: transparent;
-      font-size: var(--text-sm);
+      min-height: 44px;
+      padding: 0 var(--space-sm);
+      background: var(--color-paper);
       color: var(--color-ink);
-      outline: none;
-      padding: 0;
+      border: var(--rule-hair) solid var(--color-rule-2);
+      border-radius: 0;
+      font-size: var(--text-sm);
+      transition: border-color var(--dur-micro) var(--ease-out);
+    }
+
+    .field input:focus-visible,
+    .field select:focus-visible {
+      outline: 2px solid var(--color-focus);
+      outline-offset: -2px;
+    }
+
+    .field input:disabled,
+    .field select:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
 
     .form-actions {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: var(--space-sm);
+      gap: var(--space-md);
       margin-top: var(--space-md);
+      padding-top: var(--space-md);
+      border-top: var(--rule-hair) solid var(--color-rule);
       flex-wrap: wrap;
     }
 
-    /* Ruled lists */
-    .ruled {
-      border-top: var(--rule-hair) solid var(--color-ink);
+    .inline-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) auto;
+      gap: var(--space-sm);
+      align-items: end;
+      margin-bottom: var(--space-lg);
     }
 
-    .ruled-row {
+    /* Ruled ledgers & definition lists */
+    .spec-list {
+      margin: 0;
+      display: grid;
+    }
+
+    .spec-row {
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: baseline;
       gap: var(--space-md);
-      padding: var(--space-sm) 0;
+      padding-block: var(--space-sm);
+      border-top: var(--rule-hair) solid var(--color-rule);
+      font-size: var(--text-sm);
+    }
+
+    .spec-row:last-child {
       border-bottom: var(--rule-hair) solid var(--color-rule);
     }
 
-    .ruled-row:last-child {
-      border-bottom-color: var(--color-ink);
-    }
-
-    .kv-label {
-      font-size: var(--text-sm);
+    .spec-row dt {
       color: var(--color-muted);
+      font-weight: 500;
       flex-shrink: 0;
     }
 
-    .kv-value {
-      font-size: var(--text-sm);
+    .spec-row dd {
+      margin: 0;
       color: var(--color-ink);
       text-align: right;
       word-break: break-word;
     }
 
-    .chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
+    .ruled-list {
+      display: grid;
     }
 
-    .chip {
+    .ruled-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: var(--space-md);
+      padding-block: var(--space-md);
+      border-top: var(--rule-hair) solid var(--color-rule);
+    }
+
+    .ruled-row:last-child {
+      border-bottom: var(--rule-hair) solid var(--color-rule);
+    }
+
+    .tag {
       display: inline-flex;
       align-items: center;
-      padding: 2px 8px;
-      border-radius: var(--radius-pill);
+      padding: var(--space-3xs) var(--space-xs);
       font-size: var(--text-xs);
       font-weight: 500;
-      background: var(--color-paper-3);
+      background: var(--color-paper-2);
       color: var(--color-ink-2);
       border: var(--rule-hair) solid var(--color-rule);
     }
 
-    .chip--speaker {
+    .tag--ok {
       background: var(--color-accent-soft);
-      color: var(--color-accent-ink);
-      border-color: color-mix(in oklab, var(--color-accent) 45%, var(--color-rule));
+      color: var(--color-accent);
+      border-color: color-mix(in oklab, var(--color-accent) 28%, transparent);
     }
 
-    .chip--ok {
-      background: var(--color-green-soft);
-      color: var(--color-green);
-      border-color: color-mix(in oklab, var(--color-green) 35%, transparent);
+    .tag--ink {
+      background: var(--color-ink);
+      color: var(--color-paper);
+      border-color: var(--color-ink);
     }
 
-    /* History timeline */
-    .toolbar {
+    .tags-row {
       display: flex;
       flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--space-sm);
-    }
-
-    .toolbar-group {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
       gap: var(--space-xs);
+      align-items: center;
+    }
+
+    /* Capabilities editorial 3-column ruled index */
+    .caps-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-lg) var(--gap-columns);
+    }
+
+    .cap-entry {
+      border-top: var(--rule-hair) solid var(--color-rule-2);
+      padding-top: var(--space-sm);
+      display: grid;
+      gap: var(--space-xs);
+      align-content: start;
+      min-width: 0;
+    }
+
+    .cap-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: var(--space-xs);
+    }
+
+    .cap-desc {
+      font-size: var(--text-sm);
+      color: var(--color-ink-2);
+    }
+
+    .cap-detail {
+      font-size: var(--text-xs);
+      color: var(--color-muted);
+      word-break: break-all;
+    }
+
+    /* History ledger */
+    .filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      align-items: center;
+    }
+
+    .filter-bar input {
+      min-height: 36px;
+      padding: 0 var(--space-sm);
+      border: var(--rule-hair) solid var(--color-rule-2);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      font-size: var(--text-sm);
+      min-width: 220px;
     }
 
     .history-item {
-      padding: var(--space-md) 0;
-      border-bottom: var(--rule-hair) solid var(--color-rule);
+      padding-block: var(--space-md);
+      border-top: var(--rule-hair) solid var(--color-rule);
       display: grid;
       gap: var(--space-xs);
+    }
+
+    .history-item:last-child {
+      border-bottom: var(--rule-hair) solid var(--color-rule);
     }
 
     .history-meta {
       display: flex;
       flex-wrap: wrap;
-      align-items: center;
       justify-content: space-between;
       gap: var(--space-xs);
       font-size: var(--text-xs);
@@ -532,72 +633,62 @@
     }
 
     .history-q {
-      font-weight: 500;
+      font-weight: 600;
       color: var(--color-ink);
+      overflow-wrap: anywhere;
     }
 
     .history-a {
       color: var(--color-ink-2);
-      background: var(--color-paper);
-      border-left: 3px solid var(--color-accent);
-      padding: var(--space-xs) var(--space-sm);
-      border-radius: 0 var(--radius-pill) var(--radius-pill) 0;
+      overflow-wrap: anywhere;
     }
 
-    /* Capability cards */
-    .cap-card {
-      background: var(--color-paper-2);
-      border: var(--rule-hair) solid var(--color-rule);
-      border-radius: var(--radius-card);
-      padding: var(--space-md);
-      display: grid;
-      gap: var(--space-xs);
-      align-content: start;
-    }
-
-    .cap-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--space-xs);
-    }
-
-    .cap-desc {
-      font-size: var(--text-sm);
-      color: var(--color-muted);
-    }
-
-    .cap-detail {
-      font-size: var(--text-xs);
-      color: var(--color-ink-2);
-      word-break: break-all;
-    }
-
-    /* Empty state & Feedback banner */
     .empty-state {
-      padding: var(--space-lg) var(--space-md);
-      text-align: center;
+      padding: var(--space-lg) 0;
+      border-top: var(--rule-hair) solid var(--color-rule);
       color: var(--color-muted);
       font-size: var(--text-sm);
-      border-top: var(--rule-hair) solid var(--color-ink);
-      border-bottom: var(--rule-hair) solid var(--color-rule);
     }
 
+    /* Login Gate */
+    .login-gate {
+      min-height: 68vh;
+      display: grid;
+      place-items: center;
+      padding: var(--space-xl) var(--space-md);
+    }
+
+    .login-box {
+      width: 100%;
+      max-width: 440px;
+      background: var(--color-paper-2);
+      border-top: var(--rule-heavy) solid var(--color-ink);
+      padding: var(--space-lg);
+      display: grid;
+      gap: var(--space-md);
+    }
+
+    .login-error {
+      font-size: var(--text-sm);
+      color: var(--color-error);
+      background: var(--color-error-soft);
+      border: var(--rule-hair) solid color-mix(in oklab, var(--color-error) 35%, transparent);
+      padding: var(--space-xs) var(--space-sm);
+    }
+
+    /* Toast */
     .toast {
       position: fixed;
       right: var(--space-lg);
       bottom: var(--space-lg);
-      z-index: 500;
-      max-width: 420px;
-      padding: var(--space-sm) var(--space-md);
-      border-radius: var(--radius-pill);
+      z-index: var(--z-toast);
       background: var(--color-ink);
-      color: var(--color-paper-2);
+      color: var(--color-paper);
+      padding: var(--space-sm) var(--space-md);
       font-size: var(--text-sm);
-      box-shadow: var(--shadow-lift);
       opacity: 0;
-      transform: translateY(8px);
       pointer-events: none;
+      transform: translateY(8px);
       transition: opacity var(--dur-short) var(--ease-out), transform var(--dur-short) var(--ease-out);
     }
 
@@ -608,50 +699,55 @@
 
     .toast.is-error {
       background: var(--color-error);
+      color: var(--color-paper);
     }
 
-    .inline-form {
-      display: grid;
-      grid-template-columns: 1fr 1.6fr auto;
-      gap: var(--space-xs);
-      align-items: stretch;
-      margin-bottom: var(--space-md);
+    @media (max-width: 64rem) {
+      :root { --gutter: 24px; }
+      .topbar-inner {
+        grid-template-columns: 1fr auto;
+      }
+      .brand { order: 1; }
+      .top-actions { order: 2; }
+      .tabs-bar {
+        order: 3;
+        grid-column: 1 / -1;
+        justify-content: flex-start;
+        border-top: var(--rule-hair) solid var(--color-rule);
+        padding-top: var(--space-xs);
+      }
+      .metrics-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-md) 0;
+      }
+      .metric-cell:nth-child(odd) {
+        padding-left: 0;
+        border-left: 0;
+      }
+      .workspace-split,
+      .caps-grid,
+      .form-grid,
+      .inline-form {
+        grid-template-columns: 1fr;
+      }
     }
 
-    .login-gate {
-      min-height: 70vh;
-      display: grid;
-      place-items: center;
-      padding: var(--space-xl) var(--space-md);
-    }
-
-    .login-card {
-      width: 100%;
-      max-width: 420px;
-      display: grid;
-      gap: var(--space-md);
-    }
-
-    .login-error {
-      font-size: var(--text-sm);
-      color: var(--color-error);
-      background: var(--color-error-soft);
-      border: var(--rule-hair) solid color-mix(in oklab, var(--color-error) 35%, var(--color-rule));
-      border-radius: var(--radius-card);
-      padding: var(--space-xs) var(--space-sm);
-    }
-
-    @media (max-width: 60rem) {
+    @media (max-width: 40rem) {
       :root { --gutter: 16px; }
-      .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .grid-2 { grid-template-columns: 1fr; }
-      .form-grid { grid-template-columns: 1fr; }
-      .inline-form { grid-template-columns: 1fr; }
-    }
-
-    @media (max-width: 36rem) {
-      .grid-4, .grid-3 { grid-template-columns: 1fr; }
+      .brand-sub { display: none; }
+      .metrics-strip {
+        grid-template-columns: 1fr;
+      }
+      .metric-cell {
+        padding-inline: 0;
+        border-left: 0;
+        border-top: var(--rule-hair) solid var(--color-rule);
+        padding-top: var(--space-sm);
+      }
+      .metric-cell:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -669,196 +765,194 @@
     <div class="container">
       <div class="topbar-inner">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">N</div>
-          <div>
-            <h1 id="assistantTitle">Nomi 控制台</h1>
-            <div class="brand-sub">Xiao Speaker Assistant · 本地控制面板</div>
-          </div>
+          <span class="brand-title" id="assistantTitle">Nomi 控制台</span>
+          <span class="brand-sub">Xiao Speaker Assistant</span>
         </div>
+
+        <nav class="tabs-bar" id="tabsBar" role="tablist" aria-label="控制台栏目" hidden>
+          <button type="button" class="tab-btn" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" data-tab="overview">概览与配置</button>
+          <button type="button" class="tab-btn" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" data-tab="history">对话历史</button>
+          <button type="button" class="tab-btn" role="tab" id="tab-capabilities" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">能力索引</button>
+          <button type="button" class="tab-btn" role="tab" id="tab-memory" aria-controls="panel-memory" aria-selected="false" data-tab="memory">记忆与成员</button>
+        </nav>
+
         <div class="top-actions">
-          <span class="status-pill" id="serverStatus">
-            <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-tag" id="serverStatus" role="status">
             <span id="serverStatusText">已连接</span>
           </span>
-          <button type="button" class="btn btn--sm" id="themeToggleBtn" aria-label="切换浅色/深色主题">深色</button>
-          <button type="button" class="btn btn--sm" id="refreshBtn">刷新数据</button>
-          <button type="button" class="btn btn--sm btn--danger" id="logoutBtn" hidden>退出登录</button>
+          <button type="button" class="btn btn--sm" id="themeToggleBtn" aria-label="切换浅色或深色主题">深色</button>
+          <button type="button" class="btn btn--sm" id="refreshBtn">刷新</button>
+          <button type="button" class="btn btn--sm btn--danger" id="logoutBtn" hidden>退出</button>
         </div>
       </div>
-      <nav class="tabs-bar" id="tabsBar" role="tablist" aria-label="控制台栏目" hidden>
-        <button type="button" class="tab-btn" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" data-tab="overview">概览与统计</button>
-        <button type="button" class="tab-btn" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" data-tab="history">对话历史</button>
-        <button type="button" class="tab-btn" role="tab" id="tab-capabilities" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">能力矩阵</button>
-        <button type="button" class="tab-btn" role="tab" id="tab-memory" aria-controls="panel-memory" aria-selected="false" data-tab="memory">记忆与成员管理</button>
-      </nav>
     </div>
   </header>
 
   <section id="loginGate" class="login-gate" hidden>
-    <article class="card card--notebook login-card">
+    <article class="login-box">
       <div>
-        <h2>远端访问验证</h2>
-        <div class="card-sub">检测到经由远端通道或非本机直连访问，请输入控制台口令（Mac 本机保存在 console.token 或 XSA_CONSOLE_PASSWORD）。</div>
+        <h1>远端访问验证</h1>
+        <p class="section-meta" style="margin-top: var(--space-xs);">检测到经由域名或代理访问控制台，请输入访问口令（Mac 本机保存在 console.token 或 XSA_CONSOLE_PASSWORD）。</p>
       </div>
       <div id="loginError" class="login-error" hidden></div>
       <form id="loginForm" class="panel" style="gap: var(--space-sm);">
         <div class="field">
           <label for="loginPassword">访问口令</label>
-          <input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入控制口令" required>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="输入访问口令" required>
         </div>
-        <button type="submit" class="btn btn--primary" id="loginSubmitBtn">验证并进入控制台</button>
+        <button type="submit" class="btn btn--primary" id="loginSubmitBtn">验证并进入</button>
       </form>
     </article>
   </section>
 
   <main class="container" id="mainApp" hidden>
-    <!-- 1. Overview & Stats -->
+    <!-- 1. Overview & Live Config -->
     <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
-      <div class="grid-4">
-        <article class="stat-card">
-          <div class="stat-label">总对话轮次 Total Turns</div>
-          <div class="stat-value"><span class="num" id="statTotalTurns">0</span><span class="stat-unit">轮</span></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-label">今日对话 Today</div>
-          <div class="stat-value"><span class="num" id="statTurnsToday">0</span><span class="stat-unit">轮</span></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-label">平均延迟 Avg Latency</div>
-          <div class="stat-value"><span class="num" id="statAvgLatency">0</span><span class="stat-unit">ms</span></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-label">P95 延迟 P95 Latency</div>
-          <div class="stat-value"><span class="num" id="statP95Latency">0</span><span class="stat-unit">ms</span></div>
-        </article>
+      <div class="page-intro">
+        <div>
+          <h1>语音网关与声学控制台</h1>
+          <p class="page-intro-sub">实时对话指标、模型与音色热更新、声学与唤醒运行参数</p>
+        </div>
+        <span class="tag" id="ttsProviderBadge">edge · OH2P</span>
       </div>
 
-      <article class="card card--notebook">
-        <div class="card-header">
-          <div>
-            <h2>模型与音色切换</h2>
-            <div class="card-sub">保存后原子写入 config.yaml 并立即热更新运行实例</div>
-          </div>
+      <div class="metrics-strip">
+        <div class="metric-cell">
+          <div class="metric-value"><span class="num" id="statTotalTurns">0</span><span class="metric-unit">轮</span></div>
+          <div class="metric-label">总对话轮次</div>
         </div>
-        <form id="settingsForm">
-          <div class="form-grid">
-            <div class="field">
-              <label for="modelSelect">推理模型 (OpenCode Model)</label>
-              <select id="modelSelect" name="model"></select>
-            </div>
-            <div class="field">
-              <label for="voiceSelect">TTS 音色 (Edge Voice)</label>
-              <select id="voiceSelect" name="edge_voice"></select>
-            </div>
-            <div class="field">
-              <label for="rateInput">语速 (Edge Rate, 如 +8%)</label>
-              <input id="rateInput" name="edge_rate" type="text" placeholder="+8%">
-            </div>
-          </div>
-          <div class="form-actions">
-            <div class="card-sub">当前配置：<span class="num" id="configPathLabel">config.yaml</span></div>
-            <button type="submit" class="btn btn--primary" id="saveSettingsBtn">保存并热更新</button>
-          </div>
-        </form>
-      </article>
+        <div class="metric-cell">
+          <div class="metric-value"><span class="num" id="statTurnsToday">0</span><span class="metric-unit">轮</span></div>
+          <div class="metric-label">今日对话</div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-value"><span class="num" id="statAvgLatency">0</span><span class="metric-unit">ms</span></div>
+          <div class="metric-label">平均响应延迟</div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-value"><span class="num" id="statP95Latency">0</span><span class="metric-unit">ms</span></div>
+          <div class="metric-label">P95 响应延迟</div>
+        </div>
+      </div>
 
-      <div class="grid-2">
-        <article class="card">
-          <div class="card-header">
-            <h2>运行链路与声学状态</h2>
-            <span class="chip" id="ttsProviderBadge">edge</span>
-          </div>
-          <div class="ruled" id="runtimeKvList"></div>
-        </article>
+      <div class="workspace-split">
+        <div class="col-stack">
+          <section class="well" aria-labelledby="heading-settings">
+            <div class="section-head">
+              <h2 id="heading-settings">模型与播报热更新</h2>
+              <span class="section-meta num" id="configPathLabel">config.yaml</span>
+            </div>
+            <form id="settingsForm">
+              <div class="form-grid">
+                <div class="field">
+                  <label for="modelSelect">推理模型</label>
+                  <select id="modelSelect" name="model"></select>
+                </div>
+                <div class="field">
+                  <label for="voiceSelect">TTS 音色</label>
+                  <select id="voiceSelect" name="edge_voice"></select>
+                </div>
+                <div class="field">
+                  <label for="rateInput">语速</label>
+                  <input id="rateInput" name="edge_rate" type="text" placeholder="+8%" autocomplete="off">
+                </div>
+              </div>
+              <div class="form-actions">
+                <span class="section-meta">保存后原子写入配置文件，也可以直接语音说“切到 GPT 6.2”或“换晓伊声音”</span>
+                <button type="submit" class="btn btn--primary" id="saveSettingsBtn">保存并热更新</button>
+              </div>
+            </form>
+          </section>
 
-        <article class="card">
-          <div class="card-header">
-            <h2>成员与模型统计</h2>
-            <span class="card-sub">来自真实历史记录</span>
+          <section class="section-band" aria-labelledby="heading-breakdown">
+            <div class="section-head">
+              <h2 id="heading-breakdown">成员与模型分布</h2>
+              <span class="section-meta">来自真实对话记录</span>
+            </div>
+            <div id="statsBreakdown"></div>
+          </section>
+        </div>
+
+        <section class="section-band" aria-labelledby="heading-runtime">
+          <div class="section-head">
+            <h2 id="heading-runtime">运行链路与声学参数</h2>
           </div>
-          <div id="breakdownContainer"></div>
-        </article>
+          <dl class="spec-list" id="runtimeSpecList"></dl>
+        </section>
       </div>
     </section>
 
     <!-- 2. Chat History -->
     <section id="panel-history" class="panel" role="tabpanel" aria-labelledby="tab-history" hidden>
-      <article class="card">
-        <div class="card-header">
-          <div>
-            <h2>对话历史</h2>
-            <div class="card-sub">共 <span class="num" id="historyCountLabel">0</span> 条记录</div>
-          </div>
-          <div class="toolbar-group">
-            <div class="field" style="min-height: 40px; padding: 14px 10px 4px; min-width: 180px;">
-              <label for="speakerFilter">按成员筛选</label>
-              <input id="speakerFilter" type="text" placeholder="全部 / 大雄 / 拳拳">
-            </div>
-            <button type="button" class="btn btn--sm" id="applyFilterBtn">筛选</button>
-            <button type="button" class="btn btn--sm btn--danger" id="clearHistoryBtn">清空历史</button>
-          </div>
+      <div class="page-intro">
+        <div>
+          <h1>对话历史</h1>
+          <p class="page-intro-sub">本地记录最近 <span class="num" id="historyCountLabel">0</span> 轮语音与桥接交互</p>
         </div>
-        <div id="historyList"></div>
-      </article>
+        <div class="filter-bar">
+          <input id="speakerFilter" type="search" placeholder="按说话人筛选（如：大雄、拳拳）" aria-label="按说话人筛选">
+          <button type="button" class="btn btn--sm" id="applyFilterBtn">筛选</button>
+          <button type="button" class="btn btn--sm btn--danger" id="clearHistoryBtn">清空历史</button>
+        </div>
+      </div>
+      <div id="historyList"></div>
     </section>
 
     <!-- 3. Capabilities -->
     <section id="panel-capabilities" class="panel" role="tabpanel" aria-labelledby="tab-capabilities" hidden>
-      <article class="card">
-        <div class="card-header">
-          <div>
-            <h2>能力矩阵</h2>
-            <div class="card-sub">本地内置工具、外部 MCP 服务与自动化能力实时状态</div>
-          </div>
+      <div class="page-intro">
+        <div>
+          <h1>工具与能力索引</h1>
+          <p class="page-intro-sub">实时检测当前启用的 MCP 工具、本机插件与服务连接状态</p>
         </div>
-        <div class="grid-3" id="capabilitiesGrid"></div>
-      </article>
+      </div>
+      <div class="caps-grid" id="capabilitiesGrid"></div>
     </section>
 
     <!-- 4. Memories, Voiceprints & Reminders -->
     <section id="panel-memory" class="panel" role="tabpanel" aria-labelledby="tab-memory" hidden>
-      <article class="card">
-        <div class="card-header">
-          <div>
-            <h2>长期记忆管理</h2>
-            <div class="card-sub">已保存 <span class="num" id="memoryCountLabel">0</span> 条偏好与事实（严禁保存密码或密钥）</div>
-          </div>
-          <span class="chip" id="memoryStatusChip">已启用</span>
+      <div class="page-intro">
+        <div>
+          <h1>长期记忆、声纹与提醒</h1>
+          <p class="page-intro-sub">共保存 <span class="num" id="memoryCountLabel">0</span> 条长期记忆、<span class="num" id="voiceprintCountLabel">0</span> 位声纹成员与 <span class="num" id="reminderCountLabel">0</span> 条提醒</p>
+        </div>
+        <span class="tag" id="memoryStatusChip">已启用</span>
+      </div>
+
+      <section class="well" aria-labelledby="heading-memories">
+        <div class="section-head">
+          <h2 id="heading-memories">长期记忆管理</h2>
+          <span class="section-meta">0600 隔离保存，拒绝存储密钥或密码</span>
         </div>
         <form id="memoryForm" class="inline-form">
           <div class="field">
-            <label for="memoryKey">主题 Key（如：常住城市）</label>
+            <label for="memoryKey">主题 Key</label>
             <input id="memoryKey" type="text" maxlength="80" placeholder="例如：常住城市">
           </div>
           <div class="field">
-            <label for="memoryValue">记忆内容（或直接输入完整事实）</label>
-            <input id="memoryValue" type="text" maxlength="300" placeholder="例如：北京市朝阳区">
+            <label for="memoryValue">记忆内容</label>
+            <input id="memoryValue" type="text" maxlength="300" placeholder="例如：北京市海淀区">
           </div>
           <button type="submit" class="btn btn--primary">添加记忆</button>
         </form>
         <div id="memoryList"></div>
-      </article>
+      </section>
 
-      <div class="grid-2">
-        <article class="card">
-          <div class="card-header">
-            <div>
-              <h2>声纹成员</h2>
-              <div class="card-sub">已注册 <span class="num" id="voiceprintCountLabel">0</span> 位家庭成员</div>
-            </div>
+      <div class="workspace-split">
+        <section class="section-band" aria-labelledby="heading-voiceprints">
+          <div class="section-head">
+            <h2 id="heading-voiceprints">家庭声纹成员</h2>
+            <span class="section-meta">对音箱说“记住刚才说话的是…”即可录入</span>
           </div>
           <div id="voiceprintList"></div>
-        </article>
+        </section>
 
-        <article class="card">
-          <div class="card-header">
-            <div>
-              <h2>定时提醒</h2>
-              <div class="card-sub">共 <span class="num" id="reminderCountLabel">0</span> 条提醒</div>
-            </div>
+        <section class="section-band" aria-labelledby="heading-reminders">
+          <div class="section-head">
+            <h2 id="heading-reminders">主动提醒与早报</h2>
           </div>
           <div id="reminderList"></div>
-        </article>
+        </section>
       </div>
     </section>
   </main>
@@ -1001,7 +1095,7 @@
         const voiceSel = $("voiceSelect");
         const voices = data.available_voices || [];
         voiceSel.innerHTML = voices
-          .map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)} · ${escapeHtml(v.style)} (${escapeHtml(v.id)})</option>`)
+          .map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)} · ${escapeHtml(v.style)}</option>`)
           .join("");
         if (data.voice) {
           voiceSel.value = data.voice;
@@ -1011,29 +1105,44 @@
         const wakeLocal = (data.wakewords?.local || []).join(" / ") || "—";
         const wakeEn = data.wakewords?.en_kws_enabled ? ((data.wakewords?.english || []).join(" / ") || "已启用") : "已关闭";
         const rows = [
-          ["当前模型", `<span class="num">${escapeHtml(data.model)}</span> (${escapeHtml(data.default_provider)})`],
-          ["TTS 音色 / 语速", `${escapeHtml(data.voice_name || data.voice)} <span class="num">${escapeHtml(data.voice)} (${escapeHtml(data.rate)})</span>`],
-          ["ASR 引擎", `${escapeHtml(data.asr_provider)} / <span class="num">${escapeHtml(data.asr_model)}</span> (${escapeHtml(data.asr_language)})`],
-          ["硬件 AEC", data.aec_enabled ? `<span class="chip chip--ok">已开启 (${escapeHtml(data.capture_channels)}ch)</span>` : `<span class="chip">未开启 (${escapeHtml(data.capture_channels)}ch)</span>`],
+          ["当前模型", `<span class="num">${escapeHtml(data.model)}</span>`],
+          ["对话后端", escapeHtml(data.default_provider)],
+          ["TTS 音色", `${escapeHtml(data.voice_name || data.voice)} <span class="num">(${escapeHtml(data.rate)})</span>`],
+          ["ASR 引擎", `${escapeHtml(data.asr_provider)} / ${escapeHtml(data.asr_model)} (${escapeHtml(data.asr_language)})`],
+          ["硬件 AEC", data.aec_enabled ? `<span class="tag tag--ok">已开启 ${escapeHtml(data.capture_channels)}ch</span>` : `<span class="tag">未开启 ${escapeHtml(data.capture_channels)}ch</span>`],
           ["中文唤醒词", escapeHtml(wakeLocal)],
           ["英文唤醒词", escapeHtml(wakeEn)],
         ];
-        $("runtimeKvList").innerHTML = rows
-          .map(([k, v]) => `<div class="ruled-row"><span class="kv-label">${k}</span><span class="kv-value">${v}</span></div>`)
+        $("runtimeSpecList").innerHTML = rows
+          .map(([k, v]) => `<div class="spec-row"><dt>${escapeHtml(k)}</dt><dd>${v}</dd></div>`)
           .join("");
 
         const spkEntries = Object.entries(stats.speaker_breakdown || {});
-        const mdlEntries = Object.entries(stats.model_breakdown || {});
-        if (!spkEntries.length && !mdlEntries.length) {
-          $("breakdownContainer").innerHTML = `<div class="empty-state">暂无对话统计，唤醒 Nomi 对话后将自动记录。</div>`;
+        const modEntries = Object.entries(stats.model_breakdown || {});
+        if (!spkEntries.length && !modEntries.length) {
+          $("statsBreakdown").innerHTML = `<div class="empty-state">暂无对话统计，唤醒 Nomi 对话后将自动记录。</div>`;
         } else {
-          const spkRows = spkEntries
-            .map(([k, v]) => `<div class="ruled-row"><span class="kv-label">成员 · ${escapeHtml(k)}</span><span class="kv-value num">${v} 轮</span></div>`)
-            .join("");
-          const mdlRows = mdlEntries
-            .map(([k, v]) => `<div class="ruled-row"><span class="kv-label">模型 · <span class="num">${escapeHtml(k)}</span></span><span class="kv-value num">${v} 轮</span></div>`)
-            .join("");
-          $("breakdownContainer").innerHTML = `<div class="ruled">${spkRows}${mdlRows}</div>`;
+          const allRows = [
+            ...spkEntries.map(([name, cnt]) => [name, `${cnt} 轮`, "说话人"]),
+            ...modEntries.map(([mod, cnt]) => [mod, `${cnt} 轮`, "模型"]),
+          ];
+          $("statsBreakdown").innerHTML = `
+            <div class="ruled-list">
+              ${allRows
+                .map(
+                  ([label, val, kind]) => `
+                    <div class="ruled-row">
+                      <div class="tags-row">
+                        <span class="tag">${escapeHtml(kind)}</span>
+                        <span>${escapeHtml(label)}</span>
+                      </div>
+                      <span class="num">${escapeHtml(val)}</span>
+                    </div>
+                  `
+                )
+                .join("")}
+            </div>
+          `;
         }
 
         renderCapabilities(data.capabilities || []);
@@ -1041,25 +1150,22 @@
 
       function renderCapabilities(caps) {
         if (!caps.length) {
-          $("capabilitiesGrid").innerHTML = `<div class="empty-state">暂无能力配置信息</div>`;
+          $("capabilitiesGrid").innerHTML = `<div class="empty-state">未获取到能力配置。</div>`;
           return;
         }
         $("capabilitiesGrid").innerHTML = caps
-          .map((c) => {
-            const badge = c.enabled
-              ? `<span class="chip chip--ok">${escapeHtml(c.status_label || "已启用")}</span>`
-              : `<span class="chip">${escapeHtml(c.status_label || "未启用")}</span>`;
-            return `
-              <article class="cap-card">
+          .map(
+            (c) => `
+              <article class="cap-entry">
                 <div class="cap-head">
                   <h3>${escapeHtml(c.name)}</h3>
-                  ${badge}
+                  <span class="tag ${c.enabled ? "tag--ok" : ""}">${escapeHtml(c.status_label || (c.enabled ? "已启用" : "未启用"))}</span>
                 </div>
-                <p class="cap-desc">${escapeHtml(c.description)}</p>
+                <p class="cap-desc">${escapeHtml(c.description || "")}</p>
                 <div class="cap-detail num">${escapeHtml(c.detail || "")}</div>
               </article>
-            `;
-          })
+            `
+          )
           .join("");
       }
 
@@ -1072,20 +1178,20 @@
           return;
         }
         $("historyList").innerHTML = `
-          <div class="ruled">
+          <div class="ruled-list">
             ${turns
               .map((t) => {
                 const roleLabel = t.speaker_role ? ` (${t.speaker_role})` : "";
                 return `
                   <div class="history-item">
                     <div class="history-meta">
-                      <div class="chips">
-                        <span class="chip chip--speaker">${escapeHtml((t.speaker_name || "未知") + roleLabel)}</span>
-                        <span class="chip">${escapeHtml(t.source || "voice")}</span>
-                        ${t.voice ? `<span class="chip">${escapeHtml(t.voice)}</span>` : ""}
-                        ${t.model ? `<span class="chip">${escapeHtml(t.model)}</span>` : ""}
+                      <div class="tags-row">
+                        <span class="tag tag--ink">${escapeHtml((t.speaker_name || "未知") + roleLabel)}</span>
+                        <span class="tag">${escapeHtml(t.source || "voice")}</span>
+                        ${t.voice ? `<span class="tag">${escapeHtml(t.voice)}</span>` : ""}
+                        ${t.model ? `<span class="tag">${escapeHtml(t.model)}</span>` : ""}
                       </div>
-                      <span class="num">${formatTime(t.timestamp)} · ${escapeHtml(t.latency_ms)} ms</span>
+                      <span class="num">${formatTime(t.timestamp)} / ${escapeHtml(t.latency_ms)} ms</span>
                     </div>
                     <div class="history-q">问：${escapeHtml(t.query)}</div>
                     <div class="history-a">答：${escapeHtml(t.reply)}</div>
@@ -1103,21 +1209,24 @@
         $("memoryCountLabel").textContent = String(items.length);
         const chip = $("memoryStatusChip");
         chip.textContent = data.enabled ? "已启用" : "已禁用";
-        chip.className = data.enabled ? "chip chip--ok" : "chip";
+        chip.className = data.enabled ? "tag tag--ok" : "tag";
 
         if (!items.length) {
           $("memoryList").innerHTML = `<div class="empty-state">暂无长期记忆，可通过语音说“记住……”或在上方添加。</div>`;
           return;
         }
         $("memoryList").innerHTML = `
-          <div class="ruled">
+          <div class="ruled-list">
             ${items
               .map(
                 (m) => `
                   <div class="ruled-row">
                     <div>
-                      <div><strong>${escapeHtml(m.key)}</strong> <span class="chip">${escapeHtml(m.category || "fact")}</span></div>
-                      <div class="card-sub">${escapeHtml(m.value)}</div>
+                      <div class="tags-row">
+                        <strong>${escapeHtml(m.key)}</strong>
+                        <span class="tag">${escapeHtml(m.category || "fact")}</span>
+                      </div>
+                      <div class="section-meta" style="margin-top: var(--space-3xs); color: var(--color-ink-2);">${escapeHtml(m.value)}</div>
                     </div>
                     <button type="button" class="btn btn--sm btn--danger" data-del-memory="${escapeHtml(m.id)}">删除</button>
                   </div>
@@ -1133,38 +1242,38 @@
         state.voiceprints = items;
         $("voiceprintCountLabel").textContent = String(items.length);
         if (!items.length) {
-          $("voiceprintList").innerHTML = `<div class="empty-state">暂无已注册声纹（未检测到 speakers.json 或为空）。</div>`;
+          $("voiceprintList").innerHTML = `<div class="empty-state">暂无已注册声纹。成员说完话后，你对音箱说“记住刚才和你说话的是…”即可录入。</div>`;
           return;
         }
         $("voiceprintList").innerHTML = `
-          <div class="ruled">
+          <div class="ruled-list">
             ${items
-              .map(
-                (vp) => {
-                  const caps = Array.isArray(vp.capabilities)
-                    ? vp.capabilities.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")
-                    : "";
-                  const meta = [
-                    `ID: ${vp.id}`,
-                    vp.sample_count ? `样本 ${vp.sample_count}` : "",
-                    vp.preferred_voice ? `音色 ${vp.preferred_voice}` : "",
-                  ].filter(Boolean).join(" · ");
-                  return `
-                    <div class="ruled-row">
-                      <div>
-                        <div class="chips">
-                          <strong>${escapeHtml(vp.name || vp.id)}</strong>
-                          ${vp.role ? `<span class="chip chip--speaker">${escapeHtml(vp.role)}</span>` : ""}
-                          ${caps}
-                        </div>
-                        <div class="card-sub num">${escapeHtml(meta)}</div>
-                        ${vp.notes ? `<div class="card-sub">${escapeHtml(vp.notes)}</div>` : ""}
+              .map((vp) => {
+                const caps = Array.isArray(vp.capabilities)
+                  ? vp.capabilities.map((c) => `<span class="tag">${escapeHtml(c)}</span>`).join("")
+                  : "";
+                const meta = [
+                  `ID: ${vp.id}`,
+                  vp.sample_count ? `样本 ${vp.sample_count}` : "",
+                  vp.preferred_voice ? `音色 ${vp.preferred_voice}` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" / ");
+                return `
+                  <div class="ruled-row">
+                    <div>
+                      <div class="tags-row">
+                        <strong>${escapeHtml(vp.name || vp.id)}</strong>
+                        ${vp.role ? `<span class="tag tag--ok">${escapeHtml(vp.role)}</span>` : ""}
+                        ${caps}
                       </div>
-                      <button type="button" class="btn btn--sm btn--danger" data-del-vp="${escapeHtml(vp.id)}">移除</button>
+                      <div class="section-meta num" style="margin-top: var(--space-3xs);">${escapeHtml(meta)}</div>
+                      ${vp.notes ? `<div class="section-meta" style="margin-top: var(--space-3xs);">${escapeHtml(vp.notes)}</div>` : ""}
                     </div>
-                  `;
-                }
-              )
+                    <button type="button" class="btn btn--sm btn--danger" data-del-vp="${escapeHtml(vp.id)}">移除</button>
+                  </div>
+                `;
+              })
               .join("")}
           </div>
         `;
@@ -1175,20 +1284,20 @@
         state.reminders = items;
         $("reminderCountLabel").textContent = String(items.length);
         if (!items.length) {
-          $("reminderList").innerHTML = `<div class="empty-state">暂无定时提醒（未检测到 reminders.json 或为空）。</div>`;
+          $("reminderList").innerHTML = `<div class="empty-state">暂无定时提醒。可对音箱说“20 分钟后提醒我…”或“每天早上 8 点半播报早报”。</div>`;
           return;
         }
         $("reminderList").innerHTML = `
-          <div class="ruled">
+          <div class="ruled-list">
             ${items
               .map(
                 (r) => `
                   <div class="ruled-row">
                     <div>
                       <div><strong>${escapeHtml(r.message || r.title || r.text || "提醒")}</strong></div>
-                      <div class="card-sub num">${escapeHtml(r.daily_hhmm ? `每日 ${r.daily_hhmm}` : typeof r.trigger_at === "number" ? formatTime(r.trigger_at) : r.trigger_at || r.due_at || r.time || r.cron || "—")}</div>
+                      <div class="section-meta num" style="margin-top: var(--space-3xs);">${escapeHtml(r.daily_hhmm ? `每日 ${r.daily_hhmm}` : typeof r.trigger_at === "number" ? formatTime(r.trigger_at) : r.trigger_at || r.due_at || r.time || r.cron || "—")}</div>
                     </div>
-                    <span class="chip ${r.enabled === false ? "" : "chip--ok"}">${escapeHtml(r.status || (r.enabled === false ? "已停用" : "生效中"))}</span>
+                    <span class="tag ${r.enabled === false ? "" : "tag--ok"}">${escapeHtml(r.status || (r.enabled === false ? "已停用" : "生效中"))}</span>
                   </div>
                 `
               )
@@ -1230,6 +1339,8 @@
 
       $("settingsForm").addEventListener("submit", async (e) => {
         e.preventDefault();
+        const btn = $("saveSettingsBtn");
+        btn.disabled = true;
         const payload = {
           model: $("modelSelect").value,
           edge_voice: $("voiceSelect").value,
@@ -1244,6 +1355,8 @@
           await loadAll();
         } catch (err) {
           showToast(`保存失败：${err.message}`, true);
+        } finally {
+          btn.disabled = false;
         }
       });
 
@@ -1328,6 +1441,8 @@
 
       $("loginForm").addEventListener("submit", async (e) => {
         e.preventDefault();
+        const btn = $("loginSubmitBtn");
+        btn.disabled = true;
         const pw = $("loginPassword").value;
         try {
           await apiFetch("/api/login", {
@@ -1340,6 +1455,8 @@
           showToast("登录成功");
         } catch (err) {
           showLoginGate(err.message || "口令错误");
+        } finally {
+          btn.disabled = false;
         }
       });
 
