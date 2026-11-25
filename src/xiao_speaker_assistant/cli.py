@@ -33,6 +33,7 @@ from xiao_speaker_assistant.tools import (
 from xiao_speaker_assistant.voice import SpeakerGateway, run_with_relay
 from xiao_speaker_assistant.voice.models_setup import (
     download_models,
+    find_english_kws_dir,
     find_paraformer_dir,
     find_sense_voice_dir,
 )
@@ -182,7 +183,9 @@ def cmd_doctor(config: AppConfig) -> int:
     if missing_models:
         print(f"  [MISSING] Speech models in {models_dir}: {', '.join(missing_models)}")
     else:
-        print(f"  [OK] Speech models ready in {models_dir}")
+        en_dir = find_english_kws_dir(models_dir) if config.speech.en_kws_enabled else None
+        en_status = f"enabled ({en_dir.name})" if en_dir else "not installed (ASR fallback)"
+        print(f"  [OK] Speech models ready in {models_dir} (en_kws={en_status}, lang={config.speech.asr_language})")
 
     print(f"  OpenCode model:   {config.llm.providers.opencode.model}")
     print(f"  OpenCode V2 URL:  {config.llm.providers.opencode.server_url}")

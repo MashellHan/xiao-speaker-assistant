@@ -13,6 +13,43 @@ def test_match_wakeup_phrase_tolerates_punctuation_in_chinese_keywords() -> None
     assert match_wakeup_phrase("你好，管家。", ["你好管家"]) == ("你好管家", "")
     assert match_wakeup_phrase("你好，管家！帮我查一下", ["你好管家"]) == ("你好管家", "帮我查一下")
     assert match_wakeup_phrase("你好，小助手，今天星期几", ["你好小助手"]) == ("你好小助手", "今天星期几")
+    assert match_wakeup_phrase("Hno米，今天北京天气", ["你好管家"]) == ("hi nomi", "今天北京天气")
+    assert match_wakeup_phrase("你好，老米查一下磁盘", ["你好管家"]) == ("hi nomi", "查一下磁盘")
+
+
+def test_sense_voice_transcribe_filters_hangul_and_kana_hallucinations() -> None:
+    from xiao_speaker_assistant.voice.audio_pipeline import LocalSpeechPipeline
+
+    fake_pipe = LocalSpeechPipeline.__new__(LocalSpeechPipeline)
+    fake_pipe._cloud_asr = None
+
+    class FakeResult:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class FakeStream:
+        def __init__(self, text: str) -> None:
+            self.result = FakeResult(text)
+
+        def accept_waveform(self, sr: int, samples) -> None:
+            pass
+
+    class FakeASR:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def create_stream(self):
+            return FakeStream(self._text)
+
+        def decode_stream(self, stream) -> None:
+            pass
+
+    for bad in ("안녕하세요", "ありがとう", "はい。"):
+        fake_pipe._asr = FakeASR(bad)
+        assert fake_pipe._transcribe([0.1, 0.2]) == ""
+
+    fake_pipe._asr = FakeASR("Hi Nomi，今天星期三。")
+    assert fake_pipe._transcribe([0.1, 0.2]) == "Hi Nomi，今天星期三。"
 
 
 def test_generate_chime_pcm_produces_16bit_mono_audio() -> None:

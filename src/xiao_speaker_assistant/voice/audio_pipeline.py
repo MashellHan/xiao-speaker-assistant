@@ -18,8 +18,10 @@ from xiao_speaker_assistant.config import SpeechConfig
 from xiao_speaker_assistant.voice.aec import LinearEchoCanceller
 from xiao_speaker_assistant.voice.cloud_asr import DoubaoFlashASR, OpenAIWhisperASR
 from xiao_speaker_assistant.voice.models_setup import (
+    find_english_kws_dir,
     find_paraformer_dir,
     find_sense_voice_dir,
+    generate_english_keywords_file,
     generate_keywords_file,
 )
 
@@ -30,7 +32,7 @@ VAD_WINDOW_SAMPLES = 512
 
 HI_NOMI_REGEX = re.compile(
     r"^\s*(?:hi|hey|hello|can|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
-    r"(?:nomi|normi|nami|hnomi|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米)"
+    r"(?:nomi|normi|nami|hnomi|hno\s*米|h\s*no\s*米|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米|老米|纳米)"
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -38,6 +40,7 @@ HI_NOMI_REGEX = re.compile(
 _PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a", "chen", "han", "an"}
 _PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao", "lao"}
 _PINYIN_THIRD = {"mi", "min", "mei", "ming"}
+_NON_ZH_EN_HALLUCINATION_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff]")
 
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
@@ -218,6 +221,28 @@ class LocalSpeechPipeline:
         )
         self._kws_stream = self._kws.create_stream()
 
+        self._en_kws = None
+        self._en_kws_stream = None
+        if config.en_kws_enabled:
+            en_dir = find_english_kws_dir(models_dir)
+            if en_dir is not None:
+                en_kw_file = generate_english_keywords_file(en_dir, config.en_keywords)
+                self._en_kws = sherpa_onnx.KeywordSpotter(
+                    provider="cpu",
+                    num_threads=1,
+                    max_active_paths=8,
+                    keywords_score=config.en_kws_score,
+                    keywords_threshold=config.en_kws_threshold,
+                    num_trailing_blanks=0,
+                    keywords_file=str(en_kw_file),
+                    tokens=str(en_dir / "tokens.txt"),
+                    encoder=str(en_dir / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                    decoder=str(en_dir / "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                    joiner=str(en_dir / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+                )
+                self._en_kws_stream = self._en_kws.create_stream()
+                logger.info("English Hi Nomi KWS enabled (%s)", en_dir.name)
+
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(models_dir / "silero_vad.onnx"),
             threshold=config.vad_threshold,
@@ -300,6 +325,8 @@ class LocalSpeechPipeline:
                 self._vad_buffer = np.zeros(0, dtype=np.float32)
             else:
                 self._kws.reset_stream(self._kws_stream)
+                if self._en_kws is not None and self._en_kws_stream is not None:
+                    self._en_kws.reset_stream(self._en_kws_stream)
 
     def mute_for(self, seconds: float) -> None:
         with self._lock:
@@ -318,6 +345,8 @@ class LocalSpeechPipeline:
                 self._vad.reset()
                 self._vad_buffer = np.zeros(0, dtype=np.float32)
             self._kws.reset_stream(self._kws_stream)
+            if self._en_kws is not None and self._en_kws_stream is not None:
+                self._en_kws.reset_stream(self._en_kws_stream)
 
     def feed_pcm(
         self,
@@ -439,6 +468,30 @@ class LocalSpeechPipeline:
                     on_barge_in_wakeup(hit)
                 return
 
+        # Dedicated lightweight English GigaSpeech KWS for `Hi Nomi` when available.
+        if self._en_kws is not None and self._en_kws_stream is not None:
+            self._en_kws_stream.accept_waveform(SAMPLE_RATE, samples)
+            while self._en_kws.is_ready(self._en_kws_stream):
+                self._en_kws.decode_stream(self._en_kws_stream)
+                en_hit = self._en_kws.get_result(self._en_kws_stream)
+                if not en_hit:
+                    continue
+                self._en_kws.reset_stream(self._en_kws_stream)
+                if not self.awake:
+                    self.set_awake(True, preserve_vad=True)
+                    logger.info("English KWS triggered: %s", en_hit)
+                    if on_wakeup:
+                        on_wakeup(en_hit)
+                    break
+                if self.awake and is_muted:
+                    logger.info("English barge-in wake word detected: %s", en_hit)
+                    self._explicit_muted = False
+                    self._muted_until = 0.0
+                    self.set_awake(True)
+                    if on_barge_in_wakeup:
+                        on_barge_in_wakeup(en_hit)
+                    return
+
         if is_muted:
             return
 
@@ -482,4 +535,8 @@ class LocalSpeechPipeline:
         stream = self._asr.create_stream()
         stream.accept_waveform(SAMPLE_RATE, samples)
         self._asr.decode_stream(stream)
-        return stream.result.text.strip()
+        text = stream.result.text.strip()
+        if text and _NON_ZH_EN_HALLUCINATION_RE.search(text):
+            logger.debug("Dropping non-zh/en SenseVoice hallucination: %s", text)
+            return ""
+        return text

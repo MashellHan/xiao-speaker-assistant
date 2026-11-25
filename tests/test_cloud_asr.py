@@ -226,6 +226,15 @@ def test_openai_whisper_asr_multipart_upload_and_custom_provider(
     with wave.open(io.BytesIO(wav_payload), "rb") as wf:
         assert wf.getnframes() == 3
 
+    # language="auto" must omit the form field so OpenAI/Groq auto-detects instead of 400.
+    asr_auto = OpenAIWhisperASR(
+        api_key_env="GROQ_API_KEY",
+        language="auto",
+        client=client,
+    )
+    _, _, auto_data = asr_auto._build_request(np.array([0.1, -0.1, 0.2], dtype=np.float32))
+    assert "language" not in auto_data
+
 
 def test_openai_whisper_asr_local_keyless_async_and_errors(
     monkeypatch: pytest.MonkeyPatch,

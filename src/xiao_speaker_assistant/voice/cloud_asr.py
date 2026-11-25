@@ -279,8 +279,8 @@ class OpenAIWhisperASR:
             "model": self.model,
             "response_format": self.response_format,
         }
-        if self.language:
-            data["language"] = self.language
+        if self.language and self.language.strip().lower() != "auto":
+            data["language"] = self.language.strip()
         if self.prompt:
             data["prompt"] = self.prompt
         if self.temperature is not None:
