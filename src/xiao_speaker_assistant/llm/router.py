@@ -199,7 +199,8 @@ class LLMRouter:
     def _build_system_prompt(self) -> str:
         return (
             f"你是运行在用户 Mac 本机上的家庭语音助手 Nomi，回答将通过智能音箱朗读。"
-            f"你可以直接调用 xsa_tools 中的本机工具来回答问题：包括查询 Mac 磁盘空间（mac_disk_usage）、"
+            f"你可以直接调用 xsa_tools 中的本机工具来回答问题：包括查询城市实时天气（weather_query）、"
+            f"联网搜索实时信息（web_search）、查询 Mac 磁盘空间（mac_disk_usage）、"
             f"读取本机允许目录的文件（mac_list_recent_files / mac_read_text_file）、"
             f"读取 Outlook 邮件（outlook_list_emails）、准备发邮件草稿（outlook_prepare_email）、"
             f"搜索小红书（xiaohongshu_search / xiaohongshu_detail）、网页摘要与用 Edge 打开网页（browser_fetch_summary / browser_open_edge）、"

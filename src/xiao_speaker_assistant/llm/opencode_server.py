@@ -67,8 +67,8 @@ def build_opencode_v2_config(
                 "system": system_prompt,
                 "permissions": [
                     {"action": "xsa_tools_*", "resource": "*", "effect": "allow"},
-                    {"action": "websearch", "resource": "*", "effect": "allow"},
                     {"action": "webfetch", "resource": "*", "effect": "allow"},
+                    {"action": "websearch", "resource": "*", "effect": "deny"},
                     {"action": "edit", "resource": "*", "effect": "deny"},
                     {"action": "write", "resource": "*", "effect": "deny"},
                     {"action": "shell", "resource": "*", "effect": "deny"},
@@ -213,7 +213,7 @@ class OpenCodeV2Client:
     async def _reply_permission(
         self, client: httpx.AsyncClient, session_id: str, request_id: str, action: str
     ) -> None:
-        reply = "once" if (action.startswith("xsa_tools_") or action in {"websearch", "webfetch"}) else "reject"
+        reply = "once" if (action.startswith("xsa_tools_") or action == "webfetch") else "reject"
         try:
             await client.post(
                 f"/api/session/{session_id}/permission/{request_id}/reply",
@@ -237,62 +237,66 @@ class OpenCodeV2Client:
         ]
         client, owns = self._make_client(timeout=self._timeout_sec)
         try:
-            async with client.stream("GET", "/api/event", params=params) as sse:
-                sse.raise_for_status()
-                prompt_sent = False
+            async with asyncio.timeout(self._timeout_sec):
+                async with client.stream("GET", "/api/event", params=params) as sse:
+                    sse.raise_for_status()
+                    prompt_sent = False
 
-                async def send_prompt() -> None:
-                    nonlocal prompt_sent
-                    if prompt_sent:
-                        return
-                    prompt_sent = True
-                    pr = await client.post(
-                        f"/api/session/{session_id}/prompt",
-                        json={"text": text},
-                    )
-                    if pr.status_code == 404:
-                        raise SessionNotFoundError(f"OpenCode session not found: {session_id}")
-                    pr.raise_for_status()
+                    async def send_prompt() -> None:
+                        nonlocal prompt_sent
+                        if prompt_sent:
+                            return
+                        prompt_sent = True
+                        pr = await client.post(
+                            f"/api/session/{session_id}/prompt",
+                            json={"text": text},
+                        )
+                        if pr.status_code == 404:
+                            raise SessionNotFoundError(f"OpenCode session not found: {session_id}")
+                        pr.raise_for_status()
 
-                async for raw_line in sse.aiter_lines():
-                    if not raw_line.startswith("data:"):
-                        continue
-                    body = raw_line[5:].strip()
-                    if not body:
-                        continue
-                    try:
-                        evt = json.loads(body)
-                    except json.JSONDecodeError:
-                        continue
+                    async for raw_line in sse.aiter_lines():
+                        if not raw_line.startswith("data:"):
+                            continue
+                        body = raw_line[5:].strip()
+                        if not body:
+                            continue
+                        try:
+                            evt = json.loads(body)
+                        except json.JSONDecodeError:
+                            continue
 
-                    etype = evt.get("type")
-                    data = evt.get("data") or {}
+                        etype = evt.get("type")
+                        data = evt.get("data") or {}
 
-                    if etype == "server.connected":
-                        await send_prompt()
-                        continue
+                        if etype == "server.connected":
+                            await send_prompt()
+                            continue
 
-                    if not prompt_sent:
-                        await send_prompt()
+                        if not prompt_sent:
+                            await send_prompt()
 
-                    if data.get("sessionID") != session_id:
-                        continue
+                        if data.get("sessionID") != session_id:
+                            continue
 
-                    if etype == "session.text.delta":
-                        delta = data.get("delta")
-                        if isinstance(delta, str) and delta:
-                            yield delta
-                    elif etype == "permission.asked":
-                        req_id = data.get("id")
-                        action = str(data.get("action") or "")
-                        if isinstance(req_id, str) and req_id:
-                            await self._reply_permission(client, session_id, req_id, action)
-                    elif etype in {"session.execution.succeeded", "session.idle", "session.execution.interrupted"}:
-                        break
-                    elif etype == "session.execution.failed":
-                        err = data.get("error") or {}
-                        msg = err.get("message") if isinstance(err, dict) else str(err)
-                        raise RuntimeError(f"OpenCode execution failed: {msg or 'unknown error'}")
+                        if etype == "session.text.delta":
+                            delta = data.get("delta")
+                            if isinstance(delta, str) and delta:
+                                yield delta
+                        elif etype == "permission.asked":
+                            req_id = data.get("id")
+                            action = str(data.get("action") or "")
+                            if isinstance(req_id, str) and req_id:
+                                await self._reply_permission(client, session_id, req_id, action)
+                        elif etype in {"session.execution.succeeded", "session.idle", "session.execution.interrupted"}:
+                            break
+                        elif etype == "session.execution.failed":
+                            err = data.get("error") or {}
+                            msg = err.get("message") if isinstance(err, dict) else str(err)
+                            raise RuntimeError(f"OpenCode execution failed: {msg or 'unknown error'}")
+        except TimeoutError as exc:
+            await self.interrupt(session_id)
+            raise RuntimeError("响应超时，请稍后再试") from exc
         finally:
             if owns:
                 await client.aclose()

@@ -60,6 +60,7 @@ def test_parse_model_ref_and_ensure_agent_home(tmp_path: Path) -> None:
     assert written["mcp"]["servers"]["xsa_tools"]["oauth"] is False
     perms = {(p["action"], p["effect"]) for p in written["agents"]["nomi"]["permissions"]}
     assert ("xsa_tools_*", "allow") in perms
+    assert ("websearch", "deny") in perms
     assert ("shell", "deny") in perms
     assert ("edit", "deny") in perms
     assert ("write", "deny") in perms
@@ -301,3 +302,66 @@ def test_doctor_reports_opencode_v2_and_mcp_status(capsys) -> None:
     assert "OpenCode V2 URL:" in out
     assert "Unified MCP HTTP:" in out
     assert "ffmpeg" in out
+
+
+def test_mcp_weather_query_and_web_search_with_mock_http() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "wttr.in" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "current_condition": [
+                        {
+                            "temp_C": "8",
+                            "FeelsLikeC": "6",
+                            "humidity": "30",
+                            "windspeedKmph": "12",
+                            "lang_zh": [{"value": "晴"}],
+                        }
+                    ],
+                    "weather": [
+                        {"mintempC": "-1", "maxtempC": "10"},
+                        {"mintempC": "0", "maxtempC": "11"},
+                    ],
+                },
+                request=request,
+            )
+        if "cn.bing.com/search" in str(request.url):
+            html_body = (
+                '<ul><li class="b_algo"><h2><a href="https://example.com/news">北京今日天气</a></h2>'
+                '<p>晴朗微风，最高气温10度。</p></li></ul>'
+            )
+            return httpx.Response(200, text=html_body, request=request)
+        return httpx.Response(404, request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            srv = McpServer(AppConfig(), http_client=http_client, include_local_tools=True)
+            w_resp = await srv.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "weather_query", "arguments": {"city": "北京"}},
+                }
+            )
+            assert w_resp is not None and w_resp["result"]["isError"] is False
+            w_data = json.loads(w_resp["result"]["content"][0]["text"])
+            assert w_data["current_temp_c"] == "8"
+            assert w_data["condition"] == "晴"
+            assert w_data["today_max_c"] == "10"
+
+            s_resp = await srv.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "web_search", "arguments": {"query": "北京天气"}},
+                }
+            )
+            assert s_resp is not None and s_resp["result"]["isError"] is False
+            s_data = json.loads(s_resp["result"]["content"][0]["text"])
+            assert s_data["count"] == 1
+            assert s_data["results"][0]["title"] == "北京今日天气"
+
+    asyncio.run(run())

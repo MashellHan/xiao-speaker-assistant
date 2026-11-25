@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import quote
 
 import httpx
 from aiohttp import web
@@ -194,6 +197,32 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["prompt"],
         },
     },
+    {
+        "name": "weather_query",
+        "description": "Query real-time current weather and 2-day forecast for a city (fast, works in China).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "City name in Chinese or English, e.g. 北京, 上海, Beijing",
+                },
+            },
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web quickly via Bing China for current facts, news, dates, or prices.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query keywords"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -329,6 +358,10 @@ class McpServer:
             return self._ok(req_id, await self._call_mac_disk_usage(args))
         if name == "codex_analyze":
             return self._ok(req_id, await self._call_codex_analyze(args))
+        if name == "weather_query":
+            return self._ok(req_id, await self._call_weather_query(args))
+        if name == "web_search":
+            return self._ok(req_id, await self._call_web_search(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -636,6 +669,98 @@ class McpServer:
                 os.unlink(out_file)
             except OSError:
                 pass
+
+    async def _call_weather_query(self, args: dict[str, Any]) -> dict[str, Any]:
+        city = str(args.get("city") or "").strip()
+        if not city:
+            return self._tool_result(
+                {"error": "invalid_arguments", "message": "Argument 'city' is required."},
+                is_error=True,
+            )
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
+        try:
+            resp = await client.get(
+                f"https://wttr.in/{quote(city)}",
+                params={"format": "j1", "lang": "zh"},
+                headers={"User-Agent": "curl/8.5.0"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            cur = (data.get("current_condition") or [{}])[0]
+            weather_days = data.get("weather") or []
+            lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get("value", "")
+            today = weather_days[0] if len(weather_days) > 0 else {}
+            tomorrow = weather_days[1] if len(weather_days) > 1 else {}
+            return self._tool_result(
+                {
+                    "city": city,
+                    "current_temp_c": cur.get("temp_C"),
+                    "feels_like_c": cur.get("FeelsLikeC"),
+                    "condition": lang_desc,
+                    "humidity_pct": cur.get("humidity"),
+                    "wind_kmph": cur.get("windspeedKmph"),
+                    "today_min_c": today.get("mintempC"),
+                    "today_max_c": today.get("maxtempC"),
+                    "tomorrow_min_c": tomorrow.get("mintempC"),
+                    "tomorrow_max_c": tomorrow.get("maxtempC"),
+                }
+            )
+        except Exception as exc:
+            return self._tool_result(
+                {"error": "weather_error", "message": str(exc), "city": city},
+                is_error=True,
+            )
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def _call_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return self._tool_result(
+                {"error": "invalid_arguments", "message": "Argument 'query' is required."},
+                is_error=True,
+            )
+        limit = max(1, min(8, int(args.get("limit", 5))))
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
+        try:
+            resp = await client.get(
+                "https://cn.bing.com/search",
+                params={"q": query},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
+            )
+            resp.raise_for_status()
+            items: list[dict[str, str]] = []
+            for block in re.findall(r'<li class="b_algo"[^>]*>([\s\S]*?)</li>', resp.text):
+                m_link = re.search(r'<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', block)
+                if not m_link:
+                    continue
+                url = html.unescape(m_link.group(1))
+                title = html.unescape(re.sub(r"<[^>]+>", "", m_link.group(2))).strip()
+                m_snip = re.search(r'<p[^>]*>([\s\S]*?)</p>', block)
+                snippet = (
+                    html.unescape(re.sub(r"<[^>]+>", "", m_snip.group(1))).strip()
+                    if m_snip
+                    else ""
+                )
+                if title:
+                    items.append({"title": title, "snippet": snippet[:240], "url": url})
+                if len(items) >= limit:
+                    break
+            return self._tool_result({"query": query, "results": items, "count": len(items)})
+        except Exception as exc:
+            return self._tool_result(
+                {"error": "web_search_error", "message": str(exc), "query": query},
+                is_error=True,
+            )
+        finally:
+            if owns_client:
+                await client.aclose()
 
     async def start_http_server(
         self,
