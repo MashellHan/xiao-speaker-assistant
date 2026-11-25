@@ -39,7 +39,9 @@ class SpeechConfig(BaseModel):
             "网页",
         ]
     )
-    local_keywords: list[str] = Field(default_factory=lambda: ["你好管家", "你好诺米"])
+    local_keywords: list[str] = Field(
+        default_factory=lambda: ["你好管家", "你好诺米", "你好糯米", "嗨糯米"]
+    )
     interrupt_keywords: list[str] = Field(
         default_factory=lambda: ["退出", "停止", "闭嘴", "退下", "别说了", "再见"]
     )
@@ -56,9 +58,9 @@ class SpeechConfig(BaseModel):
     s32_shift: int = 16
     kws_score: float = 2.0
     kws_threshold: float = 0.20
-    vad_threshold: float = 0.03
+    vad_threshold: float = 0.12
     vad_min_silence_ms: int = 550
-    input_gain: float = 1.0
+    input_gain: float = 16.0
     agc_enabled: bool = False
     agc_target_rms: float = 0.10
     agc_max_gain: float = 48.0
