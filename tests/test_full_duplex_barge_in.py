@@ -60,6 +60,7 @@ def test_bare_wake_word_during_2ch_playback_interrupts_instead_of_blocking() -> 
     cfg.speaker.tts_provider = "say"
     cfg.speech.aec_enabled = True
     cfg.speech.capture_channels = 2
+    cfg.speech.local_keywords = ["糯米糯米", "你好管家"]
     gw = SpeakerGateway(cfg, on_stream_query=slow_stream)
 
     async def run() -> None:
@@ -106,6 +107,7 @@ def test_echo_window_expires_after_playback_for_short_answers() -> None:
     cfg.speaker.tts_provider = "say"
     cfg.speech.aec_enabled = True
     cfg.speech.capture_channels = 2
+    cfg.speech.local_keywords = ["糯米糯米", "你好管家"]
     gw = SpeakerGateway(cfg, on_stream_query=fake_stream)
 
     async def run() -> None:
@@ -159,6 +161,7 @@ def test_full_duplex_followup_interrupts_active_reply_without_resetting_session(
     cfg.speaker.tts_provider = "say"
     cfg.speech.aec_enabled = True
     cfg.speech.capture_channels = 2
+    cfg.speech.local_keywords = ["糯米糯米", "你好管家"]
     gw = SpeakerGateway(
         cfg,
         on_stream_query=fake_stream,

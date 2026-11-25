@@ -33,7 +33,7 @@ VAD_WINDOW_SAMPLES = 512
 
 HI_NOMI_REGEX = re.compile(
     r"^\s*(?:hi|hey|hello|can|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
-    r"(?:nomi|normi|nami|hnomi|hno\s*米|h\s*no\s*米|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米|老米|纳米)"
+    r"(?:nomi|nuomi|normi|nami|hnomi|hno\s*米|h\s*no\s*米|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米|老米|纳米)"
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
 )

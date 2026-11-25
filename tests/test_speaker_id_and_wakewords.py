@@ -20,13 +20,13 @@ def _unit_vec(idx: int, dim: int = 192) -> list[float]:
 
 
 def test_reduplicated_wakewords_matching() -> None:
-    kws = ["糯米糯米", "小诺小诺", "米粒米粒", "你好管家", "你好诺米"]
+    kws = ["糯米糯米", "诺米诺米"]
     assert match_wakeup_phrase("糯米糯米", kws) == ("糯米糯米", "")
     assert match_wakeup_phrase("糯米、糯米，今天天气怎么样", kws) == ("糯米糯米", "今天天气怎么样")
-    assert match_wakeup_phrase("诺米诺米，帮我讲个故事", kws) == ("糯米糯米", "帮我讲个故事")
-    assert match_wakeup_phrase("小诺小诺，几点了", kws) == ("小诺小诺", "几点了")
-    assert match_wakeup_phrase("米粒米粒，明天北京天气", kws) == ("米粒米粒", "明天北京天气")
-    assert match_wakeup_phrase("你好，管家。打开日程", kws) == ("你好管家", "打开日程")
+    assert match_wakeup_phrase("诺米诺米，帮我讲个故事", kws) == ("诺米诺米", "帮我讲个故事")
+    assert match_wakeup_phrase("糯米诺米，明天北京天气", kws) == ("糯米糯米", "明天北京天气")
+    assert match_wakeup_phrase("Hey Nuomi, what time is it", kws) == ("hi nomi", "what time is it")
+    assert match_wakeup_phrase("Hey Nomi", kws) == ("hi nomi", "")
 
 
 def test_speaker_profile_store_enroll_previous_update_and_identify(tmp_path: Path) -> None:

@@ -44,16 +44,13 @@ class SpeechConfig(BaseModel):
     )
     local_keywords: list[str] = Field(
         default_factory=lambda: [
-            "小诺小诺",
             "糯米糯米",
-            "米粒米粒",
-            "你好管家",
-            "你好诺米",
+            "诺米诺米",
         ]
     )
     en_kws_enabled: bool = True
     en_keywords: list[str] = Field(
-        default_factory=lambda: ["HI NOMI", "HI NAOMI", "HI KNOW ME", "HI NO ME", "HEY NOMI", "HI NOAMI"]
+        default_factory=lambda: ["HEY NUOMI", "HEY NOMI", "HEY NOUMI", "HEY NAOMI"]
     )
     en_kws_score: float = 1.5
     en_kws_threshold: float = 0.20
