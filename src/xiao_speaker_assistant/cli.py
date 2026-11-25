@@ -206,7 +206,6 @@ def cmd_doctor(config: AppConfig) -> int:
     print(f"  OpenCode V2 URL:  {config.llm.providers.opencode.server_url}")
     print(f"  OpenCode home:    {config.llm.providers.opencode.agent_home}")
     print(f"  Unified MCP HTTP: http://127.0.0.1:{config.tools.mcp_http_port}/mcp")
-    print(f"  Web Console:      http://127.0.0.1:{config.tools.mcp_http_port}/")
 
     client_id_present = bool(read_env_secret(config.tools.outlook.client_id_env))
     cache_path = Path(config.tools.outlook.token_cache_file).expanduser()
@@ -286,6 +285,10 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             router.reload_runtime_config(active_config)
             router.opencode_session_id = None
 
+    effective_config_path: str | Path | None = getattr(args, "config", None)
+    if effective_config_path is None and Path("config.yaml").is_file():
+        effective_config_path = Path("config.yaml").resolve()
+
     mcp_server = McpServer(
         active_config,
         confirmation_store=confirmations,
@@ -297,7 +300,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         on_model_changed=on_model_changed,
-        config_path=getattr(args, "config", None),
+        config_path=effective_config_path,
         include_local_tools=True,
     )
     mcp_runner, mcp_port = await mcp_server.start_http_server(

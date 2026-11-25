@@ -610,19 +610,9 @@ def test_voice_model_switching_and_remote_tunnel_login_gate(tmp_path: Path) -> N
                 assert ok_login.status_code == 200
                 assert "xsa_console_session" in ok_login.cookies
 
-                # HTTPS proxy sets Secure cookie flag
-                https_login = await client.post(
-                    f"{base}/api/login",
-                    headers={**tunnel_headers, "X-Forwarded-Proto": "https"},
-                    json={"password": "remote-console-password"},
-                )
-                assert https_login.status_code == 200
-                assert "Secure" in https_login.headers.get("set-cookie", "")
-
                 authed_ov = await client.get(
                     f"{base}/api/overview",
                     headers=tunnel_headers,
-                    cookies={"xsa_console_session": ok_login.cookies["xsa_console_session"]},
                 )
                 assert authed_ov.status_code == 200
                 assert authed_ov.json()["model"] == "raven/gpt-6.2-sol#low"
@@ -631,6 +621,15 @@ def test_voice_model_switching_and_remote_tunnel_login_gate(tmp_path: Path) -> N
                 await client.post(f"{base}/api/logout", headers=tunnel_headers)
                 after_logout = await client.get(f"{base}/api/overview", headers=tunnel_headers)
                 assert after_logout.status_code == 401
+
+                # HTTPS proxy sets Secure cookie flag
+                https_login = await client.post(
+                    f"{base}/api/login",
+                    headers={**tunnel_headers, "X-Forwarded-Proto": "https"},
+                    json={"password": "remote-console-password"},
+                )
+                assert https_login.status_code == 200
+                assert "Secure" in https_login.headers.get("set-cookie", "")
         finally:
             await runner.cleanup()
 
