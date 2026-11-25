@@ -94,8 +94,8 @@ class PlaybackController:
                     "channels": 1,
                     "bits_per_sample": 16,
                     "sample_rate": self._config.tts_sample_rate,
-                    "period_size": 960,
-                    "buffer_size": 4800,  # 200ms ring buffer at 24kHz so short chimes exceed start_threshold
+                    "period_size": 1200,
+                    "buffer_size": 4800,  # 200ms ring buffer at 24kHz matching open-xiaoai-bridge
                 },
                 wait_response=True,
                 timeout=5.0,
@@ -112,17 +112,20 @@ class PlaybackController:
             return False
         return True
 
-    async def stop_playback(self, *, stop_native: bool = True) -> None:
-        """Immediately halt active and queued playback and optionally stop native players."""
-        self._cancel_epoch += 1
-        self._cancel_event.set()
+    async def _close_stream(self) -> None:
         self._play_drain_until = 0.0
         if self._stream_open:
             self._stream_open = False
             try:
-                await self._send_rpc("stop_play", None, wait_response=False, timeout=2.0)
+                await self._send_rpc("stop_play", None, wait_response=True, timeout=1.5)
             except Exception:
                 pass
+
+    async def stop_playback(self, *, stop_native: bool = True) -> None:
+        """Immediately halt active and queued playback and optionally stop native players."""
+        self._cancel_epoch += 1
+        self._cancel_event.set()
+        await self._close_stream()
         if stop_native:
             try:
                 await self._run_shell(STOP_NATIVE_SCRIPT, False, 5.0)
@@ -207,7 +210,10 @@ class PlaybackController:
                     yield self._chime_pcm[i : i + chunk_bytes]
 
             # 150ms chime + 250ms trailing silence = 400ms (> 200ms ALSA buffer_size) so it always plays immediately.
-            await self._stream_chunks(chime_iter(), epoch, pad_tail_sec=0.25)
+            try:
+                await self._stream_chunks(chime_iter(), epoch, pad_tail_sec=0.25)
+            finally:
+                await self._close_stream()
 
     async def speak(self, text: str, *, interrupt_native: bool = True) -> None:
         if not text.strip():
@@ -240,5 +246,7 @@ class PlaybackController:
                     pad_tail_sec=0.22,
                 )
             finally:
+                if self._config.tts_provider != "xiaoai":
+                    await self._close_stream()
                 if self._on_playback_state:
                     self._on_playback_state(False)

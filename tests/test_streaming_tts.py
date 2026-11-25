@@ -78,13 +78,13 @@ def test_gateway_barge_in_interrupt_cancels_active_streaming_reply() -> None:
             sent_commands.append(cmd)
             if cmd == "run_shell" and isinstance(req.get("payload"), str):
                 sent_commands.append(req["payload"])
-            if cmd == "start_play" and isinstance(req.get("id"), str):
+            if cmd in {"start_play", "stop_play"} and isinstance(req.get("id"), str):
                 req_id = req["id"]
                 asyncio.get_running_loop().call_soon(
-                    lambda: asyncio.create_task(
+                    lambda rid=req_id: asyncio.create_task(
                         gw._handle_text_message(
                             self,
-                            json.dumps({"Response": {"id": req_id, "code": 0}}),
+                            json.dumps({"Response": {"id": rid, "code": 0}}),
                         )
                     )
                 )

@@ -175,3 +175,4 @@ def test_playback_controller_awaits_start_play_ack_and_pads_trailing_silence() -
     # Total PCM bytes sent must exceed ALSA 4800-frame (9600-byte) buffer_size so chime plays immediately.
     total_bytes = sum(len(frame["bytes"]) for frame in sent_binary)
     assert total_bytes >= 15000
+    assert events[-1].startswith("rpc:stop_play")

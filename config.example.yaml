@@ -27,9 +27,10 @@ speech:
   asr_language: zh
   capture_channels: 1
   capture_bits_per_sample: 16
-  agc_enabled: true
-  agc_target_rms: 0.10
-  agc_max_gain: 48.0
+  agc_enabled: false
+  vad_threshold: 0.03
+  kws_score: 2.0
+  kws_threshold: 0.20
   aec_enabled: false
   models_dir: models
   vad_min_silence_ms: 550
