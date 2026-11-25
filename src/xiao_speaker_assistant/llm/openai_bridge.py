@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 import edge_tts
 
 from xiao_speaker_assistant.config import SpeakerConfig
+from xiao_speaker_assistant.llm.router import resolve_binary
 
 logger = logging.getLogger(__name__)
 
 AskFn = Callable[[str], Awaitable[str]]
+StreamAskFn = Callable[[str], AsyncIterator[str]]
 ResetFn = Callable[[], None]
+
+ALLOWED_AUDIO_FORMATS = frozenset({"mp3", "wav", "pcm", "opus", "aac", "flac"})
 
 
 def extract_last_user_prompt(messages: list[dict[str, Any]]) -> str:
@@ -37,7 +43,6 @@ def extract_last_user_prompt(messages: list[dict[str, Any]]) -> str:
             text = "".join(parts).strip()
         else:
             continue
-        # Strip open-xiaoai-bridge's appended rule_prompt suffix if present
         for marker in ("\n注意：将结果处理成纯文字版", "\n注意：这条消息是主人通过小爱音箱发送的"):
             if marker in text:
                 text = text.split(marker, 1)[0].strip()
@@ -54,6 +59,9 @@ async def synthesize_edge_audio_bytes(
 ) -> tuple[bytes, str]:
     """Synthesize speech using `edge-tts` and return `(audio_bytes, content_type)`."""
     fmt = response_format.strip().lower() or "mp3"
+    if fmt not in ALLOWED_AUDIO_FORMATS:
+        raise ValueError(f"Unsupported response_format: {response_format!r}")
+
     comm = edge_tts.Communicate(text=text, voice=voice)
     mp3_chunks: list[bytes] = []
     async for msg in comm.stream():
@@ -65,11 +73,10 @@ async def synthesize_edge_audio_bytes(
     if fmt == "mp3":
         return mp3_bytes, "audio/mpeg"
 
-    import asyncio
-
+    ffmpeg_bin = resolve_binary("ffmpeg")
     out_fmt = "s16le" if fmt == "pcm" else fmt
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
+        ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -103,10 +110,12 @@ class OpenAIBridgeServer:
         ask_fn: AskFn,
         speaker_config: SpeakerConfig,
         *,
+        stream_fn: StreamAskFn | None = None,
         on_reset: ResetFn | None = None,
         auth_token: str | None = None,
     ) -> None:
         self._ask_fn = ask_fn
+        self._stream_fn = stream_fn
         self._speaker_config = speaker_config
         self._on_reset = on_reset
         self._auth_token = auth_token.strip() if auth_token else None
@@ -133,7 +142,7 @@ class OpenAIBridgeServer:
         async def handle_health(_request: web.Request) -> web.Response:
             return web.json_response({"ok": True})
 
-        async def handle_chat(request: web.Request) -> web.Response:
+        async def handle_chat(request: web.Request) -> web.StreamResponse:
             denied = self._check_security(request)
             if denied is not None:
                 return denied
@@ -158,12 +167,49 @@ class OpenAIBridgeServer:
             if not prompt:
                 return web.json_response({"error": {"message": "Missing user message"}}, status=400)
 
-            reply = await self._ask_fn(prompt)
             model = str(body.get("model") or "nomi")
+            cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+
+            if bool(body.get("stream")):
+                sse = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream; charset=utf-8",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+                await sse.prepare(request)
+
+                async def write_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> None:
+                    chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                    }
+                    await sse.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+
+                await write_chunk({"role": "assistant"})
+                if self._stream_fn is not None:
+                    async for piece in self._stream_fn(prompt):
+                        if piece:
+                            await write_chunk({"content": piece})
+                else:
+                    reply = await self._ask_fn(prompt)
+                    if reply:
+                        await write_chunk({"content": reply})
+                await write_chunk({}, finish_reason="stop")
+                await sse.write(b"data: [DONE]\n\n")
+                await sse.write_eof()
+                return sse
+
+            reply = await self._ask_fn(prompt)
             payload = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "id": cmpl_id,
                 "object": "chat.completion",
-                "created": int(time.time()),
+                "created": created,
                 "model": model,
                 "choices": [
                     {
@@ -191,6 +237,11 @@ class OpenAIBridgeServer:
             if voice in {"alloy", "nova", "shimmer", "echo", "fable", "onyx", "default"}:
                 voice = self._speaker_config.edge_voice
             fmt = str(body.get("response_format") or "mp3").strip().lower()
+            if fmt not in ALLOWED_AUDIO_FORMATS:
+                return web.json_response(
+                    {"error": {"message": f"Unsupported response_format: {fmt!r}"}},
+                    status=400,
+                )
 
             audio_bytes, ctype = await synthesize_edge_audio_bytes(
                 text, voice=voice, response_format=fmt

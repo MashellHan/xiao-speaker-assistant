@@ -287,6 +287,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             bridge = OpenAIBridgeServer(
                 ask_fn=handle_query,
                 speaker_config=config.speaker,
+                stream_fn=stream_query,
                 on_reset=reset_all,
                 auth_token=read_env_secret(args.token_env) if getattr(args, "token_env", None) else None,
             )

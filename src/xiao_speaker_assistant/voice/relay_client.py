@@ -103,7 +103,7 @@ class RelayHostClient:
         self._connected_event.set()
         received_any = False
 
-        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=48)
+        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         audio_worker_task = asyncio.create_task(self._gateway._audio_worker(conn, audio_queue))
         watchdog_task: asyncio.Task[None] | None = None
 

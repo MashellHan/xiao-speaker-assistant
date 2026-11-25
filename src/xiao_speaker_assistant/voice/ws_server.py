@@ -310,7 +310,7 @@ class SpeakerGateway:
         self._get_playback(conn)
         logger.info("Speaker connected from %s", conn.remote_address)
 
-        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=48)
+        audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         audio_worker_task = asyncio.create_task(self._audio_worker(conn, audio_queue))
 
         if self._pipeline is not None:

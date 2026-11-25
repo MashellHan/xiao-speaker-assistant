@@ -24,12 +24,18 @@ def test_openai_bridge_chat_and_speech_endpoints() -> None:
         seen_prompts.append(prompt)
         return f"收到：{prompt}"
 
+    async def fake_stream(prompt: str):
+        seen_prompts.append(prompt)
+        yield "第一句。"
+        yield "第二句。"
+
     async def fake_synth(text: str, *, voice: str, response_format: str):
         return b"ID3-fake-mp3-" + text.encode("utf-8"), "audio/mpeg"
 
     bridge = OpenAIBridgeServer(
         ask_fn=fake_ask,
         speaker_config=SpeakerConfig(),
+        stream_fn=fake_stream,
         on_reset=lambda: resets.append(True),
         auth_token="bridge-tok",
     )
@@ -57,6 +63,17 @@ def test_openai_bridge_chat_and_speech_endpoints() -> None:
                 data = resp.json()
                 assert data["choices"][0]["message"]["content"] == "收到：查一下磁盘"
 
+                # Streaming SSE mode
+                stream_resp = await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer bridge-tok", "X-Hermes-Session-Key": "s1"},
+                    json={"model": "nomi", "stream": True, "messages": [{"role": "user", "content": "流式测试"}]},
+                )
+                assert stream_resp.status_code == 200
+                assert "text/event-stream" in stream_resp.headers["content-type"]
+                assert "第一句。" in stream_resp.text and "第二句。" in stream_resp.text
+                assert "data: [DONE]" in stream_resp.text
+
                 # Switching session key triggers reset callback
                 resp2 = await client.post(
                     "/v1/chat/completions",
@@ -65,6 +82,13 @@ def test_openai_bridge_chat_and_speech_endpoints() -> None:
                 )
                 assert resp2.status_code == 200
                 assert resets == [True]
+
+                bad_fmt = await client.post(
+                    "/v1/audio/speech",
+                    headers={"Authorization": "Bearer bridge-tok"},
+                    json={"input": "你好", "response_format": "exe"},
+                )
+                assert bad_fmt.status_code == 400
 
                 with patch("xiao_speaker_assistant.llm.openai_bridge.synthesize_edge_audio_bytes", fake_synth):
                     tts_resp = await client.post(
@@ -78,4 +102,4 @@ def test_openai_bridge_chat_and_speech_endpoints() -> None:
             await runner.cleanup()
 
     asyncio.run(run())
-    assert seen_prompts == ["查一下磁盘", "新会话"]
+    assert seen_prompts == ["查一下磁盘", "流式测试", "新会话"]

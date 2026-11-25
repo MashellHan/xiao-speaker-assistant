@@ -117,7 +117,7 @@ class PlaybackController:
         if self._stream_open:
             self._stream_open = False
             try:
-                await self._send_rpc("stop_play", None, wait_response=False, timeout=2.0)
+                await self._send_rpc("stop_play", None, wait_response=True, timeout=1.5)
             except Exception:
                 pass
 
