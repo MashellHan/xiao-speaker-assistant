@@ -459,7 +459,7 @@ class McpServer:
         on_voice_changed: Callable[[str, str], None] | None = None,
         on_model_changed: Callable[[str], None] | None = None,
         config_path: str | Path | None = None,
-        speakers_path: str | Path = "~/.local/share/xiao-speaker-assistant/speakers.json",
+        speakers_path: str | Path | None = None,
         reminders_path: str | Path | None = None,
         http_client: httpx.AsyncClient | None = None,
         include_local_tools: bool = False,
@@ -487,7 +487,7 @@ class McpServer:
         self._on_voice_changed = on_voice_changed
         self._on_model_changed = on_model_changed
         self._config_path = config_path
-        self._speakers_path = Path(speakers_path).expanduser()
+        self._speakers_path = Path(speakers_path).expanduser() if speakers_path is not None else None
         self._reminders_path = Path(reminders_path).expanduser() if reminders_path is not None else None
         self._http_client = http_client
         self._include_local_tools = include_local_tools
@@ -1576,6 +1576,8 @@ class McpServer:
         }
 
     def _read_voiceprints(self) -> list[dict[str, Any]]:
+        if self._speakers_path is None:
+            return self.speaker_store.list_profiles()
         if not self._speakers_path.is_file():
             return []
         try:
@@ -1597,7 +1599,11 @@ class McpServer:
 
     def _delete_voiceprint(self, vp_id: str) -> bool:
         target = vp_id.strip()
-        if not target or not self._speakers_path.is_file():
+        if not target:
+            return False
+        if self._speakers_path is None:
+            return self.speaker_store.delete_profile(target)
+        if not self._speakers_path.is_file():
             return False
         try:
             raw = json.loads(self._speakers_path.read_text(encoding="utf-8"))
