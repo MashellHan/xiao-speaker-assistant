@@ -18,10 +18,14 @@ speaker:
 
 speech:
   local_keywords:
+    - 小诺小诺
+    - 糯米糯米
+    - 米粒米粒
     - 你好管家
     - 你好诺米
-    - 你好糯米
-    - 嗨糯米
+  speaker_id_enabled: true
+  speaker_id_threshold: 0.45
+  speaker_profiles_file: ~/.local/share/xiao-speaker-assistant/speakers.json
   interrupt_keywords:
     - 退出
     - 停止

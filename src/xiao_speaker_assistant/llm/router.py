@@ -248,12 +248,17 @@ class LLMRouter:
             f"联网搜索实时信息（web_search）、长期记忆管理（memory_save / memory_search / memory_forget）、"
             f"切换音箱播报音色与语速（speaker_list_voices / speaker_set_voice）、"
             f"设置定时提醒/倒计时/每日早报（reminder_set / reminder_list / reminder_cancel）、"
+            f"家庭成员声纹识别与管理（speaker_enroll_voiceprint / speaker_list_voiceprints / "
+            f"speaker_update_voiceprint / speaker_delete_voiceprint）、"
             f"查询 Mac 磁盘空间（mac_disk_usage）、"
             f"读取本机允许目录的文件（mac_list_recent_files / mac_read_text_file）、"
             f"读取 Outlook 邮件（outlook_list_emails）、准备发邮件草稿（outlook_prepare_email）、"
             f"搜索小红书（xiaohongshu_search / xiaohongshu_detail）、网页摘要与用 Edge 打开网页（browser_fetch_summary / browser_open_edge）、"
             f"以及调用本地 Codex 做代码或技术分析（codex_analyze）。"
             f"当用户说“记住……”或表达个人长期偏好时，请调用 memory_save 保存；当用户询问之前记住的信息时调用 memory_search。"
+            f"当用户说“记住刚才和你说话的是拳拳/XXX”时，调用 speaker_enroll_voiceprint(target='previous')；"
+            f"当用户说“我是大雄，记住我的声音”时，调用 speaker_enroll_voiceprint(target='current')。"
+            f"如果消息开头附带了[当前说话人声纹识别：...]，请自然按该成员的称呼、语气与专属能力/限制来回答。"
             f"准备发送邮件时只能调用 outlook_prepare_email 生成待确认草稿，并请用户口头说“确认发送”或“取消”，切勿声称邮件已发送。"
             f"不要回答“我无法访问你的电脑”或“还在学习中”。"
             f"无论用户使用中文、英文还是中英混合提问，请一律使用自然流畅的简体中文回答（专有名词可保留英文）。"
@@ -270,23 +275,25 @@ class LLMRouter:
         tools: list[ToolDefinition] | None = None,
         executor: ToolExecutor | None = None,
         max_rounds: int = 4,
+        speaker_context: str | None = None,
     ) -> str:
         chosen = provider or self._config.default_provider
         system_prompt = self._build_system_prompt()
+        prompt_text = f"{speaker_context}\n{user_text}" if speaker_context else user_text
         if chosen == "opencode":
             if self._config.providers.opencode.server_url.strip():
-                raw = await self._ask_opencode_v2(system_prompt, user_text)
+                raw = await self._ask_opencode_v2(system_prompt, prompt_text)
             else:
-                raw = await self._ask_opencode_cli(system_prompt, user_text)
+                raw = await self._ask_opencode_cli(system_prompt, prompt_text)
         elif chosen == "codex":
-            raw = await self._ask_codex_cli(system_prompt, self._format_with_history(user_text))
+            raw = await self._ask_codex_cli(system_prompt, self._format_with_history(prompt_text))
         elif chosen == "codex_api":
             raw = await self._ask_codex_api(
-                system_prompt, self._format_with_history(user_text), tools=tools or [], executor=executor, max_rounds=max_rounds
+                system_prompt, self._format_with_history(prompt_text), tools=tools or [], executor=executor, max_rounds=max_rounds
             )
         elif chosen == "gemini_api":
             raw = await self._ask_gemini_api(
-                system_prompt, self._format_with_history(user_text), tools=tools or [], executor=executor, max_rounds=max_rounds
+                system_prompt, self._format_with_history(prompt_text), tools=tools or [], executor=executor, max_rounds=max_rounds
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {chosen}")
@@ -304,18 +311,20 @@ class LLMRouter:
         tools: list[ToolDefinition] | None = None,
         executor: ToolExecutor | None = None,
         max_rounds: int = 4,
+        speaker_context: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield spoken-formatted sentences incrementally as the LLM responds."""
         chosen = provider or self._config.default_provider
         system_prompt = self._build_system_prompt()
+        prompt_text = f"{speaker_context}\n{user_text}" if speaker_context else user_text
         splitter = SentenceStreamBuffer(max_total_chars=self._config.spoken_max_chars)
 
         if chosen == "opencode":
             collected: list[str] = []
             stream_it = (
-                self._stream_opencode_v2(system_prompt, user_text)
+                self._stream_opencode_v2(system_prompt, prompt_text)
                 if self._config.providers.opencode.server_url.strip()
-                else self._stream_opencode_cli(system_prompt, user_text)
+                else self._stream_opencode_cli(system_prompt, prompt_text)
             )
             async for piece in stream_it:
                 for sent in splitter.feed(piece):
@@ -331,7 +340,7 @@ class LLMRouter:
             return
 
         if chosen == "codex_api" and not tools:
-            async for piece in self._stream_codex_api(system_prompt, user_text):
+            async for piece in self._stream_codex_api(system_prompt, prompt_text):
                 for sent in splitter.feed(piece):
                     yield sent
             for sent in splitter.flush():
@@ -339,7 +348,7 @@ class LLMRouter:
             return
 
         if chosen == "gemini_api" and not tools:
-            async for piece in self._stream_gemini_api(system_prompt, user_text):
+            async for piece in self._stream_gemini_api(system_prompt, prompt_text):
                 for sent in splitter.feed(piece):
                     yield sent
             for sent in splitter.flush():
@@ -352,6 +361,7 @@ class LLMRouter:
             tools=tools,
             executor=executor,
             max_rounds=max_rounds,
+            speaker_context=speaker_context,
         )
         for sent in splitter.feed(reply):
             yield sent

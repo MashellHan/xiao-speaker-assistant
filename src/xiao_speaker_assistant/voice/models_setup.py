@@ -19,6 +19,12 @@ EN_KWS_URL = (
     "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2"
 )
 EN_KWS_DIRNAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+SPEAKER_ID_MODEL_FILENAME = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+SPEAKER_ID_MODEL_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+    "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+)
+SPEAKER_ID_MODEL_SHA256 = "e6af4d4c444f3dab01d991bb9b7d5af98eb979e329f6c8880a19d5553561ed25"
 
 
 def sha256_file(path: Path) -> str:
@@ -161,6 +167,24 @@ def download_models(models_dir: Path, keywords: list[str]) -> Path:
         en_dir = find_english_kws_dir(models_dir)
     if en_dir is not None:
         generate_english_keywords_file(en_dir)
+
+    spk_path = models_dir / SPEAKER_ID_MODEL_FILENAME
+    if not spk_path.is_file() or sha256_file(spk_path) != SPEAKER_ID_MODEL_SHA256:
+        print(f"Downloading speaker ID model (~27 MB) to {spk_path}...", flush=True)
+        subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--location",
+                "--progress-bar",
+                SPEAKER_ID_MODEL_URL,
+                "--output",
+                str(spk_path),
+            ],
+            check=True,
+        )
+        if sha256_file(spk_path) != SPEAKER_ID_MODEL_SHA256:
+            raise RuntimeError(f"{SPEAKER_ID_MODEL_FILENAME} SHA-256 mismatch")
 
     print(f"OK: models ready in {models_dir}, keywords generated at {kw_path}")
     return kw_path

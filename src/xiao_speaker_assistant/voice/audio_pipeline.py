@@ -24,6 +24,7 @@ from xiao_speaker_assistant.voice.models_setup import (
     generate_english_keywords_file,
     generate_keywords_file,
 )
+from xiao_speaker_assistant.voice.speaker_id import SpeakerIdentifier
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ _PINYIN_FIRST = {"hai", "cai", "kai", "ai", "tai", "sai", "hei", "ha", "a", "che
 _PINYIN_SECOND = {"nuo", "na", "luo", "no", "nao", "lao"}
 _PINYIN_THIRD = {"mi", "min", "mei", "ming"}
 _NON_ZH_EN_HALLUCINATION_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff]")
+_WAKE_HOMOPHONE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("诺米诺米", "糯米糯米"),
+    ("糯米诺米", "糯米糯米"),
+    ("诺米糯米", "糯米糯米"),
+)
 
 
 def extract_record_pcm_from_binary(raw_bytes: bytes) -> bytes | None:
@@ -139,11 +145,35 @@ class DynamicAGC:
 def match_wakeup_phrase(
     text: str, extra_keywords: list[str] | None = None
 ) -> tuple[str, str] | None:
-    """Match `Hi Nomi` or punctuation-tolerant Chinese wake keywords (e.g. 你好，管家。)."""
+    """Match `Hi Nomi` or punctuation-tolerant Chinese wake keywords (e.g. 糯米，糯米 / 你好，管家。)."""
     stripped = text.strip()
     if not stripped:
         return None
 
+    # 1. Check explicit configured keywords & reduplicated homophones first so e.g.
+    # "糯米糯米" is never partially consumed by the bare `糯米` branch of HI_NOMI_REGEX.
+    norm_chars: list[tuple[int, str]] = []
+    for idx, ch in enumerate(stripped):
+        if ch not in " ,，、.。!！?？:：~～":
+            norm_chars.append((idx, ch.lower()))
+    norm_str = "".join(c for _, c in norm_chars)
+
+    for kw in extra_keywords or []:
+        clean_kw = re.sub(r"[ ,，、.。!！?？:：~～]+", "", kw.strip().lower())
+        if not clean_kw:
+            continue
+        if norm_str.startswith(clean_kw):
+            last_orig_idx = norm_chars[len(clean_kw) - 1][0]
+            rest = stripped[last_orig_idx + 1 :].strip(" ,，、.。!！?？:：~～")
+            return clean_kw, rest
+
+    for alias_prefix, canonical_kw in _WAKE_HOMOPHONE_PREFIXES:
+        if norm_str.startswith(alias_prefix):
+            last_orig_idx = norm_chars[len(alias_prefix) - 1][0]
+            rest = stripped[last_orig_idx + 1 :].strip(" ,，、.。!！?？:：~～")
+            return canonical_kw, rest
+
+    # 2. Match English/mixed Hi Nomi variants and 3-syllable pinyin approximations.
     m = HI_NOMI_REGEX.match(stripped)
     if m:
         rest = (m.group(1) or "").strip(" ，,。.!！？:：")
@@ -163,22 +193,6 @@ def match_wakeup_phrase(
             cut = cjk_chars[-1][0] + 1
             rest = stripped[cut:].strip(" ，,。.!！？:：")
             return "hi nomi", rest
-
-    # Punctuation-tolerant Chinese keyword prefix match (handles "你好，管家。" from SenseVoice ITN).
-    norm_chars: list[tuple[int, str]] = []
-    for idx, ch in enumerate(stripped):
-        if ch not in " ,，.。!！?？:：":
-            norm_chars.append((idx, ch.lower()))
-    norm_str = "".join(c for _, c in norm_chars)
-
-    for kw in extra_keywords or []:
-        clean_kw = re.sub(r"[ ,，.。!！?？:：]+", "", kw.strip().lower())
-        if not clean_kw:
-            continue
-        if norm_str.startswith(clean_kw):
-            last_orig_idx = norm_chars[len(clean_kw) - 1][0]
-            rest = stripped[last_orig_idx + 1 :].strip(" ，,。.!！？:：")
-            return clean_kw, rest
     return None
 
 
@@ -316,6 +330,32 @@ class LocalSpeechPipeline:
             if config.agc_enabled
             else None
         )
+        self._speaker_id: SpeakerIdentifier | None = self._init_speaker_identifier(
+            models_dir, config
+        )
+
+    @staticmethod
+    def _init_speaker_identifier(
+        models_dir: Path, config: SpeechConfig
+    ) -> SpeakerIdentifier | None:
+        if not config.speaker_id_enabled:
+            return None
+        model_path = Path(config.speaker_id_model).expanduser()
+        if not model_path.is_absolute():
+            model_path = models_dir / model_path
+        if not model_path.exists():
+            logger.warning(
+                "Speaker ID enabled but model not found at %s; skipping voiceprint extraction",
+                model_path,
+            )
+            return None
+        try:
+            ident = SpeakerIdentifier(model_path, sample_rate=SAMPLE_RATE)
+            logger.info("Local speaker voiceprint model loaded (%s, dim=%d)", model_path.name, ident.dim)
+            return ident
+        except Exception as exc:
+            logger.warning("Failed to load speaker ID model %s: %s", model_path, exc)
+            return None
 
     def set_muted(self, muted: bool) -> None:
         with self._lock:
@@ -452,12 +492,20 @@ class LocalSpeechPipeline:
             else:
                 self._aec = None
 
+            if (
+                new_config.speaker_id_enabled != old_cfg.speaker_id_enabled
+                or new_config.speaker_id_model != old_cfg.speaker_id_model
+                or new_config.models_dir != old_cfg.models_dir
+            ):
+                self._speaker_id = self._init_speaker_identifier(models_dir, new_config)
+
     def feed_pcm(
         self,
         pcm_bytes: bytes,
         *,
         on_wakeup: Callable[[str], None] | None = None,
         on_utterance: Callable[[str], None] | None = None,
+        on_utterance_embedding: Callable[[str, list[float] | None], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
         on_barge_in_wakeup: Callable[[str], None] | None = None,
@@ -467,6 +515,7 @@ class LocalSpeechPipeline:
                 pcm_bytes,
                 on_wakeup=on_wakeup,
                 on_utterance=on_utterance,
+                on_utterance_embedding=on_utterance_embedding,
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
                 on_barge_in_wakeup=on_barge_in_wakeup,
@@ -478,6 +527,7 @@ class LocalSpeechPipeline:
         *,
         on_wakeup: Callable[[str], None] | None = None,
         on_utterance: Callable[[str], None] | None = None,
+        on_utterance_embedding: Callable[[str, list[float] | None], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
         on_barge_in_wakeup: Callable[[str], None] | None = None,
@@ -614,6 +664,21 @@ class LocalSpeechPipeline:
             if not text:
                 continue
 
+            emb_list: list[float] | None = None
+            if self._speaker_id is not None:
+                try:
+                    emb = self._speaker_id.extract_embedding(segment)
+                    if emb is not None:
+                        emb_list = [round(float(x), 6) for x in emb.tolist()]
+                except Exception as exc:
+                    logger.debug("Voiceprint extraction failed: %s", exc)
+
+            def _emit_utterance(utterance_text: str) -> None:
+                if on_utterance_embedding is not None:
+                    on_utterance_embedding(utterance_text, emb_list)
+                elif on_utterance is not None:
+                    on_utterance(utterance_text)
+
             if not self.awake:
                 matched = match_wakeup_phrase(text, self._config.local_keywords)
                 if not matched:
@@ -623,14 +688,12 @@ class LocalSpeechPipeline:
                 logger.info("ASR wake matched (%s): %s", wake_label, text)
                 self.set_awake(True)
                 if rest:
-                    if on_utterance:
-                        on_utterance(rest)
+                    _emit_utterance(rest)
                 elif on_wakeup:
                     on_wakeup(wake_label)
             else:
                 self._last_active_at = time.monotonic()
-                if on_utterance:
-                    on_utterance(text)
+                _emit_utterance(text)
 
     def _transcribe(self, samples: list[float] | np.ndarray) -> str:
         if self._cloud_asr is not None:
