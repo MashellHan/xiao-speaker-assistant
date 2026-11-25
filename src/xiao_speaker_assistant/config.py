@@ -86,7 +86,7 @@ class SpeechConfig(BaseModel):
 
 class OpencodeCliConfig(BaseModel):
     binary: str = "opencode"
-    model: str = "raven/gemini-4-hydrogen"
+    model: str = "raven/gemini-4-hydrogen#low"
     timeout_sec: float = 45.0
     auto_approve: bool = True
     server_url: str = "http://127.0.0.1:4396"

@@ -119,6 +119,16 @@ def load_or_create_mcp_token(agent_home: Path) -> str:
     return _load_or_create_token_file(agent_home, "mcp.token")
 
 
+def load_or_create_console_password(
+    agent_home: Path, password_env: str = "XSA_CONSOLE_PASSWORD"
+) -> str:
+    """Read remote Web Console password from env, or persist/reuse a `0600` token file."""
+    env_pw = read_env_secret(password_env)
+    if env_pw:
+        return env_pw
+    return _load_or_create_token_file(agent_home, "console.token")
+
+
 def _load_or_create_token_file(agent_home: Path, filename: str) -> str:
     agent_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(agent_home, 0o700)

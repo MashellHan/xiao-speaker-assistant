@@ -167,6 +167,7 @@ def test_llm_router_opencode_v2_streams_sse_and_recovers_stale_session(tmp_path:
             assert created_sessions[0]["model"] == {
                 "providerID": "raven",
                 "id": "gemini-4-hydrogen",
+                "variant": "low",
             }
 
             # Second turn triggers simulated 404 on ses_1 and transparently recreates ses_2

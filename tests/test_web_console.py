@@ -248,7 +248,7 @@ def test_web_console_endpoints_settings_memories_and_mcp_auth(tmp_path: Path, mo
                 ov = await client.get(f"{base}/api/overview")
                 assert ov.status_code == 200
                 ov_data = ov.json()
-                assert ov_data["model"] == "raven/gemini-4-hydrogen"
+                assert ov_data["model"] == "raven/gemini-4-hydrogen#low"
                 assert ov_data["voice"] == "zh-CN-XiaoxiaoNeural"
                 assert ov_data["asr_model"] == "paraformer"
                 assert ov_data["aec_enabled"] is True
@@ -432,7 +432,7 @@ def test_write_api_rejects_non_loopback_without_bearer(tmp_path: Path) -> None:
                 return {"model": "raven/gpt-5.4-nano"}
 
         resp_denied = await handler(RemoteReqProxy(remote_req))
-        assert resp_denied.status == 403
+        assert resp_denied.status in (401, 403)
 
         auth_req = make_mocked_request(
             "POST",
@@ -520,3 +520,118 @@ def test_cli_serve_records_history_on_handle_query_and_stream_query(tmp_path: Pa
     assert entries[1].query == "你好"
     assert entries[1].reply == "回答：你好"
     assert captured_handlers["mcp_server"].history_store is recorded_store  # type: ignore[attr-defined]
+
+
+def test_voice_model_switching_and_remote_tunnel_login_gate(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "llm:\n  providers:\n    opencode:\n      model: raven/gemini-4-hydrogen#low\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.llm.providers.opencode.model == "raven/gemini-4-hydrogen#low"
+
+    model_changes: list[str] = []
+    srv = McpServer(
+        cfg,
+        config_path=cfg_path,
+        on_model_changed=lambda m: model_changes.append(m),
+        include_local_tools=True,
+    )
+
+    # 1. Voice MCP tools: speaker_list_models + speaker_set_model("gpt 6.2")
+    list_res = asyncio.run(
+        srv.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "speaker_list_models", "arguments": {}}}
+        )
+    )
+    assert list_res is not None
+    list_data = json.loads(list_res["result"]["content"][0]["text"])
+    assert list_data["current_model"] == "raven/gemini-4-hydrogen#low"
+
+    set_res = asyncio.run(
+        srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "speaker_set_model", "arguments": {"model": "gpt 6.2"}},
+            }
+        )
+    )
+    assert set_res is not None and set_res["result"]["isError"] is False
+    set_data = json.loads(set_res["result"]["content"][0]["text"])
+    assert set_data["model"] == "raven/gpt-6.2-sol#low"
+    assert model_changes == ["raven/gpt-6.2-sol#low"]
+    assert load_config(cfg_path).llm.providers.opencode.model == "raven/gpt-6.2-sol#low"
+
+    # 2. Remote proxy / Cloudflare Tunnel auth gate + /mcp isolation
+    async def run_http() -> None:
+        runner, port = await srv.start_http_server(
+            host="127.0.0.1",
+            port=0,
+            auth_token="mcp-secret-token",
+            console_password="remote-console-password",
+        )
+        base = f"http://127.0.0.1:{port}"
+        tunnel_headers = {"Host": "nomi.mxhan.com", "CF-Connecting-IP": "198.51.100.2"}
+        try:
+            async with httpx.AsyncClient() as client:
+                # /mcp rejects any proxied request even with valid Bearer token
+                mcp_proxied = await client.post(
+                    f"{base}/mcp",
+                    headers={**tunnel_headers, "Authorization": "Bearer mcp-secret-token"},
+                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                )
+                assert mcp_proxied.status_code == 403
+
+                # /api/overview requires login when accessed through Cloudflare / proxy headers
+                auth_status = await client.get(f"{base}/api/auth/status", headers=tunnel_headers)
+                assert auth_status.status_code == 200
+                assert auth_status.json()["authenticated"] is False
+                assert auth_status.json()["auth_required"] is True
+
+                unauth_ov = await client.get(f"{base}/api/overview", headers=tunnel_headers)
+                assert unauth_ov.status_code == 401
+
+                # Wrong password fails with 401, then valid login unlocks with HttpOnly cookie
+                bad_login = await client.post(
+                    f"{base}/api/login",
+                    headers=tunnel_headers,
+                    json={"password": "wrong"},
+                )
+                assert bad_login.status_code == 401
+
+                ok_login = await client.post(
+                    f"{base}/api/login",
+                    headers=tunnel_headers,
+                    json={"password": "remote-console-password"},
+                )
+                assert ok_login.status_code == 200
+                assert "xsa_console_session" in ok_login.cookies
+
+                # HTTPS proxy sets Secure cookie flag
+                https_login = await client.post(
+                    f"{base}/api/login",
+                    headers={**tunnel_headers, "X-Forwarded-Proto": "https"},
+                    json={"password": "remote-console-password"},
+                )
+                assert https_login.status_code == 200
+                assert "Secure" in https_login.headers.get("set-cookie", "")
+
+                authed_ov = await client.get(
+                    f"{base}/api/overview",
+                    headers=tunnel_headers,
+                    cookies={"xsa_console_session": ok_login.cookies["xsa_console_session"]},
+                )
+                assert authed_ov.status_code == 200
+                assert authed_ov.json()["model"] == "raven/gpt-6.2-sol#low"
+
+                # Logout clears session cookie
+                await client.post(f"{base}/api/logout", headers=tunnel_headers)
+                after_logout = await client.get(f"{base}/api/overview", headers=tunnel_headers)
+                assert after_logout.status_code == 401
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run_http())

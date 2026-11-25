@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
@@ -63,18 +66,51 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "xiao-speaker-assistant", "version": "0.1.0"}
 
 AVAILABLE_MODELS: tuple[dict[str, str], ...] = (
-    {"id": "raven/gemini-4-hydrogen#medium", "label": "Gemini 4 Hydrogen · Medium (推荐均衡)"},
-    {"id": "raven/gemini-4-hydrogen#low", "label": "Gemini 4 Hydrogen · Low (低延迟)"},
-    {"id": "raven/gemini-4-hydrogen", "label": "Gemini 4 Hydrogen (默认)"},
-    {"id": "raven/gpt-6.1-sol#medium", "label": "GPT-6.1 Sol · Medium (约3.2s)"},
-    {"id": "raven/gpt-6.1-sol#low", "label": "GPT-6.1 Sol · Low (约2.9s)"},
-    {"id": "raven/gpt-6.1-sol", "label": "GPT-6.1 Sol (默认)"},
-    {"id": "raven/gpt-5.6-sol-fast", "label": "GPT-5.6 Sol Fast (约2.4s)"},
-    {"id": "raven/gpt-5.4-nano", "label": "GPT-5.4 Nano (极速)"},
+    {"id": "raven/gemini-4-hydrogen#low", "label": "Gemini 4 Hydrogen · Low (默认低延迟 · ~2.5s)"},
+    {"id": "raven/gemini-4-hydrogen#medium", "label": "Gemini 4 Hydrogen · Medium"},
+    {"id": "raven/gpt-6.2-sol#low", "label": "GPT-6.2 Sol · Low (稳健推荐 · ~2.85s)"},
+    {"id": "raven/gpt-6.2-sol#medium", "label": "GPT-6.2 Sol · Medium (~3.5s)"},
+    {"id": "raven/gpt-6.1-sol#low", "label": "GPT-6.1 Sol · Low"},
+    {"id": "raven/gpt-6.1-sol#medium", "label": "GPT-6.1 Sol · Medium"},
+    {"id": "raven/gpt-5.6-sol-fast", "label": "GPT-5.6 Sol Fast (~2.4s)"},
+    {"id": "raven/gpt-5.4-nano", "label": "GPT-5.4 Nano (极速 ~1.5s)"},
 )
+MODEL_ALIASES: dict[str, str] = {
+    "hydrogen": "raven/gemini-4-hydrogen#low",
+    "hydrogen low": "raven/gemini-4-hydrogen#low",
+    "hydrogen低": "raven/gemini-4-hydrogen#low",
+    "默认": "raven/gemini-4-hydrogen#low",
+    "氢": "raven/gemini-4-hydrogen#low",
+    "hydrogen medium": "raven/gemini-4-hydrogen#medium",
+    "hydrogen中": "raven/gemini-4-hydrogen#medium",
+    "gpt": "raven/gpt-6.2-sol#low",
+    "sol": "raven/gpt-6.2-sol#low",
+    "gpt6.2": "raven/gpt-6.2-sol#low",
+    "gpt 6.2": "raven/gpt-6.2-sol#low",
+    "6.2": "raven/gpt-6.2-sol#low",
+    "gpt6.2 low": "raven/gpt-6.2-sol#low",
+    "gpt6.2 medium": "raven/gpt-6.2-sol#medium",
+    "gpt 6.2 medium": "raven/gpt-6.2-sol#medium",
+    "gpt6.1": "raven/gpt-6.1-sol#low",
+    "gpt 6.1": "raven/gpt-6.1-sol#low",
+    "6.1": "raven/gpt-6.1-sol#low",
+    "gpt6.1 medium": "raven/gpt-6.1-sol#medium",
+    "sol fast": "raven/gpt-5.6-sol-fast",
+    "fast": "raven/gpt-5.6-sol-fast",
+    "nano": "raven/gpt-5.4-nano",
+    "极速": "raven/gpt-5.4-nano",
+}
 _MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:#[A-Za-z0-9._-]+)?$")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+_PROXY_HEADER_NAMES = (
+    "CF-Connecting-IP",
+    "CF-Ray",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "Forwarded",
+)
+_CONSOLE_COOKIE_NAME = "xsa_console_session"
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -435,6 +471,30 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["name_or_id"],
         },
     },
+    {
+        "name": "speaker_list_models",
+        "description": "List available LLM chat models (e.g. Gemini 4 Hydrogen, GPT-6.2 Sol, GPT-5.4 Nano) and the currently active model.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "speaker_set_model",
+        "description": (
+            "Switch the active LLM conversation model immediately by model ID or friendly alias "
+            "(e.g. 'gpt', 'gpt 6.2', 'hydrogen', 'nano', 'raven/gpt-6.2-sol#low'), "
+            "optionally persisting to config.yaml."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "string",
+                    "description": "Model ID or alias such as 'gpt', 'gpt 6.2', 'hydrogen', 'nano', or 'raven/gpt-6.2-sol#low'",
+                },
+                "persist": {"type": "boolean", "default": True},
+            },
+            "required": ["model"],
+        },
+    },
 ]
 
 ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [*TOOL_DEFINITIONS, *LOCAL_TOOL_DEFINITIONS]
@@ -455,6 +515,7 @@ class McpServer:
         reminder_store: ReminderStore | None = None,
         speaker_store: SpeakerProfileStore | None = None,
         history_store: ConversationHistoryStore | None = None,
+        console_password: str | None = None,
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
         on_model_changed: Callable[[str], None] | None = None,
@@ -483,6 +544,7 @@ class McpServer:
             self._config.speech.speaker_profiles_file
         )
         self.history_store = history_store or ConversationHistoryStore()
+        self._console_password = console_password
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
         self._on_model_changed = on_model_changed
@@ -634,6 +696,10 @@ class McpServer:
             return self._ok(req_id, self._call_speaker_update_voiceprint(args))
         if name == "speaker_delete_voiceprint":
             return self._ok(req_id, self._call_speaker_delete_voiceprint(args))
+        if name == "speaker_list_models":
+            return self._ok(req_id, self._call_speaker_list_models())
+        if name == "speaker_set_model":
+            return self._ok(req_id, await self._call_speaker_set_model(args))
         return self._error(req_id, -32602, f"Unknown tool: {name}")
 
     async def _call_outlook_list_emails(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1402,15 +1468,58 @@ class McpServer:
         removed = self.speaker_store.delete_profile(target)
         return self._tool_result({"removed": removed, "name_or_id": target})
 
-    @staticmethod
-    def _validate_model_ref(raw_model: str) -> str:
+    @classmethod
+    def _validate_model_ref(cls, raw_model: str) -> str:
         cleaned = raw_model.strip()
+        lowered = re.sub(r"\s+", " ", cleaned.lower())
+        if lowered in MODEL_ALIASES:
+            return MODEL_ALIASES[lowered]
+        compact = lowered.replace(" ", "")
+        if compact in MODEL_ALIASES:
+            return MODEL_ALIASES[compact]
         if not cleaned or len(cleaned) > 120 or not _MODEL_REF_RE.fullmatch(cleaned):
             raise ValueError(
-                f"Invalid model {raw_model!r}; expected format 'provider/model[#variant]', "
-                "e.g. 'raven/gemini-4-hydrogen#medium'."
+                f"Invalid model {raw_model!r}; expected 'provider/model[#variant]' or alias like 'gpt', 'gpt 6.2', 'hydrogen', 'nano'."
             )
         return cleaned
+
+    def _call_speaker_list_models(self) -> dict[str, Any]:
+        return self._tool_result(
+            {
+                "current_model": self._config.llm.providers.opencode.model,
+                "models": list(AVAILABLE_MODELS),
+            }
+        )
+
+    async def _call_speaker_set_model(self, args: dict[str, Any]) -> dict[str, Any]:
+        raw_model = str(args.get("model") or "").strip()
+        persist = bool(args.get("persist", True))
+        try:
+            new_model = self._validate_model_ref(raw_model)
+        except ValueError as exc:
+            return self._tool_result(
+                {"error": "invalid_model", "message": str(exc)},
+                is_error=True,
+            )
+
+        self._config.llm.providers.opencode.model = new_model
+        if persist:
+            await asyncio.to_thread(
+                persist_runtime_settings,
+                self._config_path,
+                model=new_model,
+            )
+        if self._on_model_changed is not None:
+            self._on_model_changed(new_model)
+        label = next((m["label"] for m in AVAILABLE_MODELS if m["id"] == new_model), new_model)
+        return self._tool_result(
+            {
+                "status": "updated",
+                "model": new_model,
+                "label": label,
+                "persisted": persist,
+            }
+        )
 
     @staticmethod
     def _parse_memory_payload(body: dict[str, Any]) -> tuple[str, str, str]:
@@ -1685,10 +1794,77 @@ class McpServer:
         port: int = 4397,
         *,
         auth_token: str | None = None,
+        console_password: str | None = None,
     ) -> tuple[web.AppRunner, int]:
         """Start an in-process Streamable-HTTP MCP endpoint on `/mcp` and Web Console on `/`."""
+        effective_console_password = (
+            console_password if console_password is not None else self._console_password
+        )
+        session_secret = hashlib.sha256(
+            (effective_console_password or auth_token or secrets.token_hex(32)).encode("utf-8")
+        ).digest()
+        login_failures: dict[str, list[float]] = {}
+
+        def _extract_hostname(host_header: str) -> str:
+            val = host_header.strip().lower()
+            if val.startswith("["):
+                end = val.find("]")
+                return val[1:end] if end != -1 else val
+            return val.split(":", 1)[0]
+
+        def _is_direct_local_request(request: web.Request) -> bool:
+            remote = (request.remote or "").strip()
+            if remote not in _LOOPBACK_REMOTES:
+                return False
+            if any(request.headers.get(h) for h in _PROXY_HEADER_NAMES):
+                return False
+            host_header = request.headers.get("Host", "")
+            if host_header and _extract_hostname(host_header) not in _LOOPBACK_HOSTS:
+                return False
+            return True
+
+        def _make_session_cookie(ttl_sec: int = 7 * 86400) -> str:
+            exp = str(int(time.time()) + ttl_sec)
+            sig = hmac.new(session_secret, exp.encode("ascii"), hashlib.sha256).hexdigest()
+            return f"{exp}.{sig}"
+
+        def _verify_session_cookie(raw_cookie: str) -> bool:
+            if "." not in raw_cookie:
+                return False
+            exp_str, sig = raw_cookie.split(".", 1)
+            if not exp_str.isdigit():
+                return False
+            if int(exp_str) < int(time.time()):
+                return False
+            expected = hmac.new(session_secret, exp_str.encode("ascii"), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(sig, expected)
+
+        def _has_valid_console_auth(request: web.Request) -> bool:
+            if _is_direct_local_request(request):
+                return True
+            cookies = getattr(request, "cookies", {}) or {}
+            cookie_val = cookies.get(_CONSOLE_COOKIE_NAME, "")
+            if cookie_val and _verify_session_cookie(cookie_val):
+                return True
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                supplied = auth_header[7:].strip()
+                if effective_console_password and hmac.compare_digest(
+                    supplied, effective_console_password
+                ):
+                    return True
+                if auth_token and hmac.compare_digest(supplied, auth_token):
+                    return True
+            return False
 
         def _check_security(request: web.Request) -> web.Response | None:
+            # Reject proxy-forwarded or non-loopback requests on /mcp so tunnels (e.g. cloudflared)
+            # exposing the Web Console never expose internal MCP tool execution.
+            if not _is_direct_local_request(request):
+                return web.json_response(
+                    {"error": "forbidden", "message": "MCP endpoint is local-only"},
+                    status=403,
+                )
             # Reject any browser cross-origin / no-cors simple requests immediately.
             if request.headers.get("Origin"):
                 return web.json_response(
@@ -1710,28 +1886,33 @@ class McpServer:
                     )
             return None
 
+        def _check_console_read_security(request: web.Request) -> web.Response | None:
+            if not _has_valid_console_auth(request):
+                return web.json_response(
+                    {"error": "unauthorized", "message": "Console login required"},
+                    status=401,
+                )
+            return None
+
         def _check_console_write_security(request: web.Request) -> web.Response | None:
             origin = request.headers.get("Origin")
             if origin:
-                parsed = urlparse(origin)
-                if (parsed.hostname or "").lower() not in _LOOPBACK_HOSTS:
+                origin_host = (urlparse(origin).hostname or "").lower()
+                req_host = _extract_hostname(request.headers.get("Host", ""))
+                allowed_hosts = set(_LOOPBACK_HOSTS)
+                if req_host:
+                    allowed_hosts.add(req_host)
+                if origin_host not in allowed_hosts:
                     return web.json_response(
                         {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
                         status=403,
                     )
-            remote = (request.remote or "").strip()
-            if remote in _LOOPBACK_REMOTES:
-                return None
-            if auth_token:
-                auth_header = request.headers.get("Authorization", "")
-                if auth_header.startswith("Bearer ") and hmac.compare_digest(
-                    auth_header[7:].strip(), auth_token
-                ):
-                    return None
-            return web.json_response(
-                {"error": "forbidden", "message": "Write API is restricted to loopback or Bearer token"},
-                status=403,
-            )
+            if not _has_valid_console_auth(request):
+                return web.json_response(
+                    {"error": "unauthorized", "message": "Console login required"},
+                    status=401,
+                )
+            return None
 
         async def handle_mcp_post(request: web.Request) -> web.Response:
             denied = _check_security(request)
@@ -1779,12 +1960,95 @@ class McpServer:
                 text=load_console_html(),
                 content_type="text/html",
                 charset="utf-8",
+                headers={"Cache-Control": "no-store"},
             )
 
-        async def handle_api_overview(_request: web.Request) -> web.Response:
+        async def handle_api_auth_status(request: web.Request) -> web.Response:
+            is_local = _is_direct_local_request(request)
+            authed = _has_valid_console_auth(request)
+            return web.json_response(
+                {
+                    "authenticated": authed,
+                    "auth_required": not is_local,
+                    "is_local": is_local,
+                }
+            )
+
+        async def handle_api_login(request: web.Request) -> web.Response:
+            origin = request.headers.get("Origin")
+            if origin:
+                origin_host = (urlparse(origin).hostname or "").lower()
+                req_host = _extract_hostname(request.headers.get("Host", ""))
+                allowed_hosts = set(_LOOPBACK_HOSTS)
+                if req_host:
+                    allowed_hosts.add(req_host)
+                if origin_host not in allowed_hosts:
+                    return web.json_response(
+                        {"error": "forbidden", "message": "Cross-origin login is not allowed"},
+                        status=403,
+                    )
+            if not effective_console_password:
+                return web.json_response(
+                    {"error": "auth_unavailable", "message": "Console remote password is not configured"},
+                    status=503,
+                )
+            client_key = (
+                request.headers.get("CF-Connecting-IP")
+                or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                or (request.remote or "unknown")
+            )
+            now = time.monotonic()
+            recent = [t for t in login_failures.get(client_key, []) if (now - t) < 60.0]
+            if len(recent) >= 5:
+                login_failures[client_key] = recent
+                return web.json_response(
+                    {"error": "rate_limited", "message": "尝试次数过多，请 1 分钟后再试"},
+                    status=429,
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            supplied = str(body.get("password") or "").strip() if isinstance(body, dict) else ""
+            if not supplied or not hmac.compare_digest(supplied, effective_console_password):
+                recent.append(now)
+                login_failures[client_key] = recent
+                return web.json_response(
+                    {"error": "invalid_password", "message": "访问口令错误"},
+                    status=401,
+                )
+            login_failures.pop(client_key, None)
+            resp = web.json_response({"authenticated": True})
+            is_https = (
+                request.secure
+                or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            )
+            resp.set_cookie(
+                _CONSOLE_COOKIE_NAME,
+                _make_session_cookie(),
+                max_age=7 * 86400,
+                path="/",
+                httponly=True,
+                samesite="Lax",
+                secure=is_https,
+            )
+            return resp
+
+        async def handle_api_logout(_request: web.Request) -> web.Response:
+            resp = web.json_response({"authenticated": False})
+            resp.del_cookie(_CONSOLE_COOKIE_NAME, path="/")
+            return resp
+
+        async def handle_api_overview(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
             return web.json_response(self._build_overview_payload())
 
         async def handle_api_history_get(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
             raw_limit = request.query.get("limit", "50")
             try:
                 limit = max(1, min(500, int(raw_limit)))
@@ -1808,6 +2072,9 @@ class McpServer:
             return web.json_response({"cleared": cleared, "stats": self.history_store.stats()})
 
         async def handle_api_memories_get(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
             q = request.query.get("q", "")
             raw_limit = request.query.get("limit", "100")
             try:
@@ -1924,7 +2191,10 @@ class McpServer:
                 }
             )
 
-        async def handle_api_voiceprints_get(_request: web.Request) -> web.Response:
+        async def handle_api_voiceprints_get(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
             items = self._read_voiceprints()
             return web.json_response({"voiceprints": items, "count": len(items)})
 
@@ -1938,7 +2208,10 @@ class McpServer:
                 return web.json_response({"error": "not_found", "removed": False, "id": vp_id}, status=404)
             return web.json_response({"removed": True, "id": vp_id})
 
-        async def handle_api_reminders_get(_request: web.Request) -> web.Response:
+        async def handle_api_reminders_get(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
             items = self._read_reminders()
             return web.json_response({"reminders": items, "count": len(items)})
 
@@ -1949,6 +2222,9 @@ class McpServer:
         app.router.add_get("/health", handle_health)
 
         app.router.add_get("/", handle_console_index)
+        app.router.add_get("/api/auth/status", handle_api_auth_status)
+        app.router.add_post("/api/login", handle_api_login)
+        app.router.add_post("/api/logout", handle_api_logout)
         app.router.add_get("/api/overview", handle_api_overview)
         app.router.add_get("/api/history", handle_api_history_get)
         app.router.add_delete("/api/history", handle_api_history_delete)
