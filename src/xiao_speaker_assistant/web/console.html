@@ -374,6 +374,10 @@
       font-weight: 600;
     }
 
+    .sidebar-footer span {
+      overflow-wrap: anywhere;
+    }
+
     /* Mobile Tab Bar (visible <= 860px) */
     .mobile-tabs {
       display: none;
@@ -485,32 +489,7 @@
       overflow-wrap: anywhere;
     }
 
-    /* Collapsible Group Card (Astryx ConnectedAccountsTemplate pattern) */
-    .group-trigger {
-      width: 100%;
-      padding: var(--spacing-4) var(--spacing-5);
-      border: 0;
-      background: transparent;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--spacing-3);
-      cursor: pointer;
-      text-align: left;
-      transition: background-color var(--dur-fast) var(--ease-out);
-    }
-
-    .group-trigger:hover {
-      background: var(--color-surface-hover);
-    }
-
-    .group-trigger-left {
-      display: flex;
-      align-items: center;
-      gap: var(--spacing-3);
-      min-width: 0;
-    }
-
+    /* Collapsible Group Summary (Astryx ConnectedAccountsTemplate pattern) */
     .group-trigger-right {
       display: flex;
       align-items: center;
@@ -532,17 +511,6 @@
       font-size: var(--text-sm);
       font-weight: 600;
       color: var(--color-text-primary);
-    }
-
-    .chevron {
-      width: 16px;
-      height: 16px;
-      color: var(--color-text-tertiary);
-      transition: transform var(--dur-fast) var(--ease-out);
-    }
-
-    .group-trigger[aria-expanded="false"] .chevron {
-      transform: rotate(-90deg);
     }
 
     .group-body {
@@ -815,6 +783,10 @@
       font-size: var(--text-sm);
       font-weight: 500;
       color: var(--color-text-primary);
+      overflow-wrap: anywhere;
+    }
+
+    #runtimeSpecList .info-row-label {
       white-space: nowrap;
       flex-shrink: 0;
     }
@@ -1056,6 +1028,7 @@
       position: fixed;
       right: var(--spacing-5);
       bottom: var(--spacing-5);
+      max-width: min(420px, calc(100% - var(--spacing-8)));
       z-index: var(--z-toast);
       background: var(--color-text-primary);
       color: var(--color-surface);
@@ -1167,10 +1140,10 @@
 
   <!-- Mobile Navigation -->
   <nav class="mobile-tabs" id="mobileTabsBar" role="tablist" aria-label="控制台导航" hidden>
-    <button type="button" class="mobile-tab" role="tab" aria-selected="true" data-tab="overview">概览与配置</button>
-    <button type="button" class="mobile-tab" role="tab" aria-selected="false" data-tab="history">对话历史</button>
-    <button type="button" class="mobile-tab" role="tab" aria-selected="false" data-tab="capabilities">能力与服务</button>
-    <button type="button" class="mobile-tab" role="tab" aria-selected="false" data-tab="memory">记忆与成员</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview">概览与配置</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-history" aria-selected="false" data-tab="history">对话历史</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">能力与服务</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-memory" aria-selected="false" data-tab="memory">记忆与成员</button>
   </nav>
 
   <!-- Remote Login Gate -->
@@ -1544,7 +1517,9 @@
         const data = await resp.json().catch(() => ({}));
         if (resp.status === 401 && url !== "/api/login" && url !== "/api/auth/status") {
           showLoginGate("登录状态已过期，请重新验证");
-          throw new Error(data.message || "需要登录");
+          const err = new Error(data.message || "需要登录");
+          err.status = 401;
+          throw err;
         }
         if (!resp.ok) {
           throw new Error(data.message || data.error || `HTTP ${resp.status}`);
@@ -1921,15 +1896,22 @@
           renderReminders(reminders);
           $("serverStatus").className = "badge badge--success";
           $("serverStatusText").textContent = "已连接";
+          return true;
         } catch (err) {
+          if (err && err.status === 401) {
+            return false;
+          }
           $("serverStatus").className = "badge badge--error";
           $("serverStatusText").textContent = "连接异常";
           showToast(`加载失败：${err.message}`, true);
+          return false;
         }
       }
 
-      $("refreshBtn").addEventListener("click", () => {
-        loadAll().then(() => showToast("已刷新实时状态"));
+      $("refreshBtn").addEventListener("click", async () => {
+        if (await loadAll()) {
+          showToast("已刷新实时状态");
+        }
       });
 
       $("settingsForm").addEventListener("submit", async (e) => {
