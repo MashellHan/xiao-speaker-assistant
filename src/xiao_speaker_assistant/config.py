@@ -191,6 +191,53 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     return AppConfig.model_validate(data)
 
 
+def persist_runtime_settings(
+    config_path: str | Path | None,
+    *,
+    model: str | None = None,
+    edge_voice: str | None = None,
+    edge_rate: str | None = None,
+) -> Path:
+    """Atomically update selected runtime fields in `config.yaml` while preserving other sections."""
+    target = Path(config_path) if config_path else Path("config.yaml")
+    data: dict = {}
+    if target.exists():
+        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            data = loaded
+
+    if edge_voice is not None or edge_rate is not None:
+        speaker = data.setdefault("speaker", {})
+        if not isinstance(speaker, dict):
+            speaker = {}
+            data["speaker"] = speaker
+        if edge_voice is not None:
+            speaker["edge_voice"] = edge_voice
+        if edge_rate is not None:
+            speaker["edge_rate"] = edge_rate
+
+    if model is not None:
+        llm = data.setdefault("llm", {})
+        if not isinstance(llm, dict):
+            llm = {}
+            data["llm"] = llm
+        providers = llm.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            llm["providers"] = providers
+        opencode = providers.setdefault("opencode", {})
+        if not isinstance(opencode, dict):
+            opencode = {}
+            providers["opencode"] = opencode
+        opencode["model"] = model
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    os.replace(tmp, target)
+    return target
+
+
 def read_env_secret(env_name: str) -> str | None:
     value = os.environ.get(env_name, "").strip()
     return value or None

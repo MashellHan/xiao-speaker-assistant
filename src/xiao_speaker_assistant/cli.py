@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from xiao_speaker_assistant.llm.opencode_server import load_or_create_mcp_token
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import (
     ConfirmationStore,
+    ConversationHistoryStore,
     HttpMcpClient,
     McpServer,
     MemoryStore,
@@ -201,6 +203,7 @@ def cmd_doctor(config: AppConfig) -> int:
     print(f"  OpenCode V2 URL:  {config.llm.providers.opencode.server_url}")
     print(f"  OpenCode home:    {config.llm.providers.opencode.agent_home}")
     print(f"  Unified MCP HTTP: http://127.0.0.1:{config.tools.mcp_http_port}/mcp")
+    print(f"  Web Console:      http://127.0.0.1:{config.tools.mcp_http_port}/")
 
     client_id_present = bool(read_env_secret(config.tools.outlook.client_id_env))
     cache_path = Path(config.tools.outlook.token_cache_file).expanduser()
@@ -230,12 +233,27 @@ def cmd_doctor(config: AppConfig) -> int:
     return 0
 
 
+def _resolve_active_model(config: AppConfig, provider_override: str | None = None) -> str:
+    chosen = provider_override or config.llm.default_provider
+    if chosen == "opencode":
+        return config.llm.providers.opencode.model
+    if chosen == "codex":
+        return config.llm.providers.codex.model or "codex"
+    if chosen == "codex_api":
+        return config.llm.providers.codex_api.model
+    if chosen == "gemini_api":
+        return config.llm.providers.gemini_api.model
+    return chosen
+
+
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
+    active_config = config
     confirmations = ConfirmationStore()
-    memory_store = MemoryStore(config.memory.file_path)
-    reminder_store = ReminderStore(config.reminders.file_path)
-    speaker_store = SpeakerProfileStore(config.speech.speaker_profiles_file)
-    agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
+    memory_store = MemoryStore(active_config.memory.file_path)
+    reminder_store = ReminderStore(active_config.reminders.file_path)
+    speaker_store = SpeakerProfileStore(active_config.speech.speaker_profiles_file)
+    history_store = ConversationHistoryStore()
+    agent_home = Path(active_config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
 
     router: LLMRouter | None = None
@@ -244,50 +262,58 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     scheduler: ReminderScheduler | None = None
 
     def on_voice_changed(voice: str, rate: str) -> None:
-        config.speaker.edge_voice = voice
-        config.speaker.edge_rate = rate
+        active_config.speaker.edge_voice = voice
+        active_config.speaker.edge_rate = rate
         if gateway is not None:
             gateway.apply_voice_change(voice, rate)
         if bridge is not None:
             bridge._speaker_config.edge_voice = voice
             bridge._speaker_config.edge_rate = rate
 
+    def on_model_changed(new_model: str) -> None:
+        active_config.llm.providers.opencode.model = new_model
+        if router is not None:
+            router.reload_runtime_config(active_config)
+            router.opencode_session_id = None
+
     mcp_server = McpServer(
-        config,
+        active_config,
         confirmation_store=confirmations,
         memory_store=memory_store,
         reminder_store=reminder_store,
         speaker_store=speaker_store,
+        history_store=history_store,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
+        on_model_changed=on_model_changed,
         config_path=getattr(args, "config", None),
         include_local_tools=True,
     )
     mcp_runner, mcp_port = await mcp_server.start_http_server(
         host="127.0.0.1",
-        port=config.tools.mcp_http_port,
+        port=active_config.tools.mcp_http_port,
         auth_token=mcp_token,
     )
     mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
     router = LLMRouter(
-        config.llm,
+        active_config.llm,
         mcp_url=mcp_url,
         mcp_auth_token=mcp_token,
-        persona=config.persona,
+        persona=active_config.persona,
         memory_store=memory_store,
-        memory_enabled=config.memory.enabled,
-        memory_max_items=config.memory.max_prompt_items,
+        memory_enabled=active_config.memory.enabled,
+        memory_max_items=active_config.memory.max_prompt_items,
     )
-    effective_provider = args.provider or config.llm.default_provider
+    effective_provider = args.provider or active_config.llm.default_provider
     if effective_provider == "opencode":
         await router.start(mcp_url=mcp_url, mcp_auth_token=mcp_token)
 
-    tools, clients = build_tool_registry(config, confirmation_store=confirmations)
-    outlook_client = clients.get("outlook") or OutlookClient(config.tools.outlook)
+    tools, clients = build_tool_registry(active_config, confirmation_store=confirmations)
+    outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
 
     async def apply_hot_reload(new_cfg: AppConfig) -> None:
-        nonlocal tools, clients, outlook_client
+        nonlocal active_config, tools, clients, outlook_client
         if getattr(args, "host", None):
             new_cfg.speaker.ws_host = args.host
         if getattr(args, "port", None):
@@ -296,6 +322,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             new_cfg.speech.asr_provider = args.asr
         if getattr(args, "asr_model", None):
             new_cfg.speech.asr_model = args.asr_model
+        active_config = new_cfg
         mcp_server.reload_config(new_cfg)
         await asyncio.to_thread(router.reload_runtime_config, new_cfg)
         if gateway is not None:
@@ -311,48 +338,84 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     watcher = ConfigWatcher(getattr(args, "config", None), apply_hot_reload)
     watcher.start()
 
+    history_source = "bridge" if args.command == "openai-bridge" else "voice"
+
+    def _record_turn(query: str, reply: str, started_at: float) -> None:
+        latency_ms = round((time.monotonic() - started_at) * 1000.0, 1)
+        spk = CURRENT_SPEAKER.get()
+        history_store.record(
+            query=query,
+            reply=reply,
+            latency_ms=latency_ms,
+            model=_resolve_active_model(active_config, args.provider),
+            voice=active_config.speaker.edge_voice,
+            speaker_name=spk.name if spk is not None else "未知",
+            speaker_role=spk.role if spk is not None else "",
+            source=history_source,
+        )
+
     async def handle_query(query: str) -> str:
+        t0 = time.monotonic()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
                 draft = confirmations.confirm_and_pop()
                 if draft is not None:
                     await outlook_client.send_email(draft)
-                    return f"好的，已发送邮件给 {draft.to}。"
+                    reply = f"好的，已发送邮件给 {draft.to}。"
+                    _record_turn(query, reply, t0)
+                    return reply
             elif is_cancel_utterance(query):
                 confirmations.clear()
-                return "好的，已取消发送邮件。"
+                reply = "好的，已取消发送邮件。"
+                _record_turn(query, reply, t0)
+                return reply
 
         spk = CURRENT_SPEAKER.get()
-        return await router.ask(
+        reply = await router.ask(
             query,
             provider=args.provider,
             tools=tools,
             executor=lambda name, t_args: execute_tool(clients, name, t_args),
             speaker_context=spk.format_context_prefix() if spk is not None else None,
         )
+        _record_turn(query, reply, t0)
+        return reply
 
     async def stream_query(query: str):
+        t0 = time.monotonic()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
                 draft = confirmations.confirm_and_pop()
                 if draft is not None:
                     await outlook_client.send_email(draft)
-                    yield f"好的，已发送邮件给 {draft.to}。"
+                    reply = f"好的，已发送邮件给 {draft.to}。"
+                    _record_turn(query, reply, t0)
+                    yield reply
                     return
             elif is_cancel_utterance(query):
                 confirmations.clear()
-                yield "好的，已取消发送邮件。"
+                reply = "好的，已取消发送邮件。"
+                _record_turn(query, reply, t0)
+                yield reply
                 return
 
         spk = CURRENT_SPEAKER.get()
-        async for sentence in router.stream_ask(
-            query,
-            provider=args.provider,
-            tools=tools,
-            executor=lambda name, t_args: execute_tool(clients, name, t_args),
-            speaker_context=spk.format_context_prefix() if spk is not None else None,
-        ):
-            yield sentence
+        chunks: list[str] = []
+        completed = False
+        try:
+            async for sentence in router.stream_ask(
+                query,
+                provider=args.provider,
+                tools=tools,
+                executor=lambda name, t_args: execute_tool(clients, name, t_args),
+                speaker_context=spk.format_context_prefix() if spk is not None else None,
+            ):
+                chunks.append(sentence)
+                yield sentence
+            completed = True
+        finally:
+            if completed and chunks:
+                _record_turn(query, "".join(chunks), t0)
 
     def reset_all() -> None:
         router.reset_session()
