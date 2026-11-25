@@ -248,5 +248,6 @@ class PlaybackController:
             finally:
                 if self._config.tts_provider != "xiaoai":
                     await self._close_stream()
-                if self._on_playback_state:
+                aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
+                if self._on_playback_state and not aborted:
                     self._on_playback_state(False)

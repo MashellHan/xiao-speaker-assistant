@@ -276,6 +276,8 @@ class LocalSpeechPipeline:
         self._logged_first_audio = False
         self._hp_prev_x: float = 0.0
         self._hp_prev_y: float = 0.0
+        self._hp_ref_prev_x: float = 0.0
+        self._hp_ref_prev_y: float = 0.0
         self._aec = (
             LinearEchoCanceller()
             if (config.aec_enabled and config.capture_channels >= 2)
@@ -325,6 +327,7 @@ class LocalSpeechPipeline:
         on_utterance: Callable[[str], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
+        on_barge_in_wakeup: Callable[[str], None] | None = None,
     ) -> None:
         with self._lock:
             self._feed_pcm_locked(
@@ -333,6 +336,7 @@ class LocalSpeechPipeline:
                 on_utterance=on_utterance,
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
+                on_barge_in_wakeup=on_barge_in_wakeup,
             )
 
     def _feed_pcm_locked(
@@ -343,6 +347,7 @@ class LocalSpeechPipeline:
         on_utterance: Callable[[str], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
+        on_barge_in_wakeup: Callable[[str], None] | None = None,
     ) -> None:
         now = time.monotonic()
         is_muted = self._explicit_muted or now < self._muted_until
@@ -366,21 +371,32 @@ class LocalSpeechPipeline:
         )
         if len(mic_samples) == 0:
             return
+        mic_samples, self._hp_prev_x, self._hp_prev_y = apply_highpass_filter(
+            mic_samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
+        )
+        # Apply linear pre-gain identically to both mic and ref before AEC so quiet OH2P hardware
+        # (PDM Gain=0) stays in the well-conditioned adaptation regime while preserving linearity.
+        if self._agc is None and self._config.input_gain != 1.0:
+            mic_samples = mic_samples * self._config.input_gain
+            if ref_samples is not None:
+                ref_samples = ref_samples * self._config.input_gain
+
         far_end_active = False
         if self._aec is not None and ref_samples is not None:
+            ref_samples, self._hp_ref_prev_x, self._hp_ref_prev_y = apply_highpass_filter(
+                ref_samples, prev_x=self._hp_ref_prev_x, prev_y=self._hp_ref_prev_y
+            )
             far_end_active = float(np.mean(ref_samples * ref_samples)) > 1e-6
             samples = self._aec.process(mic_samples, ref_samples)
             if len(samples) == 0:
                 return
         else:
             samples = mic_samples
-        samples, self._hp_prev_x, self._hp_prev_y = apply_highpass_filter(
-            samples, prev_x=self._hp_prev_x, prev_y=self._hp_prev_y
-        )
+
         if self._agc is not None:
             samples = self._agc.process(samples, freeze_boost=far_end_active)
-        elif self._config.input_gain != 1.0:
-            samples = np.clip(samples * self._config.input_gain, -1.0, 1.0)
+        else:
+            samples = np.clip(samples, -1.0, 1.0)
         if not self._logged_first_audio:
             self._logged_first_audio = True
             rms = float(np.sqrt(np.mean(samples * samples)))
@@ -414,6 +430,14 @@ class LocalSpeechPipeline:
                 if on_wakeup:
                     on_wakeup(hit)
                 break
+            if self.awake and is_muted and hit in self._wake_set:
+                logger.info("Barge-in wake word detected while speaking: %s", hit)
+                self._explicit_muted = False
+                self._muted_until = 0.0
+                self.set_awake(True)
+                if on_barge_in_wakeup:
+                    on_barge_in_wakeup(hit)
+                return
 
         if is_muted:
             return
