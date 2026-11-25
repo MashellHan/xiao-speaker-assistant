@@ -29,7 +29,7 @@ def test_openai_bridge_chat_and_speech_endpoints() -> None:
         yield "第一句。"
         yield "第二句。"
 
-    async def fake_synth(text: str, *, voice: str, response_format: str):
+    async def fake_synth(text: str, *, voice: str, rate: str = "+0%", response_format: str):
         return b"ID3-fake-mp3-" + text.encode("utf-8"), "audio/mpeg"
 
     bridge = OpenAIBridgeServer(

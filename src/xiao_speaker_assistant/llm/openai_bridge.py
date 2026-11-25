@@ -55,6 +55,7 @@ async def synthesize_edge_audio_bytes(
     text: str,
     *,
     voice: str = "zh-CN-XiaoxiaoNeural",
+    rate: str = "+0%",
     response_format: str = "mp3",
 ) -> tuple[bytes, str]:
     """Synthesize speech using `edge-tts` and return `(audio_bytes, content_type)`."""
@@ -62,7 +63,7 @@ async def synthesize_edge_audio_bytes(
     if fmt not in ALLOWED_AUDIO_FORMATS:
         raise ValueError(f"Unsupported response_format: {response_format!r}")
 
-    comm = edge_tts.Communicate(text=text, voice=voice)
+    comm = edge_tts.Communicate(text=text, voice=voice, rate=rate)
     mp3_chunks: list[bytes] = []
     async for msg in comm.stream():
         if msg.get("type") == "audio":
@@ -244,7 +245,10 @@ class OpenAIBridgeServer:
                 )
 
             audio_bytes, ctype = await synthesize_edge_audio_bytes(
-                text, voice=voice, response_format=fmt
+                text,
+                voice=voice,
+                rate=self._speaker_config.edge_rate,
+                response_format=fmt,
             )
             return web.Response(body=audio_bytes, content_type=ctype)
 

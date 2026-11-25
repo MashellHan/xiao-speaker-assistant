@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from xiao_speaker_assistant.config import AppConfig, load_config, read_env_secret
+from xiao_speaker_assistant.config_watcher import ConfigWatcher
 from xiao_speaker_assistant.llm import LLMRouter, ToolDefinition
 from xiao_speaker_assistant.llm.openai_bridge import OpenAIBridgeServer
 from xiao_speaker_assistant.llm.opencode_server import load_or_create_mcp_token
@@ -25,6 +26,7 @@ from xiao_speaker_assistant.tools import (
     ConfirmationStore,
     HttpMcpClient,
     McpServer,
+    MemoryStore,
     OutlookClient,
     PendingEmailDraft,
     is_cancel_utterance,
@@ -220,11 +222,18 @@ def cmd_doctor(config: AppConfig) -> int:
 
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     confirmations = ConfirmationStore()
+    memory_store = MemoryStore(config.memory.file_path)
     agent_home = Path(config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
+
+    router: LLMRouter | None = None
+    gateway: SpeakerGateway | None = None
+
     mcp_server = McpServer(
         config,
         confirmation_store=confirmations,
+        memory_store=memory_store,
+        on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         include_local_tools=True,
     )
     mcp_runner, mcp_port = await mcp_server.start_http_server(
@@ -234,13 +243,44 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     )
     mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
-    router = LLMRouter(config.llm, mcp_url=mcp_url, mcp_auth_token=mcp_token)
+    router = LLMRouter(
+        config.llm,
+        mcp_url=mcp_url,
+        mcp_auth_token=mcp_token,
+        persona=config.persona,
+        memory_store=memory_store,
+        memory_enabled=config.memory.enabled,
+        memory_max_items=config.memory.max_prompt_items,
+    )
     effective_provider = args.provider or config.llm.default_provider
     if effective_provider == "opencode":
         await router.start(mcp_url=mcp_url, mcp_auth_token=mcp_token)
 
     tools, clients = build_tool_registry(config, confirmation_store=confirmations)
     outlook_client = clients.get("outlook") or OutlookClient(config.tools.outlook)
+    bridge: OpenAIBridgeServer | None = None
+
+    async def apply_hot_reload(new_cfg: AppConfig) -> None:
+        nonlocal tools, clients, outlook_client
+        if getattr(args, "host", None):
+            new_cfg.speaker.ws_host = args.host
+        if getattr(args, "port", None):
+            new_cfg.speaker.ws_port = args.port
+        if getattr(args, "asr", None):
+            new_cfg.speech.asr_provider = args.asr
+        if getattr(args, "asr_model", None):
+            new_cfg.speech.asr_model = args.asr_model
+        mcp_server.reload_config(new_cfg)
+        await asyncio.to_thread(router.reload_runtime_config, new_cfg)
+        if gateway is not None:
+            await asyncio.to_thread(gateway.reload_config, new_cfg)
+        if bridge is not None:
+            bridge._speaker_config = new_cfg.speaker
+        tools, clients = build_tool_registry(new_cfg, confirmation_store=confirmations)
+        outlook_client = clients.get("outlook") or OutlookClient(new_cfg.tools.outlook)
+
+    watcher = ConfigWatcher(getattr(args, "config", None), apply_hot_reload)
+    watcher.start()
 
     async def handle_query(query: str) -> str:
         if confirmations.peek() is not None:
@@ -319,6 +359,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             )
             await gateway.serve_forever()
     finally:
+        await watcher.stop()
         await router.close()
         await mcp_runner.cleanup()
 

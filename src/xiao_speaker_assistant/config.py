@@ -17,6 +17,8 @@ class SpeakerConfig(BaseModel):
     auth_token_env: str = "XSA_SPEAKER_TOKEN"
     tts_provider: Literal["edge", "say", "xiaoai", "openai", "mlx_audio"] = "edge"
     edge_voice: str = "zh-CN-XiaoxiaoNeural"
+    edge_rate: str = "+8%"
+    voice_routes: dict[str, str] = Field(default_factory=dict)
     say_voice: str = "Tingting"
     tts_sample_rate: int = 24000
 
@@ -143,11 +145,26 @@ class ToolsConfig(BaseModel):
     mcp_http_port: int = 4397
 
 
+class PersonaConfig(BaseModel):
+    assistant_name: str = "Nomi"
+    address_user_as: str = ""
+    style: str = "亲切自然、简短口语化、直接给出核心结论"
+    extra_instructions: str = ""
+
+
+class MemoryConfig(BaseModel):
+    enabled: bool = True
+    file_path: str = "~/.local/share/xiao-speaker-assistant/memory.json"
+    max_prompt_items: int = 12
+
+
 class AppConfig(BaseModel):
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     speech: SpeechConfig = Field(default_factory=SpeechConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
