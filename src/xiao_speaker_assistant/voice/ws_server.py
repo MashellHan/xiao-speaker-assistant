@@ -364,6 +364,10 @@ class SpeakerGateway:
             logger.info("Barge-in interrupt triggered (%s)", keyword)
             loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_interrupt(conn)))
 
+        def on_barge_in_wakeup(keyword: str) -> None:
+            logger.info("Barge-in wake word triggered (%s)", keyword)
+            loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_barge_in_wakeup(conn)))
+
         await loop.run_in_executor(
             self._asr_executor,
             lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
@@ -372,8 +376,27 @@ class SpeakerGateway:
                 on_utterance=on_utterance,
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
+                on_barge_in_wakeup=on_barge_in_wakeup,
             ),
         )
+
+    async def _handle_barge_in_wakeup(self, conn: Any) -> None:
+        sess = self._get_session(conn)
+        sess.interrupted = True
+        if sess.active_reply_task is not None and not sess.active_reply_task.done():
+            sess.active_reply_task.cancel()
+        for fut in self._pending_rpc.get(conn, {}).values():
+            if not fut.done():
+                fut.cancel()
+        pb = self._playbacks.get(conn)
+        if pb is not None:
+            await pb.stop_playback(stop_native=True)
+        else:
+            await self.stop_native_audio(conn)
+        if self._pipeline is not None:
+            self._pipeline.set_awake(True)
+            self._pipeline.set_muted(False)
+        await self.play_wakeup_chime(conn)
 
     async def _handle_interrupt(self, conn: Any) -> None:
         sess = self._get_session(conn)

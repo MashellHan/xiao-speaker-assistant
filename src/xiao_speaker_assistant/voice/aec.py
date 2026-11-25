@@ -18,7 +18,7 @@ class LinearEchoCanceller:
         hop_size: int = 256,
         num_blocks: int = 8,
         step_size: float = 0.35,
-        reg: float = 1e-2,
+        reg: float = 1e-5,
     ) -> None:
         self.hop_size = hop_size
         self.fft_size = hop_size * 2

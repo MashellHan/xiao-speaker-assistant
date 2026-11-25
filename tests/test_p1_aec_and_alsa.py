@@ -112,3 +112,19 @@ def test_aec_enabled_2ch_mutes_vad_for_echo_guard_with_short_tail() -> None:
     fake_pipeline.set_muted.assert_any_call(True)
     fake_pipeline.mute_for.assert_called_once_with(0.15)
     fake_pipeline.set_muted.assert_any_call(False)
+
+
+def test_linear_aec_converges_on_quiet_oh2p_amplitude_signal() -> None:
+    rng = np.random.default_rng(123)
+    aec = LinearEchoCanceller(hop_size=256, num_blocks=8, step_size=0.40, reg=1e-5)
+    n = 16000 * 2
+    ref = 0.015 * rng.standard_normal(n).astype(np.float32)
+    mic = np.zeros(n, dtype=np.float32)
+    mic[24:] += 0.45 * ref[:-24]
+    mic[90:] += -0.20 * ref[:-90]
+
+    cleaned = aec.process(mic, ref)
+    in_pow = float(np.mean(mic[16000:30000] ** 2))
+    out_pow = float(np.mean(cleaned[16000:30000] ** 2))
+    erle_db = 10.0 * np.log10(in_pow / max(out_pow, 1e-12))
+    assert erle_db > 15.0
