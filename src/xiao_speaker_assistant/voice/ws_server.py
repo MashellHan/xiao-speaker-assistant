@@ -342,6 +342,8 @@ class SpeakerGateway:
             return
         sess = self._get_session(conn)
         sess.last_audio_at = time.monotonic()
+        if sess.active_reply_task is not None and not sess.active_reply_task.done():
+            self._pipeline.refresh_activity()
         loop = asyncio.get_running_loop()
 
         def on_wakeup(keyword: str) -> None:
