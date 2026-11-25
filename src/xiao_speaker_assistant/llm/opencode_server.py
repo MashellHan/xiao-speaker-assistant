@@ -357,8 +357,15 @@ class OpenCodeServerManager:
                 return base_url, password
 
         # Reuse an externally started or already-running server (e.g. `xsa serve` while running `xsa ask`)
-        # without clobbering its active `opencode.jsonc` / MCP auth token.
+        # without clobbering its active `opencode.jsonc` / MCP auth token when mcp_auth_token is None.
         if await self._is_healthy(base_url, password):
+            if mcp_auth_token is not None:
+                self._agent_home = ensure_agent_home(
+                    self._config,
+                    mcp_url=mcp_url,
+                    system_prompt=system_prompt,
+                    mcp_auth_token=mcp_auth_token,
+                )
             return base_url, password
 
         if not self._config.auto_start_server:

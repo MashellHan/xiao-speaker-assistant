@@ -141,6 +141,7 @@ class LLMRouter:
         mcp_auth_token: str | None = None,
         persona: PersonaConfig | None = None,
         memory_store: MemoryStore | None = None,
+        memory_enabled: bool = True,
         memory_max_items: int = 12,
     ) -> None:
         self._config = config
@@ -149,15 +150,17 @@ class LLMRouter:
         self._mcp_auth_token = mcp_auth_token
         self._persona = persona or PersonaConfig()
         self._memory_store = memory_store
+        self._memory_enabled = memory_enabled
         self._memory_max_items = memory_max_items
         self._opencode_mgr = OpenCodeServerManager(config.providers.opencode)
         self._opencode_v2: OpenCodeV2Client | None = None
+        self._v2_active = False
         self.opencode_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
 
     def sync_agent_home(self) -> None:
         """Rewrite isolated `opencode.jsonc` when persona, config, or long-term memory changes."""
-        if self._client is not None or self._opencode_mgr._agent_home is None:
+        if self._client is not None or not self._v2_active:
             return
         ensure_agent_home(
             self._config.providers.opencode,
@@ -169,6 +172,7 @@ class LLMRouter:
     def reload_runtime_config(self, new_config: AppConfig) -> None:
         self._config = new_config.llm
         self._persona = new_config.persona
+        self._memory_enabled = new_config.memory.enabled
         self._memory_max_items = new_config.memory.max_prompt_items
         self._opencode_mgr._config = new_config.llm.providers.opencode
         self.sync_agent_home()
@@ -204,6 +208,7 @@ class LLMRouter:
         self._opencode_v2 = OpenCodeV2Client(
             base_url, password=password, timeout_sec=cfg.timeout_sec
         )
+        self._v2_active = True
 
     async def close(self) -> None:
         await self._opencode_mgr.stop()
@@ -241,7 +246,7 @@ class LLMRouter:
             else ""
         )
         memory_block = ""
-        if self._memory_store is not None and self._memory_max_items > 0:
+        if self._memory_enabled and self._memory_store is not None and self._memory_max_items > 0:
             formatted = self._memory_store.format_for_prompt(limit=self._memory_max_items)
             if formatted:
                 memory_block = f"\n\n{formatted}"

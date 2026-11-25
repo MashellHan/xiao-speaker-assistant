@@ -48,6 +48,8 @@ def test_memory_store_persists_0600_and_rejects_secrets(tmp_path: Path) -> None:
         ("github_token", "ghp_123"),
         ("邮箱密码", "123456"),
         ("api_key", "sk-abc"),
+        ("笔记", "sk-abcdef1234567890abcdef"),
+        ("备份", "ghp_abcdef1234567890abcdef"),
     ):
         with pytest.raises(MemorySecurityError):
             reloaded.save(k, v)
@@ -159,7 +161,7 @@ def test_multi_voice_routing_passes_voice_override_and_edge_rate() -> None:
         speaker=SpeakerConfig(
             edge_voice="zh-CN-XiaoxiaoNeural",
             edge_rate="+12%",
-            voice_routes={"你好管家": "zh-CN-YunxiNeural", "hi_nomi": "zh-CN-XiaoyiNeural"},
+            voice_routes={"": "zh-CN-BadBlank", "你好管家": "zh-CN-YunxiNeural"},
         )
     )
     called_voices: list[tuple[str, str]] = []
@@ -193,7 +195,8 @@ def test_multi_voice_routing_passes_voice_override_and_edge_rate() -> None:
         conn = FakeConn()
         with patch("xiao_speaker_assistant.voice.tts_stream.stream_edge_tts_pcm", fake_stream):
             await gw._process_local_utterance(conn, "你好管家，你好")
+            # Switching to an unrouted wake word must reset back to default edge_voice (and blank route key must be ignored)
             await gw._process_local_utterance(conn, "Hi Nomi，你好")
 
     asyncio.run(run())
-    assert called_voices == [("zh-CN-YunxiNeural", "+12%"), ("zh-CN-XiaoyiNeural", "+12%")]
+    assert called_voices == [("zh-CN-YunxiNeural", "+12%"), ("zh-CN-XiaoxiaoNeural", "+12%")]

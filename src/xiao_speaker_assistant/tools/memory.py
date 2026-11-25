@@ -12,7 +12,8 @@ import uuid
 from pathlib import Path
 
 _SECRET_PATTERN = re.compile(
-    r"(password|passwd|secret|token|api[_-]?key|keychain|credential|bearer|密码|口令|密钥|钥匙串)",
+    r"(password|passwd|secret|token|api[_-]?key|keychain|credential|bearer|密码|口令|密钥|钥匙串"
+    r"|sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,})",
     re.IGNORECASE,
 )
 
@@ -92,11 +93,13 @@ class MemoryStore:
         os.chmod(self.path, 0o600)
 
     def save(self, key: str, value: str, *, category: str = "fact") -> MemoryEntry:
-        clean_key = key.strip()
-        clean_val = value.strip()
+        clean_key = re.sub(r"\s+", " ", key.strip())
+        clean_val = re.sub(r"\s+", " ", value.strip())
         clean_cat = category.strip() or "fact"
         if not clean_key or not clean_val:
             raise ValueError("Both 'key' and 'value' must be non-empty.")
+        if len(clean_key) > 80 or len(clean_val) > 300:
+            raise ValueError("Memory 'key' (<=80 chars) and 'value' (<=300 chars) exceed size limits.")
         if _SECRET_PATTERN.search(clean_key) or _SECRET_PATTERN.search(clean_val):
             raise MemorySecurityError(
                 "Refusing to store passwords, tokens, keys, or Keychain secrets in long-term memory."

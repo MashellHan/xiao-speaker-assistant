@@ -150,8 +150,12 @@ class SpeakerGateway:
         if not routes:
             return None
         norm = keyword.strip().lower().replace(" ", "_")
+        if not norm:
+            return None
         for route_key, voice in routes.items():
             rk = route_key.strip().lower().replace(" ", "_")
+            if not rk:
+                continue
             if rk == norm or rk.replace("_", "") == norm.replace("_", "") or rk in norm:
                 return voice.strip() or None
         return None
@@ -541,9 +545,7 @@ class SpeakerGateway:
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
             wake_label, rest = matched
-            routed = self._resolve_voice_for_keyword(wake_label)
-            if routed:
-                sess.active_voice = routed
+            sess.active_voice = self._resolve_voice_for_keyword(wake_label)
             if not rest:
                 if is_speaking_now:
                     await self._handle_barge_in_wakeup(conn)
