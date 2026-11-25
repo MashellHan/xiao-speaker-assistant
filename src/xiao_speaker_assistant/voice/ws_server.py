@@ -19,6 +19,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
+from xiao_speaker_assistant.tools.confirmation import is_cancel_utterance, is_confirm_utterance
 from xiao_speaker_assistant.voice.audio_pipeline import (
     LocalSpeechPipeline,
     extract_record_pcm_from_binary,
@@ -63,6 +64,7 @@ class SpeakerSession:
     mute_native_until: float = 0.0
     last_audio_at: float = 0.0
     last_chime_at: float = 0.0
+    last_playback_ended_at: float = 0.0
     active_reply_task: asyncio.Task[None] | None = None
     interrupted: bool = False
     recent_spoken_texts: deque[tuple[float, str]] = field(default_factory=deque)
@@ -73,6 +75,8 @@ _ECHO_STRIP_RE = re.compile(r"[\s，,。.!！？?、；;：:\"'`~～]+")
 
 def is_self_echo(asr_text: str, recent_spoken: Iterable[str]) -> bool:
     """Return True if `asr_text` looks like a residual TTS self-echo fragment."""
+    if is_confirm_utterance(asr_text) or is_cancel_utterance(asr_text):
+        return False
     norm_asr = _ECHO_STRIP_RE.sub("", asr_text).lower()
     if len(norm_asr) < 2:
         return False
@@ -139,6 +143,8 @@ class SpeakerGateway:
             return pb
 
         def on_state(playing: bool) -> None:
+            if not playing:
+                self._get_session(conn).last_playback_ended_at = time.monotonic()
             if self._pipeline is None:
                 return
             # When 2ch hardware ch3 AEC is active, keep VAD unmuted so the user can interrupt
@@ -497,13 +503,25 @@ class SpeakerGateway:
             if self._pipeline is not None:
                 self._pipeline.refresh_activity()
             return
-        if is_self_echo(text, self._recent_spoken_list(sess)):
+        pb = self._playbacks.get(conn)
+        old_task = sess.active_reply_task
+        is_speaking_now = (old_task is not None and not old_task.done()) or (
+            pb is not None and pb.is_playing
+        )
+        in_echo_window = is_speaking_now or (
+            (time.monotonic() - sess.last_playback_ended_at) < 1.5
+        )
+        if in_echo_window and is_self_echo(text, self._recent_spoken_list(sess)):
             logger.info("Ignoring residual TTS self-echo: %s", text)
             return
+
         matched = match_wakeup_phrase(text, self._config.speech.local_keywords)
         if matched:
             _, rest = matched
             if not rest:
+                if is_speaking_now:
+                    await self._handle_barge_in_wakeup(conn)
+                    return
                 if (time.monotonic() - sess.last_chime_at) >= 2.0:
                     await self.play_wakeup_chime(conn)
                 if self._pipeline is not None:
@@ -513,11 +531,6 @@ class SpeakerGateway:
 
         # Full-duplex barge-in: if Nomi is currently speaking or thinking, cancel current reply
         # without resetting session context and immediately answer the new follow-up utterance.
-        pb = self._playbacks.get(conn)
-        old_task = sess.active_reply_task
-        is_speaking_now = (old_task is not None and not old_task.done()) or (
-            pb is not None and pb.is_playing
-        )
         if is_speaking_now:
             logger.info("Full-duplex follow-up barge-in: %s", text)
             sess.interrupted = True
@@ -528,6 +541,7 @@ class SpeakerGateway:
                     fut.cancel()
             if pb is not None:
                 await pb.stop_playback(stop_native=True)
+                sess.last_playback_ended_at = time.monotonic()
             if old_task is not None and not old_task.done():
                 try:
                     await old_task
@@ -766,6 +780,7 @@ class SpeakerGateway:
         finally:
             if not prod_task.done():
                 prod_task.cancel()
+            await asyncio.gather(prod_task, return_exceptions=True)
             if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 
