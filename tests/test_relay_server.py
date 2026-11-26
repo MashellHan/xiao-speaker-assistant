@@ -9,7 +9,7 @@ from types import ModuleType
 
 import pytest
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from xiao_speaker_assistant.config import AppConfig
 from xiao_speaker_assistant.voice.relay_client import RelayHostClient, normalize_host_ws_url
@@ -30,6 +30,13 @@ relay_mod = _load_relay_module()
 
 
 async def _expect_close_code(uri: str, expected_code: int, headers: dict[str, str] | None = None) -> None:
+    expected_http_map = {4401: 401, 4404: 404, 4429: 429}
+    if expected_code in expected_http_map:
+        with pytest.raises(InvalidStatus) as exc_info:
+            async with websockets.connect(uri, additional_headers=headers) as ws:
+                await ws.recv()
+        assert exc_info.value.response.status_code == expected_http_map[expected_code]
+        return
     with pytest.raises(ConnectionClosed) as exc_info:
         async with websockets.connect(uri, additional_headers=headers) as ws:
             await ws.recv()
@@ -398,6 +405,28 @@ def test_relay_trusted_proxy_uses_rightmost_untrusted_xff_hop() -> None:
                 },
             ):
                 pass
+
+    asyncio.run(scenario())
+
+
+def test_relay_http_health_and_non_ws_paths() -> None:
+    import httpx
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            host_token="good-host",
+            speaker_token="good-spk",
+        ) as relay:
+            base = f"http://127.0.0.1:{relay.bound_port}"
+            async with httpx.AsyncClient() as client:
+                for ok_path in ("/", "/health", "/healthz"):
+                    r = await client.get(f"{base}{ok_path}")
+                    assert r.status_code == 200
+                for bad_path in ("/ws/host", "/ws/speaker", "/xsa/ws/host", "/unknown"):
+                    r = await client.get(f"{base}{bad_path}")
+                    assert r.status_code == 404
 
     asyncio.run(scenario())
 

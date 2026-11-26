@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import re
+import socket
 import subprocess
 from collections.abc import Callable
 from typing import Any
@@ -15,8 +17,9 @@ import httpx
 EDGE_APP_NAME = "Microsoft Edge"
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
-_SHELL_META_CHARS = frozenset(";|`$<>(){}\\\'\"\n\r\t ")
+_SHELL_META_CHARS = frozenset(";|`$<>(){}\\'\"\n\r\t ")
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
+_BLOCKED_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"})
 
 _NOISE_BLOCK_RE = re.compile(
     r"<(script|style|noscript|svg|title)\b[^>]*>[\s\S]*?</\1>|<!--[\s\S]*?-->",
@@ -58,7 +61,79 @@ def extract_html_summary(raw_html: str, max_chars: int = 2000) -> tuple[str | No
     return title, truncate_text(cleaned, max_chars)
 
 
-def validate_http_url(url: str) -> str:
+def _is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return _is_non_public_ip(ip_obj.ipv4_mapped)
+        if ip_obj.sixtofour is not None and _is_non_public_ip(ip_obj.sixtofour):
+            return True
+        if ip_obj.teredo is not None:
+            server_ip, client_ip = ip_obj.teredo
+            if _is_non_public_ip(server_ip) or _is_non_public_ip(client_ip):
+                return True
+    return (
+        not ip_obj.is_global
+        or ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def _parse_ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse canonical IPv4/IPv6 AND alternate IPv4 notations (octal/hex/decimal/short)."""
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    # Catch non-canonical IPv4 literals (e.g. 2130706433, 0x7f000001, 127.1, 0177.0.0.1)
+    # that Chromium/Edge/WHATWG URL parsers normalize to loopback/private IPs.
+    try:
+        packed = socket.inet_aton(hostname)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
+def _check_public_host(hostname: str, *, resolve_dns: bool = False) -> None:
+    lower = hostname.strip().rstrip(".").lower()
+    if lower in _BLOCKED_HOSTNAMES or lower.endswith((".localhost", ".local", ".internal")):
+        raise ValueError(f"Access to local/internal host is blocked: {hostname}")
+    ip_obj = _parse_ip_literal(lower)
+    if ip_obj is not None:
+        # Reject any non-public IP, or ambiguous non-canonical IPv4 literal (octal/hex/decimal/short).
+        if _is_non_public_ip(ip_obj):
+            raise ValueError(f"Access to loopback/private/link-local IP is blocked: {hostname}")
+        if isinstance(ip_obj, ipaddress.IPv4Address) and str(ip_obj) != lower:
+            raise ValueError(f"Non-canonical IPv4 literal is blocked: {hostname}")
+        return
+    if resolve_dns:
+        try:
+            infos = socket.getaddrinfo(lower, None, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"Failed to resolve host {hostname}: {exc}") from exc
+        if not infos:
+            raise ValueError(f"Host {hostname} did not resolve to any IP address.")
+        for _fam, _type, _proto, _canon, sockaddr in infos:
+            addr = sockaddr[0]
+            try:
+                resolved_ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if _is_non_public_ip(resolved_ip):
+                raise ValueError(
+                    f"Host {hostname} resolves to blocked loopback/private IP ({addr})."
+                )
+
+
+def validate_http_url(
+    url: str,
+    *,
+    block_private_network: bool = False,
+    resolve_dns: bool = False,
+) -> str:
     """Validate that url is an http:// or https:// URL free of shell metacharacters."""
     if not isinstance(url, str):
         raise ValueError("URL must be a string.")
@@ -80,6 +155,8 @@ def validate_http_url(url: str) -> str:
         raise ValueError("URL hostname contains disallowed characters.")
     # Accessing parsed.port validates that any port number is numeric and in 0..65535.
     _ = parsed.port
+    if block_private_network:
+        _check_public_host(parsed.hostname, resolve_dns=resolve_dns)
     return cleaned
 
 
@@ -166,18 +243,38 @@ async def async_fetch_webpage_summary(
     max_chars: int = 2000,
     *,
     client: httpx.AsyncClient | None = None,
+    block_private_network: bool = True,
 ) -> dict[str, Any]:
     """Async helper returning structured summary metadata for MCP server tool calls."""
-    validated_url = validate_http_url(url)
+    validated_url = validate_http_url(
+        url,
+        block_private_network=block_private_network,
+        resolve_dns=(block_private_network and client is None),
+    )
     limit = max(0, int(max_chars))
     owns_client = client is None
     http = client or httpx.AsyncClient(
         timeout=15.0,
-        follow_redirects=True,
+        follow_redirects=False,
         headers={"User-Agent": "xiao-speaker-assistant/0.1"},
     )
     try:
-        resp = await http.get(validated_url)
+        current_url = validated_url
+        resp: httpx.Response | None = None
+        for _ in range(5):
+            resp = await http.get(current_url, follow_redirects=False)
+            if resp.is_redirect and resp.headers.get("location"):
+                next_url = str(resp.url.join(resp.headers["location"]))
+                current_url = validate_http_url(
+                    next_url,
+                    block_private_network=block_private_network,
+                    resolve_dns=(block_private_network and client is None),
+                )
+                continue
+            break
+        assert resp is not None
+        if resp.is_redirect:
+            raise ValueError("Too many redirects.")
         resp.raise_for_status()
     finally:
         if owns_client:
