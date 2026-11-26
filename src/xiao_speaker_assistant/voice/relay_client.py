@@ -48,10 +48,10 @@ class RelayHostClient:
         auth_token: str | None = None,
         token_env: str = "XSA_RELAY_TOKEN",
         initial_backoff: float = 1.0,
-        max_backoff: float = 60.0,
+        max_backoff: float = 10.0,
         backoff_factor: float = 2.0,
-        ping_interval: float | None = 20.0,
-        ping_timeout: float | None = 20.0,
+        ping_interval: float | None = 15.0,
+        ping_timeout: float | None = 15.0,
         healthy_reset_sec: float = 5.0,
     ) -> None:
         if initial_backoff <= 0:
@@ -106,6 +106,7 @@ class RelayHostClient:
         conn: Any = ws
         self._active_ws = ws
         self._gateway._connections.add(conn)
+        self._gateway._relay_connections.add(conn)
         self._gateway._pending_rpc.setdefault(conn, {})
         self._gateway._get_session(conn)
         self._gateway._get_playback(conn)
@@ -154,6 +155,8 @@ class RelayHostClient:
                     additional_headers=self._build_headers(),
                     ping_interval=self._ping_interval,
                     ping_timeout=self._ping_timeout,
+                    # Enable permessage-deflate so verbose JSON integer-array PCM frames compress ~3x over WAN.
+                    compression="deflate",
                 ) as ws:
                     connected_at = loop.time()
                     logger.info("Connected to relay host endpoint: %s", self.relay_url)
@@ -267,10 +270,10 @@ class RelayConsoleClient:
         auth_token: str | None = None,
         token_env: str = "XSA_RELAY_TOKEN",
         initial_backoff: float = 1.0,
-        max_backoff: float = 60.0,
+        max_backoff: float = 10.0,
         backoff_factor: float = 2.0,
-        ping_interval: float | None = 20.0,
-        ping_timeout: float | None = 20.0,
+        ping_interval: float | None = 15.0,
+        ping_timeout: float | None = 15.0,
         healthy_reset_sec: float = 5.0,
     ) -> None:
         self.relay_url = normalize_console_ws_url(relay_url)

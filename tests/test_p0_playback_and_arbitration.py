@@ -215,3 +215,60 @@ def test_playback_controller_awaits_start_play_ack_and_pads_trailing_silence() -
     total_bytes = sum(len(frame["bytes"]) for frame in sent_binary)
     assert total_bytes >= 15000
     assert events[-1].startswith("rpc:stop_play")
+
+
+def test_playback_controller_wan_relay_uses_jitter_buffer_and_continuous_stream() -> None:
+    rpcs: list[tuple[str, object]] = []
+    sent_binary_raw: list[bytes] = []
+    states: list[bool] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary_raw.append(b)
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def fake_send_rpc(cmd: str, payload, wait: bool, timeout: float):
+        rpcs.append((cmd, payload))
+        return {"code": 0}
+
+    async def fake_stream(text: str, cfg: SpeakerConfig, **kwargs):
+        assert kwargs.get("chunk_bytes") == 9600
+        yield b"\x02\x00" * 4800
+
+    pb = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=fake_send_rpc,
+        on_playback_state=states.append,
+        wan_relay=True,
+    )
+
+    async def run() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_stream):
+            await pb.speak("第一句。", interrupt_native=True, keep_stream_open=True)
+            await pb.speak("第二句。", interrupt_native=False, keep_stream_open=True)
+            await pb.finish_stream(pad_tail_sec=0.05)
+
+    asyncio.run(run())
+    start_rpcs = [p for cmd, p in rpcs if cmd == "start_play"]
+    stop_rpcs = [p for cmd, p in rpcs if cmd == "stop_play"]
+    # Continuous multi-sentence stream opens ALSA `aplay` ONCE and closes ONCE at the end.
+    assert len(start_rpcs) == 1
+    assert start_rpcs[0] == {
+        "pcm": "default",
+        "channels": 1,
+        "bits_per_sample": 16,
+        "sample_rate": 24000,
+        "period_size": 2400,
+        "buffer_size": 19200,
+    }
+    assert len(stop_rpcs) == 1
+    # Compact JSON encoding omits spaces after commas/colons (~22% smaller over wire)
+    assert b", " not in sent_binary_raw[0]
+    assert states[-1] is False
