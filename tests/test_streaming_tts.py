@@ -23,6 +23,17 @@ def test_sentence_stream_buffer_default_avoids_tiny_split_fragments() -> None:
     assert out == ["好的。太阳系一共有八大行星，围绕太阳运转。"]
 
 
+def test_sentence_stream_buffer_first_sentence_fast_emit() -> None:
+    buf = SentenceStreamBuffer(min_chars=18, first_sentence_min_chars=6)
+    # First sentence flushes early at >=6 chars so TTS starts sooner
+    assert buf.feed("我在呢，大熊！") == ["我在呢，大熊！"]
+    # Subsequent sentences still use min_chars=18 to avoid choppy TTS fragments
+    assert buf.feed("好的呀。") == []
+    assert buf.feed("今天延庆是晴天，气温零下三度到五度左右。") == [
+        "好的呀。今天延庆是晴天，气温零下三度到五度左右。"
+    ]
+
+
 def test_gateway_streaming_speaks_sentences_sequentially_via_xiaoai_rpc() -> None:
     sent_payloads: list[dict] = []
 

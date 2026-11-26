@@ -58,9 +58,18 @@ def format_for_speech(text: str, max_chars: int = 220) -> str:
 class SentenceStreamBuffer:
     """Buffers incremental LLM text and emits complete spoken sentences early."""
 
-    def __init__(self, *, min_chars: int = 18, max_total_chars: int = 260) -> None:
+    def __init__(
+        self,
+        *,
+        min_chars: int = 18,
+        first_sentence_min_chars: int | None = None,
+        max_total_chars: int = 260,
+    ) -> None:
         self._buf = ""
         self._min_chars = min_chars
+        self._first_min_chars = (
+            min_chars if first_sentence_min_chars is None else first_sentence_min_chars
+        )
         self._max_total = max_total_chars
         self._emitted_chars = 0
 
@@ -77,7 +86,8 @@ class SentenceStreamBuffer:
                 break
             end = m.end()
             candidate = format_for_speech(self._buf[:end], max_chars=140)
-            if len(candidate) < self._min_chars:
+            threshold = self._first_min_chars if self._emitted_chars == 0 else self._min_chars
+            if len(candidate) < threshold:
                 search_from = end
                 continue
             self._buf = self._buf[end:]
@@ -318,7 +328,10 @@ class LLMRouter:
         chosen = provider or self._config.default_provider
         system_prompt = self._build_system_prompt()
         prompt_text = f"{speaker_context}\n{user_text}" if speaker_context else user_text
-        splitter = SentenceStreamBuffer(max_total_chars=self._config.spoken_max_chars)
+        splitter = SentenceStreamBuffer(
+            first_sentence_min_chars=6,
+            max_total_chars=self._config.spoken_max_chars,
+        )
 
         if chosen == "opencode":
             collected: list[str] = []

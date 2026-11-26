@@ -88,7 +88,7 @@ class SpeechConfig(BaseModel):
     kws_score: float = 2.0
     kws_threshold: float = 0.20
     vad_threshold: float = 0.12
-    vad_min_silence_ms: int = 550
+    vad_min_silence_ms: int = 450
     input_gain: float = 16.0
     agc_enabled: bool = False
     agc_target_rms: float = 0.10
