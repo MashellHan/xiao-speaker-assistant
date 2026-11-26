@@ -519,6 +519,8 @@ class McpServer:
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
         on_model_changed: Callable[[str], None] | None = None,
+        on_reminders_config_changed: Callable[[bool, str, str], None] | None = None,
+        on_capabilities_changed: Callable[[], None] | None = None,
         config_path: str | Path | None = None,
         speakers_path: str | Path | None = None,
         reminders_path: str | Path | None = None,
@@ -537,8 +539,9 @@ class McpServer:
         self.memory_store = memory_store or MemoryStore(
             self._config.memory.file_path
         )
+        self._reminders_path = Path(reminders_path).expanduser() if reminders_path is not None else None
         self.reminder_store = reminder_store or ReminderStore(
-            self._config.reminders.file_path
+            self._reminders_path if self._reminders_path is not None else self._config.reminders.file_path
         )
         self.speaker_store = speaker_store or SpeakerProfileStore(
             self._config.speech.speaker_profiles_file
@@ -548,9 +551,10 @@ class McpServer:
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
         self._on_model_changed = on_model_changed
+        self._on_reminders_config_changed = on_reminders_config_changed
+        self._on_capabilities_changed = on_capabilities_changed
         self._config_path = config_path
         self._speakers_path = Path(speakers_path).expanduser() if speakers_path is not None else None
-        self._reminders_path = Path(reminders_path).expanduser() if reminders_path is not None else None
         self._http_client = http_client
         self._include_local_tools = include_local_tools
         self._mac_allowed_roots = mac_allowed_roots
@@ -1664,6 +1668,18 @@ class McpServer:
                 "english": list(cfg.speech.en_keywords) if cfg.speech.en_kws_enabled else [],
                 "en_kws_enabled": bool(cfg.speech.en_kws_enabled),
             },
+            "reminders_config": {
+                "enabled": bool(cfg.reminders.enabled),
+                "quiet_start_hhmm": cfg.reminders.quiet_start_hhmm,
+                "quiet_end_hhmm": cfg.reminders.quiet_end_hhmm,
+            },
+            "toggles": {
+                "reminders": bool(cfg.reminders.enabled),
+                "memory": bool(cfg.memory.enabled),
+                "xiaohongshu": bool(cfg.tools.xiaohongshu.enabled),
+                "browser": bool(cfg.tools.browser.enabled),
+                "outlook": bool(cfg.tools.outlook.enabled),
+            },
             "config_path": str(self._config_path) if self._config_path else "config.yaml",
             "stats": self.history_store.stats(),
             "capabilities": self._build_capabilities(),
@@ -2217,7 +2233,197 @@ class McpServer:
             if denied is not None:
                 return denied
             items = self._read_reminders()
-            return web.json_response({"reminders": items, "count": len(items)})
+            return web.json_response(
+                {
+                    "reminders": items,
+                    "count": len(items),
+                    "enabled": bool(self._config.reminders.enabled),
+                    "quiet_start_hhmm": self._config.reminders.quiet_start_hhmm,
+                    "quiet_end_hhmm": self._config.reminders.quiet_end_hhmm,
+                }
+            )
+
+        async def handle_api_reminders_post(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            if not self._config.reminders.enabled:
+                return web.json_response(
+                    {"error": "reminders_disabled", "message": "Proactive reminders are disabled."},
+                    status=400,
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+
+            message = str(body.get("message") or "").strip()
+            kind = str(body.get("kind") or "reminder").strip()
+            delay_seconds = body.get("delay_seconds")
+            trigger_at_iso = body.get("trigger_at_iso")
+            daily_hhmm = body.get("daily_hhmm")
+
+            if delay_seconds is not None and delay_seconds != "":
+                if isinstance(delay_seconds, bool):
+                    return web.json_response(
+                        {"error": "invalid_reminder", "message": "delay_seconds must be an integer."},
+                        status=400,
+                    )
+                try:
+                    delay_seconds = int(delay_seconds)
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        {"error": "invalid_reminder", "message": "delay_seconds must be an integer."},
+                        status=400,
+                    )
+            else:
+                delay_seconds = None
+
+            if trigger_at_iso is not None:
+                if not isinstance(trigger_at_iso, str):
+                    return web.json_response(
+                        {"error": "invalid_reminder", "message": "trigger_at_iso must be an ISO string."},
+                        status=400,
+                    )
+                trigger_at_iso = trigger_at_iso.strip() or None
+
+            if daily_hhmm is not None:
+                if not isinstance(daily_hhmm, str):
+                    return web.json_response(
+                        {"error": "invalid_reminder", "message": "daily_hhmm must be HH:MM string."},
+                        status=400,
+                    )
+                daily_hhmm = daily_hhmm.strip() or None
+
+            try:
+                entry = self.reminder_store.add(
+                    message,
+                    delay_seconds=delay_seconds,
+                    trigger_at_iso=trigger_at_iso,
+                    daily_hhmm=daily_hhmm,
+                    kind=kind,
+                )
+            except ValueError as exc:
+                return web.json_response({"error": "invalid_reminder", "message": str(exc)}, status=400)
+            return web.json_response({"reminder": asdict(entry)}, status=201)
+
+        async def handle_api_reminders_delete(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            rem_id = request.match_info.get("id", "").strip()
+            removed = self.reminder_store.cancel(rem_id, exact_id=True)
+            if not removed:
+                return web.json_response({"error": "not_found", "removed": False, "id": rem_id}, status=404)
+            return web.json_response({"removed": True, "id": rem_id, "count": removed})
+
+        async def handle_api_capabilities_post(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+
+            hhmm_re = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+            updates: dict[str, Any] = {}
+            for bool_field in (
+                "reminders_enabled",
+                "memory_enabled",
+                "xiaohongshu_enabled",
+                "browser_enabled",
+                "outlook_enabled",
+            ):
+                if bool_field in body and body[bool_field] is not None:
+                    if not isinstance(body[bool_field], bool):
+                        return web.json_response(
+                            {"error": "invalid_settings", "message": f"{bool_field} must be a boolean."},
+                            status=400,
+                        )
+                    updates[bool_field] = body[bool_field]
+
+            for time_field in ("quiet_start_hhmm", "quiet_end_hhmm"):
+                if time_field in body and body[time_field] is not None:
+                    val = str(body[time_field]).strip()
+                    if not hhmm_re.match(val):
+                        return web.json_response(
+                            {"error": "invalid_settings", "message": f"{time_field} must be HH:MM (24h)."},
+                            status=400,
+                        )
+                    updates[time_field] = val
+
+            if not updates:
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "Provide at least one capability or quiet-hours field."},
+                    status=400,
+                )
+
+            persisted = False
+            if self._config_path is not None:
+                try:
+                    await asyncio.to_thread(
+                        persist_runtime_settings,
+                        self._config_path,
+                        **updates,
+                    )
+                    persisted = True
+                except OSError as exc:
+                    return web.json_response(
+                        {"error": "persist_failed", "message": f"Failed saving config.yaml: {exc}"},
+                        status=500,
+                    )
+
+            if "reminders_enabled" in updates:
+                self._config.reminders.enabled = updates["reminders_enabled"]
+            if "quiet_start_hhmm" in updates:
+                self._config.reminders.quiet_start_hhmm = updates["quiet_start_hhmm"]
+            if "quiet_end_hhmm" in updates:
+                self._config.reminders.quiet_end_hhmm = updates["quiet_end_hhmm"]
+            if "memory_enabled" in updates:
+                self._config.memory.enabled = updates["memory_enabled"]
+            if "xiaohongshu_enabled" in updates:
+                self._config.tools.xiaohongshu.enabled = updates["xiaohongshu_enabled"]
+            if "browser_enabled" in updates:
+                self._config.tools.browser.enabled = updates["browser_enabled"]
+            if "outlook_enabled" in updates:
+                self._config.tools.outlook.enabled = updates["outlook_enabled"]
+
+            if (
+                any(k in updates for k in ("reminders_enabled", "quiet_start_hhmm", "quiet_end_hhmm"))
+                and self._on_reminders_config_changed is not None
+            ):
+                self._on_reminders_config_changed(
+                    self._config.reminders.enabled,
+                    self._config.reminders.quiet_start_hhmm,
+                    self._config.reminders.quiet_end_hhmm,
+                )
+            if self._on_capabilities_changed is not None:
+                self._on_capabilities_changed()
+
+            return web.json_response(
+                {
+                    "status": "updated",
+                    "persisted": persisted,
+                    "reminders_config": {
+                        "enabled": bool(self._config.reminders.enabled),
+                        "quiet_start_hhmm": self._config.reminders.quiet_start_hhmm,
+                        "quiet_end_hhmm": self._config.reminders.quiet_end_hhmm,
+                    },
+                    "toggles": {
+                        "reminders": bool(self._config.reminders.enabled),
+                        "memory": bool(self._config.memory.enabled),
+                        "xiaohongshu": bool(self._config.tools.xiaohongshu.enabled),
+                        "browser": bool(self._config.tools.browser.enabled),
+                        "outlook": bool(self._config.tools.outlook.enabled),
+                    },
+                    "capabilities": self._build_capabilities(),
+                }
+            )
 
         app = web.Application()
         app.router.add_post("/mcp", handle_mcp_post)
@@ -2236,9 +2442,12 @@ class McpServer:
         app.router.add_post("/api/memories", handle_api_memories_post)
         app.router.add_delete("/api/memories/{id}", handle_api_memories_delete)
         app.router.add_post("/api/settings", handle_api_settings_post)
+        app.router.add_post("/api/capabilities", handle_api_capabilities_post)
         app.router.add_get("/api/voiceprints", handle_api_voiceprints_get)
         app.router.add_delete("/api/voiceprints/{id}", handle_api_voiceprints_delete)
         app.router.add_get("/api/reminders", handle_api_reminders_get)
+        app.router.add_post("/api/reminders", handle_api_reminders_post)
+        app.router.add_delete("/api/reminders/{id}", handle_api_reminders_delete)
 
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()

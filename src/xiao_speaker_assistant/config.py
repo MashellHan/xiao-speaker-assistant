@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
+
+_CONFIG_PERSIST_LOCK = threading.Lock()
 
 
 class SpeakerConfig(BaseModel):
@@ -197,44 +201,81 @@ def persist_runtime_settings(
     model: str | None = None,
     edge_voice: str | None = None,
     edge_rate: str | None = None,
+    reminders_enabled: bool | None = None,
+    quiet_start_hhmm: str | None = None,
+    quiet_end_hhmm: str | None = None,
+    memory_enabled: bool | None = None,
+    xiaohongshu_enabled: bool | None = None,
+    browser_enabled: bool | None = None,
+    outlook_enabled: bool | None = None,
 ) -> Path:
     """Atomically update selected runtime fields in `config.yaml` while preserving other sections."""
     target = Path(config_path) if config_path else Path("config.yaml")
-    data: dict = {}
-    if target.exists():
-        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            data = loaded
+    with _CONFIG_PERSIST_LOCK:
+        data: dict = {}
+        if target.exists():
+            loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
 
-    if edge_voice is not None or edge_rate is not None:
-        speaker = data.setdefault("speaker", {})
-        if not isinstance(speaker, dict):
-            speaker = {}
-            data["speaker"] = speaker
-        if edge_voice is not None:
-            speaker["edge_voice"] = edge_voice
-        if edge_rate is not None:
-            speaker["edge_rate"] = edge_rate
+        def _ensure_dict(parent: dict, key: str) -> dict:
+            val = parent.get(key)
+            if not isinstance(val, dict):
+                val = {}
+                parent[key] = val
+            return val
 
-    if model is not None:
-        llm = data.setdefault("llm", {})
-        if not isinstance(llm, dict):
-            llm = {}
-            data["llm"] = llm
-        providers = llm.setdefault("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            llm["providers"] = providers
-        opencode = providers.setdefault("opencode", {})
-        if not isinstance(opencode, dict):
-            opencode = {}
-            providers["opencode"] = opencode
-        opencode["model"] = model
+        if edge_voice is not None or edge_rate is not None:
+            speaker = _ensure_dict(data, "speaker")
+            if edge_voice is not None:
+                speaker["edge_voice"] = edge_voice
+            if edge_rate is not None:
+                speaker["edge_rate"] = edge_rate
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".yaml.tmp")
-    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    os.replace(tmp, target)
+        if model is not None:
+            llm = _ensure_dict(data, "llm")
+            providers = _ensure_dict(llm, "providers")
+            opencode = _ensure_dict(providers, "opencode")
+            opencode["model"] = model
+
+        if reminders_enabled is not None or quiet_start_hhmm is not None or quiet_end_hhmm is not None:
+            reminders = _ensure_dict(data, "reminders")
+            if reminders_enabled is not None:
+                reminders["enabled"] = bool(reminders_enabled)
+            if quiet_start_hhmm is not None:
+                reminders["quiet_start_hhmm"] = quiet_start_hhmm
+            if quiet_end_hhmm is not None:
+                reminders["quiet_end_hhmm"] = quiet_end_hhmm
+
+        if memory_enabled is not None:
+            memory = _ensure_dict(data, "memory")
+            memory["enabled"] = bool(memory_enabled)
+
+        if xiaohongshu_enabled is not None or browser_enabled is not None or outlook_enabled is not None:
+            tools = _ensure_dict(data, "tools")
+            if xiaohongshu_enabled is not None:
+                xhs = _ensure_dict(tools, "xiaohongshu")
+                xhs.setdefault("mcp_url", "http://127.0.0.1:18060/mcp")
+                xhs["enabled"] = bool(xiaohongshu_enabled)
+            if browser_enabled is not None:
+                br = _ensure_dict(tools, "browser")
+                br.setdefault("mcp_url", "http://127.0.0.1:8931/mcp")
+                br.setdefault("preferred_browser", "msedge")
+                br["enabled"] = bool(browser_enabled)
+            if outlook_enabled is not None:
+                _ensure_dict(tools, "outlook")["enabled"] = bool(outlook_enabled)
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+        fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".yaml.tmp", dir=str(target.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_path, target)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
     return target
 
 

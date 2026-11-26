@@ -285,6 +285,33 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             router.reload_runtime_config(active_config)
             router.opencode_session_id = None
 
+    def on_reminders_config_changed(enabled: bool, quiet_start: str, quiet_end: str) -> None:
+        nonlocal scheduler
+        active_config.reminders.enabled = enabled
+        active_config.reminders.quiet_start_hhmm = quiet_start
+        active_config.reminders.quiet_end_hhmm = quiet_end
+        if scheduler is not None:
+            scheduler.enabled = enabled
+            scheduler.quiet_start_hhmm = quiet_start
+            scheduler.quiet_end_hhmm = quiet_end
+        elif enabled and args.command != "openai-bridge":
+            scheduler = ReminderScheduler(
+                reminder_store,
+                deliver_proactive_reminder,
+                quiet_start_hhmm=quiet_start,
+                quiet_end_hhmm=quiet_end,
+                enabled=enabled,
+            )
+            scheduler.start()
+
+    def on_capabilities_changed() -> None:
+        nonlocal tools, clients, outlook_client
+        mcp_server.reload_config(active_config)
+        tools, clients = build_tool_registry(active_config, confirmation_store=confirmations)
+        outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
+        if router is not None:
+            router.reload_runtime_config(active_config)
+
     effective_config_path: str | Path | None = getattr(args, "config", None)
     if effective_config_path is None and Path("config.yaml").is_file():
         effective_config_path = Path("config.yaml").resolve()
@@ -300,6 +327,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         on_model_changed=on_model_changed,
+        on_reminders_config_changed=on_reminders_config_changed,
+        on_capabilities_changed=on_capabilities_changed,
         config_path=effective_config_path,
         include_local_tools=True,
     )
@@ -327,7 +356,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
 
     async def apply_hot_reload(new_cfg: AppConfig) -> None:
-        nonlocal active_config, tools, clients, outlook_client
+        nonlocal active_config, tools, clients, outlook_client, scheduler
         prev_model = active_config.llm.providers.opencode.model
         if getattr(args, "host", None):
             new_cfg.speaker.ws_host = args.host
@@ -345,8 +374,18 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         if gateway is not None:
             await asyncio.to_thread(gateway.reload_config, new_cfg)
         if scheduler is not None:
+            scheduler.enabled = new_cfg.reminders.enabled
             scheduler.quiet_start_hhmm = new_cfg.reminders.quiet_start_hhmm
             scheduler.quiet_end_hhmm = new_cfg.reminders.quiet_end_hhmm
+        elif new_cfg.reminders.enabled and args.command != "openai-bridge":
+            scheduler = ReminderScheduler(
+                reminder_store,
+                deliver_proactive_reminder,
+                quiet_start_hhmm=new_cfg.reminders.quiet_start_hhmm,
+                quiet_end_hhmm=new_cfg.reminders.quiet_end_hhmm,
+                enabled=True,
+            )
+            scheduler.start()
         if bridge is not None:
             bridge._speaker_config = new_cfg.speaker
         tools, clients = build_tool_registry(new_cfg, confirmation_store=confirmations)

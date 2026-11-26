@@ -704,6 +704,76 @@
       align-items: end;
     }
 
+    .reminder-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+      gap: var(--spacing-3);
+      align-items: end;
+    }
+
+    .quiet-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+      gap: var(--spacing-3);
+      align-items: end;
+    }
+
+    .toggle-row {
+      padding: var(--spacing-3) var(--spacing-5);
+      border-bottom: 1px solid var(--color-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-4);
+    }
+
+    .toggle-row:last-child {
+      border-bottom: 0;
+    }
+
+    .cap-switch {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--color-border-strong);
+      background: var(--color-surface-muted);
+      cursor: pointer;
+      flex-shrink: 0;
+      padding: 0;
+      transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+    }
+
+    .cap-switch::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 18px;
+      height: 18px;
+      border-radius: var(--radius-pill);
+      background: var(--color-surface);
+      border: 1px solid var(--color-border-strong);
+      transition: transform var(--dur-fast) var(--ease-out);
+    }
+
+    .cap-switch[aria-checked="true"] {
+      background: var(--color-accent);
+      border-color: var(--color-accent);
+    }
+
+    .cap-switch[aria-checked="true"]::after {
+      transform: translateX(20px);
+      border-color: var(--color-accent);
+    }
+
+    .cap-switch:disabled {
+      background: var(--color-surface-muted);
+      border-color: var(--color-border);
+      color: var(--color-text-tertiary);
+      cursor: not-allowed;
+    }
+
     .field {
       display: flex;
       flex-direction: column;
@@ -1059,7 +1129,9 @@
       .two-col,
       .caps-grid,
       .form-grid,
-      .inline-form {
+      .inline-form,
+      .reminder-form,
+      .quiet-form {
         grid-template-columns: minmax(0, 1fr);
       }
     }
@@ -1327,9 +1399,74 @@
         <div class="page-header">
           <div>
             <h1>能力与服务</h1>
-            <p class="page-subtitle">实时检查当前启用的 MCP 工具、本机插件与连接状态</p>
+            <p class="page-subtitle">实时开关核心能力、配置夜间免打扰时段，并查看各插件与 MCP 运行状态</p>
           </div>
         </div>
+
+        <section class="card" aria-labelledby="heading-cap-switches">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-cap-switches">能力开关与免打扰时段</h2>
+                <span class="card-meta">变更会原子写入 config.yaml 并即时热更新</span>
+              </div>
+            </div>
+          </div>
+          <div class="info-list">
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">主动定时提醒与每日早报</span>
+                <span class="info-row-sub">允许音箱到点响提示音并主动语音播报倒计时、定时提醒与早报</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleReminders" data-cap-toggle="reminders_enabled" aria-checked="true" aria-label="开关主动定时提醒"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">长期记忆</span>
+                <span class="info-row-sub">在对话中记住常住城市、称呼与个人偏好（0600 隔离保存）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleMemory" data-cap-toggle="memory_enabled" aria-checked="true" aria-label="开关长期记忆"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">小红书 MCP 搜索</span>
+                <span class="info-row-sub">通过本机 :18060 小红书 MCP 搜索笔记与详情（需先扫码登录）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleXiaohongshu" data-cap-toggle="xiaohongshu_enabled" aria-checked="false" aria-label="开关小红书 MCP"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">Playwright Edge 浏览器 MCP</span>
+                <span class="info-row-sub">启用 :8931 浏览器 MCP 深度抓取与页面交互（关闭时仍可使用内置网页摘要与打开 Edge）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleBrowser" data-cap-toggle="browser_enabled" aria-checked="false" aria-label="开关浏览器 MCP"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">Outlook 邮件助手</span>
+                <span class="info-row-sub">读邮件并在语音二次确认后发邮件（需先配置客户端编号与离线登录凭证）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleOutlook" data-cap-toggle="outlook_enabled" aria-checked="true" aria-label="开关 Outlook 邮件助手"></button>
+            </div>
+          </div>
+          <div class="card-pad" style="border-top: 1px solid var(--color-border);">
+            <form id="quietHoursForm" class="quiet-form">
+              <div class="field">
+                <label for="quietStartInput">每日免打扰开始（24h）</label>
+                <input id="quietStartInput" type="time" step="60" value="23:00" required>
+              </div>
+              <div class="field">
+                <label for="quietEndInput">每日免打扰结束（24h）</label>
+                <input id="quietEndInput" type="time" step="60" value="07:00" required>
+              </div>
+              <button type="submit" class="btn btn--primary" id="saveQuietBtn">保存免打扰</button>
+            </form>
+          </div>
+        </section>
+
         <div class="caps-grid" id="capabilitiesGrid"></div>
       </section>
 
@@ -1430,6 +1567,42 @@
             </div>
           </div>
           <div class="group-body" id="group-body-reminders">
+            <div class="card-pad" style="border-bottom: 1px solid var(--color-border);">
+              <form id="reminderForm" class="reminder-form">
+                <div class="field">
+                  <label for="reminderMessage">播报内容</label>
+                  <input id="reminderMessage" type="text" maxlength="200" placeholder="例如：提醒拳拳喝牛奶 / 北京天气与待办早报" required>
+                </div>
+                <div class="field">
+                  <label for="reminderMode">调度方式</label>
+                  <select id="reminderMode">
+                    <option value="delay">倒计时（分钟）</option>
+                    <option value="daily">每日定时（HH:MM）</option>
+                    <option value="once">指定时间</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="reminderKind">播报类型</label>
+                  <select id="reminderKind">
+                    <option value="reminder">普通提醒</option>
+                    <option value="morning_briefing">智能早报（含天气/待办）</option>
+                  </select>
+                </div>
+                <div class="field" id="reminderDelayField">
+                  <label for="reminderMinutes">倒计时分钟</label>
+                  <input id="reminderMinutes" type="number" min="1" max="43200" value="10">
+                </div>
+                <div class="field" id="reminderDailyField" hidden>
+                  <label for="reminderDailyTime">每日时间</label>
+                  <input id="reminderDailyTime" type="time" value="08:30">
+                </div>
+                <div class="field" id="reminderOnceField" hidden>
+                  <label for="reminderOnceTime">触发时间</label>
+                  <input id="reminderOnceTime" type="datetime-local">
+                </div>
+                <button type="submit" class="btn btn--primary" id="addReminderBtn">添加提醒</button>
+              </form>
+            </div>
             <div id="reminderList"></div>
           </div>
         </section>
@@ -1699,6 +1872,15 @@
         }
 
         renderCapabilities(data.capabilities || []);
+        const toggles = data.toggles || {};
+        const rc = data.reminders_config || {};
+        $("toggleReminders").setAttribute("aria-checked", String(Boolean(toggles.reminders ?? rc.enabled ?? true)));
+        $("toggleMemory").setAttribute("aria-checked", String(Boolean(toggles.memory ?? true)));
+        $("toggleXiaohongshu").setAttribute("aria-checked", String(Boolean(toggles.xiaohongshu ?? false)));
+        $("toggleBrowser").setAttribute("aria-checked", String(Boolean(toggles.browser ?? false)));
+        $("toggleOutlook").setAttribute("aria-checked", String(Boolean(toggles.outlook ?? true)));
+        if (rc.quiet_start_hhmm) $("quietStartInput").value = rc.quiet_start_hhmm;
+        if (rc.quiet_end_hhmm) $("quietEndInput").value = rc.quiet_end_hhmm;
       }
 
       function renderCapabilities(caps) {
@@ -1864,10 +2046,16 @@
                 (r) => `
                   <div class="info-row">
                     <div class="info-row-main">
-                      <span class="info-row-label">${escapeHtml(r.message || r.title || r.text || "提醒")}</span>
-                      <span class="info-row-sub num">${escapeHtml(r.daily_hhmm ? `每日 ${r.daily_hhmm}` : typeof r.trigger_at === "number" ? formatTime(r.trigger_at) : r.trigger_at || r.due_at || r.time || r.cron || "—")}</span>
+                      <div class="tags-row">
+                        <span class="info-row-label">${escapeHtml(r.message || r.title || r.text || "提醒")}</span>
+                        <span class="badge ${r.kind === "morning_briefing" ? "badge--accent" : ""}">${escapeHtml(r.kind === "morning_briefing" ? "智能早报" : "定时提醒")}</span>
+                      </div>
+                      <span class="info-row-sub num">${escapeHtml(r.daily_hhmm ? `每日 ${r.daily_hhmm}` : typeof r.trigger_at === "number" ? formatTime(r.trigger_at) : r.trigger_at || r.due_at || r.time || r.cron || "未设置")}</span>
                     </div>
-                    <span class="badge ${r.enabled === false ? "" : "badge--success"}">${escapeHtml(r.status || (r.enabled === false ? "已停用" : "生效中"))}</span>
+                    <div class="toolbar-row">
+                      <span class="badge ${r.enabled === false ? "" : "badge--success"}">${escapeHtml(r.status || (r.enabled === false ? "已停用" : "生效中"))}</span>
+                      ${r.id ? `<button type="button" class="btn btn--sm btn--danger" data-del-reminder="${escapeHtml(r.id)}">取消</button>` : ""}
+                    </div>
                   </div>
                 `
               )
@@ -2013,6 +2201,127 @@
           renderVoiceprints(await apiFetch("/api/voiceprints"));
         } catch (err) {
           showToast(`移除失败：${err.message}`, true);
+        }
+      });
+
+      function syncReminderModeFields() {
+        const mode = $("reminderMode").value;
+        $("reminderDelayField").hidden = mode !== "delay";
+        $("reminderDailyField").hidden = mode !== "daily";
+        $("reminderOnceField").hidden = mode !== "once";
+      }
+      $("reminderMode").addEventListener("change", syncReminderModeFields);
+      syncReminderModeFields();
+
+      $("reminderForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const btn = $("addReminderBtn");
+        const message = $("reminderMessage").value.trim();
+        const mode = $("reminderMode").value;
+        const kind = $("reminderKind").value;
+        if (!message) {
+          showToast("请填写播报内容", true);
+          return;
+        }
+        const payload = { message, kind };
+        if (mode === "delay") {
+          const mins = Number($("reminderMinutes").value);
+          if (!Number.isFinite(mins) || mins < 1 || mins > 43200) {
+            showToast("请填写 1 至 43200 分钟之间的倒计时", true);
+            return;
+          }
+          payload.delay_seconds = Math.round(mins * 60);
+        } else if (mode === "daily") {
+          const hhmm = $("reminderDailyTime").value.trim().slice(0, 5);
+          if (!hhmm) {
+            showToast("请选择每日触发时间", true);
+            return;
+          }
+          payload.daily_hhmm = hhmm;
+        } else {
+          const iso = $("reminderOnceTime").value.trim();
+          if (!iso) {
+            showToast("请选择触发日期时间", true);
+            return;
+          }
+          payload.trigger_at_iso = iso.length === 16 ? `${iso}:00` : iso;
+        }
+        btn.disabled = true;
+        try {
+          await apiFetch("/api/reminders", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+          $("reminderMessage").value = "";
+          showToast("定时提醒已添加");
+          renderReminders(await apiFetch("/api/reminders"));
+        } catch (err) {
+          showToast(`添加提醒失败：${err.message}`, true);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      $("reminderList").addEventListener("click", async (e) => {
+        const btn = e.target.closest("[data-del-reminder]");
+        if (!btn) return;
+        const id = btn.getAttribute("data-del-reminder");
+        try {
+          await apiFetch(`/api/reminders/${encodeURIComponent(id)}`, { method: "DELETE" });
+          showToast("已取消该提醒");
+          renderReminders(await apiFetch("/api/reminders"));
+        } catch (err) {
+          showToast(`取消提醒失败：${err.message}`, true);
+        }
+      });
+
+      document.querySelectorAll("[data-cap-toggle]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const key = btn.getAttribute("data-cap-toggle");
+          const nextVal = btn.getAttribute("aria-checked") !== "true";
+          btn.disabled = true;
+          try {
+            await apiFetch("/api/capabilities", {
+              method: "POST",
+              body: JSON.stringify({ [key]: nextVal }),
+            });
+            btn.setAttribute("aria-checked", String(nextVal));
+            showToast("能力配置已保存并生效");
+          } catch (err) {
+            showToast(`更新能力配置失败：${err.message}`, true);
+            btn.disabled = false;
+            return;
+          }
+          try {
+            await loadAll();
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
+
+      $("quietHoursForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const btn = $("saveQuietBtn");
+        btn.disabled = true;
+        try {
+          await apiFetch("/api/capabilities", {
+            method: "POST",
+            body: JSON.stringify({
+              quiet_start_hhmm: $("quietStartInput").value.trim().slice(0, 5),
+              quiet_end_hhmm: $("quietEndInput").value.trim().slice(0, 5),
+            }),
+          });
+          showToast("免打扰时段已保存并生效");
+        } catch (err) {
+          showToast(`保存免打扰失败：${err.message}`, true);
+          btn.disabled = false;
+          return;
+        }
+        try {
+          await loadAll();
+        } finally {
+          btn.disabled = false;
         }
       });
 

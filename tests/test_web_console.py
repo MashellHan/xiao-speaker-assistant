@@ -395,7 +395,10 @@ def test_web_console_graceful_missing_voiceprints_and_reminders(tmp_path: Path) 
 
                 rem = await client.get(f"http://127.0.0.1:{port}/api/reminders")
                 assert rem.status_code == 200
-                assert rem.json() == {"reminders": [], "count": 0}
+                rem_json = rem.json()
+                assert rem_json["reminders"] == []
+                assert rem_json["count"] == 0
+                assert rem_json["enabled"] is True
         finally:
             await runner.cleanup()
 
@@ -634,3 +637,160 @@ def test_voice_model_switching_and_remote_tunnel_login_gate(tmp_path: Path) -> N
             await runner.cleanup()
 
     asyncio.run(run_http())
+
+
+def test_web_console_reminders_crud_and_capability_toggles(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "reminders": {
+                    "enabled": True,
+                    "file_path": str(tmp_path / "reminders.json"),
+                    "quiet_start_hhmm": "23:00",
+                    "quiet_end_hhmm": "07:00",
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    reminder_changes: list[tuple[bool, str, str]] = []
+    cap_changes = 0
+
+    def on_cap() -> None:
+        nonlocal cap_changes
+        cap_changes += 1
+
+    srv = McpServer(
+        cfg,
+        config_path=cfg_path,
+        on_reminders_config_changed=lambda en, s, e: reminder_changes.append((en, s, e)),
+        on_capabilities_changed=on_cap,
+        include_local_tools=True,
+    )
+
+    async def run() -> None:
+        runner, port = await srv.start_http_server(host="127.0.0.1", port=0, auth_token="tok")
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                # 1. Create countdown and daily morning briefing via POST /api/reminders
+                r1 = await client.post(
+                    f"{base}/api/reminders",
+                    json={"message": "提醒喝水", "delay_seconds": 600, "kind": "reminder"},
+                )
+                assert r1.status_code == 201
+                rem1 = r1.json()["reminder"]
+                assert rem1["message"] == "提醒喝水"
+                assert rem1["trigger_at"] is not None
+
+                r2 = await client.post(
+                    f"{base}/api/reminders",
+                    json={"message": "每日早报", "daily_hhmm": "08:30", "kind": "morning_briefing"},
+                )
+                assert r2.status_code == 201
+                rem2 = r2.json()["reminder"]
+                assert rem2["daily_hhmm"] == "08:30"
+                assert rem2["kind"] == "morning_briefing"
+
+                listed = await client.get(f"{base}/api/reminders")
+                assert listed.status_code == 200
+                assert listed.json()["count"] == 2
+
+                # 2. Delete one reminder
+                deleted = await client.delete(f"{base}/api/reminders/{rem1['id']}")
+                assert deleted.status_code == 200
+                assert deleted.json()["removed"] is True
+                assert (await client.get(f"{base}/api/reminders")).json()["count"] == 1
+
+                # 3. Update quiet hours & capability toggles via POST /api/capabilities
+                cap_resp = await client.post(
+                    f"{base}/api/capabilities",
+                    json={
+                        "quiet_start_hhmm": "22:30",
+                        "quiet_end_hhmm": "07:30",
+                        "browser_enabled": True,
+                        "xiaohongshu_enabled": True,
+                    },
+                )
+                assert cap_resp.status_code == 200
+                cap_data = cap_resp.json()
+                assert cap_data["persisted"] is True
+                assert cap_data["reminders_config"] == {
+                    "enabled": True,
+                    "quiet_start_hhmm": "22:30",
+                    "quiet_end_hhmm": "07:30",
+                }
+                assert cap_data["toggles"]["browser"] is True
+                assert cap_data["toggles"]["xiaohongshu"] is True
+                assert reminder_changes == [(True, "22:30", "07:30")]
+                assert cap_changes == 1
+
+                reloaded = load_config(cfg_path)
+                assert reloaded.reminders.quiet_start_hhmm == "22:30"
+                assert reloaded.reminders.quiet_end_hhmm == "07:30"
+                assert reloaded.tools.browser.enabled is True
+                assert reloaded.tools.xiaohongshu.enabled is True
+
+                # Invalid HH:MM rejected cleanly
+                bad_q = await client.post(
+                    f"{base}/api/capabilities",
+                    json={"quiet_start_hhmm": "25:99"},
+                )
+                assert bad_q.status_code == 400
+
+                # Boolean delay_seconds rejected cleanly
+                bool_rem = await client.post(
+                    f"{base}/api/reminders",
+                    json={"message": "测试布尔值", "delay_seconds": True},
+                )
+                assert bool_rem.status_code == 400
+
+                # Exact-ID deletion must NOT delete another reminder whose message contains the ID
+                r_keep = await client.post(
+                    f"{base}/api/reminders",
+                    json={"message": f"包含关键字 {rem2['id']} 的提醒", "delay_seconds": 900},
+                )
+                assert r_keep.status_code == 201
+                del_exact = await client.delete(f"{base}/api/reminders/{rem2['id']}")
+                assert del_exact.status_code == 200
+                remaining = (await client.get(f"{base}/api/reminders")).json()["reminders"]
+                assert len(remaining) == 1
+                assert remaining[0]["id"] == r_keep.json()["reminder"]["id"]
+
+                # Nonexistent ID returns 404
+                assert (await client.delete(f"{base}/api/reminders/nonexistent")).status_code == 404
+
+                # Cross-origin and proxied unauthenticated requests rejected on new write endpoints
+                assert (
+                    await client.post(
+                        f"{base}/api/reminders",
+                        headers={"Origin": "https://evil.example"},
+                        json={"message": "evil", "delay_seconds": 60},
+                    )
+                ).status_code == 403
+                assert (
+                    await client.post(
+                        f"{base}/api/capabilities",
+                        headers={"Host": "nomi.mxhan.com", "CF-Connecting-IP": "198.51.100.2"},
+                        json={"browser_enabled": False},
+                    )
+                ).status_code == 401
+
+                # Disabling reminders blocks new creation via POST /api/reminders
+                dis = await client.post(
+                    f"{base}/api/capabilities",
+                    json={"reminders_enabled": False},
+                )
+                assert dis.status_code == 200
+                blocked = await client.post(
+                    f"{base}/api/reminders",
+                    json={"message": "禁用后添加", "delay_seconds": 60},
+                )
+                assert blocked.status_code == 400
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())

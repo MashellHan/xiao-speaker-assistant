@@ -82,13 +82,25 @@ class ReminderStore:
                 msg = str(item.get("message") or "").strip()
                 if not msg:
                     continue
+                raw_trigger = item.get("trigger_at")
+                parsed_trigger: float | None = None
+                parsed_daily = str(item["daily_hhmm"]) if item.get("daily_hhmm") else None
+                if raw_trigger is not None:
+                    if isinstance(raw_trigger, str) and _HHMM_RE.match(raw_trigger.strip()):
+                        if parsed_daily is None:
+                            parsed_daily = raw_trigger.strip()
+                    else:
+                        try:
+                            parsed_trigger = float(raw_trigger)
+                        except (TypeError, ValueError):
+                            parsed_trigger = None
                 loaded.append(
                     ReminderEntry(
                         id=str(item.get("id") or uuid.uuid4().hex[:8]),
                         message=msg,
                         kind=str(item.get("kind") or "reminder"),
-                        trigger_at=float(item["trigger_at"]) if item.get("trigger_at") is not None else None,
-                        daily_hhmm=str(item["daily_hhmm"]) if item.get("daily_hhmm") else None,
+                        trigger_at=parsed_trigger,
+                        daily_hhmm=parsed_daily,
                         last_fired_date=str(item["last_fired_date"]) if item.get("last_fired_date") else None,
                         created_at=float(item.get("created_at") or 0.0),
                     )
@@ -172,17 +184,20 @@ class ReminderStore:
         with self._lock:
             return list(self._entries)
 
-    def cancel(self, id_or_keyword: str) -> int:
+    def cancel(self, id_or_keyword: str, *, exact_id: bool = False) -> int:
         target = id_or_keyword.strip().lower()
         if not target:
             return 0
         with self._lock:
             before = len(self._entries)
-            self._entries = [
-                e
-                for e in self._entries
-                if e.id.lower() != target and target not in e.message.lower()
-            ]
+            if exact_id:
+                self._entries = [e for e in self._entries if e.id.lower() != target]
+            else:
+                self._entries = [
+                    e
+                    for e in self._entries
+                    if e.id.lower() != target and target not in e.message.lower()
+                ]
             removed = before - len(self._entries)
             if removed:
                 self._persist()
@@ -306,11 +321,13 @@ class ReminderScheduler:
         quiet_end_hhmm: str = "07:00",
         poll_interval: float = 1.0,
         retry_backoff_sec: float = 10.0,
+        enabled: bool = True,
     ) -> None:
         self._store = store
         self._on_due = on_due
         self.quiet_start_hhmm = quiet_start_hhmm
         self.quiet_end_hhmm = quiet_end_hhmm
+        self.enabled = enabled
         self._poll_interval = poll_interval
         self._retry_backoff_sec = retry_backoff_sec
         self._task: asyncio.Task[None] | None = None
@@ -318,6 +335,8 @@ class ReminderScheduler:
     async def tick_once(
         self, *, now_ts: float | None = None, local_now: datetime | None = None
     ) -> int:
+        if not self.enabled:
+            return 0
         due_entries = self._store.peek_due(
             now_ts=now_ts,
             local_now=local_now,
