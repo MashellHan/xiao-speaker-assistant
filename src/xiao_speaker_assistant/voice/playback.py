@@ -67,7 +67,10 @@ class PlaybackController:
         return self._stream_open
 
     def _alsa_buffer_frames(self) -> int:
-        return 19200 if self._wan_relay else 4800
+        # 400ms ALSA ring buffer over WAN (9600 frames @ 24kHz) vs 200ms on LAN:
+        # cuts initial ALSA start_threshold audio latency in half (400ms vs 800ms) while
+        # still absorbing internet jitter alongside the 1.2s client-side mpsc prebuffer.
+        return 9600 if self._wan_relay else 4800
 
     def _notify_playback_started(self) -> None:
         if self._on_playback_state and not self._playback_notified:
@@ -119,7 +122,7 @@ class PlaybackController:
                     "bits_per_sample": 16,
                     "sample_rate": self._config.tts_sample_rate,
                     "period_size": period_size,
-                    "buffer_size": buffer_size,  # 800ms WAN jitter buffer / 200ms LAN buffer at 24kHz
+                    "buffer_size": buffer_size,  # 400ms WAN jitter buffer / 200ms LAN buffer at 24kHz
                 },
                 wait_response=True,
                 timeout=5.0,
@@ -136,13 +139,13 @@ class PlaybackController:
             return False
         return True
 
-    async def _close_stream(self) -> None:
+    async def _close_stream(self, *, wait_ack: bool = True) -> None:
         self._play_drain_until = 0.0
         self._stream_sent_sec = 0.0
         if self._stream_open:
             self._stream_open = False
             try:
-                await self._send_rpc("stop_play", None, wait_response=True, timeout=1.5)
+                await self._send_rpc("stop_play", None, wait_response=wait_ack, timeout=1.5)
             except Exception:
                 pass
 
@@ -151,7 +154,10 @@ class PlaybackController:
         self._cancel_epoch += 1
         self._cancel_event.set()
         self._playback_notified = False
-        await self._close_stream()
+        # Do not block barge-in for up to 1.5s waiting for a stop_play RPC ack (which
+        # open-xiaoai-client does not always reply to during stream teardown); fire it immediately
+        # so the follow-up LLM query starts within milliseconds.
+        await self._close_stream(wait_ack=False)
         if stop_native:
             try:
                 await self._run_shell(STOP_NATIVE_SCRIPT, False, 5.0)
@@ -257,7 +263,7 @@ class PlaybackController:
             finally:
                 aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
                 if not aborted:
-                    await self._close_stream()
+                    await self._close_stream(wait_ack=False)
                     self._notify_playback_stopped()
 
     async def abort_stream(self, *, unmute: bool = True) -> None:
@@ -267,7 +273,7 @@ class PlaybackController:
             if epoch != self._cancel_epoch or self._cancel_event.is_set():
                 return
             if self._stream_open:
-                await self._close_stream()
+                await self._close_stream(wait_ack=False)
             if unmute:
                 self._notify_playback_stopped()
 
@@ -292,11 +298,11 @@ class PlaybackController:
                     yield self._chime_pcm[i : i + chunk_bytes]
 
             # Pad trailing silence beyond ALSA buffer_size so short chime always flushes immediately.
-            pad_sec = 0.70 if self._wan_relay else 0.25
+            pad_sec = 0.35 if self._wan_relay else 0.25
             try:
                 await self._stream_chunks(chime_iter(), epoch, pad_tail_sec=pad_sec)
             finally:
-                await self._close_stream()
+                await self._close_stream(wait_ack=False)
 
     async def speak(
         self,
@@ -326,9 +332,6 @@ class PlaybackController:
                     if epoch != self._cancel_epoch or self._cancel_event.is_set():
                         return
 
-                if not await self.ensure_stream_started(epoch=epoch):
-                    return
-
                 chunk_bytes = 9600 if self._wan_relay else 4800
                 tts_stream = (
                     synthesize_tts_pcm_stream(
@@ -340,15 +343,44 @@ class PlaybackController:
                     if (voice_override or self._wan_relay)
                     else synthesize_tts_pcm_stream(text, self._config)
                 )
+
+                # Pipeline start_play RPC with Edge-TTS first-chunk synthesis so the WAN RTT
+                # for `start_play` overlaps with TTS startup instead of adding serially.
+                if not self._stream_open:
+                    start_task = asyncio.create_task(self.ensure_stream_started(epoch=epoch))
+                    first_chunk: bytes | None = None
+                    try:
+                        first_chunk = await anext(tts_stream, None)
+                    except BaseException:
+                        if not start_task.done():
+                            start_task.cancel()
+                        await asyncio.gather(start_task, return_exceptions=True)
+                        raise
+                    if not await start_task:
+                        return
+                    if first_chunk is None:
+                        return
+
+                    async def _prefetched_stream() -> AsyncIterator[bytes]:
+                        yield first_chunk
+                        async for rest_chunk in tts_stream:
+                            yield rest_chunk
+
+                    active_stream: AsyncIterator[bytes] = _prefetched_stream()
+                else:
+                    if not await self.ensure_stream_started(epoch=epoch):
+                        return
+                    active_stream = tts_stream
+
                 await self._stream_chunks(
-                    tts_stream,
+                    active_stream,
                     epoch,
-                    pad_tail_sec=0.45 if self._wan_relay else 0.22,
+                    pad_tail_sec=0.35 if self._wan_relay else 0.22,
                     keep_open=keep_stream_open,
                 )
             finally:
                 aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
                 if self._config.tts_provider != "xiaoai" and (not keep_stream_open or aborted):
-                    await self._close_stream()
+                    await self._close_stream(wait_ack=False)
                 if not aborted and (not keep_stream_open or not self._stream_open):
                     self._notify_playback_stopped()

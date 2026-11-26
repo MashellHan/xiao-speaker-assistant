@@ -269,7 +269,7 @@ def test_playback_controller_wan_relay_uses_jitter_buffer_and_continuous_stream(
         "bits_per_sample": 16,
         "sample_rate": 24000,
         "period_size": 2400,
-        "buffer_size": 19200,
+        "buffer_size": 9600,
     }
     assert len(stop_rpcs) == 1
     # Compact JSON encoding omits spaces after commas/colons (~22% smaller over wire)
@@ -312,9 +312,9 @@ def test_playback_controller_wan_short_utterance_exceeds_alsa_start_threshold() 
             await pb.speak("好的", interrupt_native=True)
 
     asyncio.run(run())
-    # Must exceed ALSA 19200-frame (38400-byte) start_threshold so short utterances never drop!
+    # Must exceed ALSA 9600-frame (19200-byte) start_threshold so short utterances never drop!
     total_bytes = sum(len(frame["bytes"]) for frame in sent_binary)
-    assert total_bytes >= 19200 * 2
+    assert total_bytes >= 9600 * 2
 
 
 def test_playback_controller_keep_open_failure_still_unmutes_vad() -> None:
@@ -333,6 +333,9 @@ def test_playback_controller_keep_open_failure_still_unmutes_vad() -> None:
         # Simulate start_play RPC timeout -> returns None
         return None
 
+    async def fake_stream(text: str, cfg: SpeakerConfig, **kwargs):
+        yield b"\x01\x00" * 4800
+
     pb = PlaybackController(
         SpeakerConfig(tts_provider="edge"),
         send_text=fake_send_text,
@@ -344,12 +347,52 @@ def test_playback_controller_keep_open_failure_still_unmutes_vad() -> None:
     )
 
     async def run() -> None:
-        await pb.speak("第一句", interrupt_native=True, keep_stream_open=True)
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_stream):
+            await pb.speak("第一句", interrupt_native=True, keep_stream_open=True)
 
     asyncio.run(run())
     assert pb.stream_open is False
     # 1ch VAD MUST be unmuted cleanly when start_play fails under keep_stream_open=True
     assert states == [True, False]
+
+
+def test_stop_playback_does_not_block_on_missing_stop_play_ack() -> None:
+    import time
+
+    rpcs: list[tuple[str, bool]] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        pass
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def slow_if_waiting_rpc(cmd: str, payload, wait: bool, timeout: float):
+        rpcs.append((cmd, wait))
+        if cmd == "stop_play" and wait:
+            await asyncio.sleep(timeout)
+        return {"code": 0}
+
+    pb = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=slow_if_waiting_rpc,
+        wan_relay=True,
+    )
+
+    async def run() -> None:
+        assert await pb.ensure_stream_started()
+        t0 = time.monotonic()
+        await pb.stop_playback(stop_native=True)
+        assert (time.monotonic() - t0) < 0.3
+
+    asyncio.run(run())
+    assert ("stop_play", False) in rpcs
 
 
 def test_barge_in_during_continuous_stream_does_not_drain_or_close_new_chime() -> None:
