@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Helper to deploy relay/ to an Azure VM via SSH+Docker, or print Azure Container Apps CLI commands.
+# Helper to deploy hardened relay/ to an Azure VM via SSH+Docker, or print Azure Container Apps CLI commands.
 # Never reads or unlocks macOS login Keychain.
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,8 +9,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  1) Deploy to an Azure Ubuntu/Debian VM with Docker via SSH:
-       XSA_RELAY_TOKEN="<token>" ./scripts/deploy_azure_relay.sh --vm <user@azure-vm-ip-or-host> [--port 8765] [--ssh-key ~/.ssh/id_ed25519]
+  1) Deploy to an Azure Ubuntu/Debian VM with Docker via SSH (supports split host/speaker tokens):
+       XSA_RELAY_HOST_TOKEN="<host-tok>" XSA_RELAY_SPEAKER_TOKEN="<spk-tok>" \
+         ./scripts/deploy_azure_relay.sh --vm <user@azure-vm-ip-or-host> [--bind 127.0.0.1] [--port 8765] [--ssh-key ~/.ssh/omb_azure_relay]
+
+     (Legacy single token XSA_RELAY_TOKEN="<tok>" is still accepted if split tokens are unset.)
 
   2) Print Azure Container Apps deployment commands (run manually in your authenticated shell):
        ./scripts/deploy_azure_relay.sh --print-aca --rg <resource-group> --location <region> [--name xsa-relay]
@@ -19,6 +22,7 @@ EOF
 
 VM_TARGET=""
 SSH_KEY=""
+RELAY_BIND="127.0.0.1"
 RELAY_PORT="8765"
 PRINT_ACA="false"
 RG="xsa-relay-rg"
@@ -29,6 +33,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --vm) VM_TARGET="$2"; shift 2 ;;
     --ssh-key) SSH_KEY="$2"; shift 2 ;;
+    --bind) RELAY_BIND="$2"; shift 2 ;;
     --port) RELAY_PORT="$2"; shift 2 ;;
     --print-aca) PRINT_ACA="true"; shift ;;
     --rg) RG="$2"; shift 2 ;;
@@ -41,8 +46,9 @@ done
 
 if [ "$PRINT_ACA" = "true" ]; then
   cat <<EOF
-# 1. Generate a strong relay token (save in ~/.config/xiao-speaker-assistant/env with chmod 600):
-export XSA_RELAY_TOKEN="\$(openssl rand -hex 32)"
+# 1. Generate separate strong relay tokens (save in ~/.config/xiao-speaker-assistant/env with chmod 600):
+export XSA_RELAY_HOST_TOKEN="\$(openssl rand -hex 32)"
+export XSA_RELAY_SPEAKER_TOKEN="\$(openssl rand -hex 32)"
 
 # 2. Deploy to Azure Container Apps (managed wss:// ingress, pinned to 1 replica):
 az group create --name "$RG" --location "$LOCATION"
@@ -53,11 +59,8 @@ az containerapp up \\
   --source "$REPO_ROOT/relay" \\
   --ingress external \\
   --target-port 8765 \\
-  --env-vars XSA_RELAY_TOKEN="\$XSA_RELAY_TOKEN"
+  --env-vars XSA_RELAY_HOST_TOKEN="\$XSA_RELAY_HOST_TOKEN" XSA_RELAY_SPEAKER_TOKEN="\$XSA_RELAY_SPEAKER_TOKEN"
 az containerapp update --name "$APP_NAME" --resource-group "$RG" --min-replicas 1 --max-replicas 1
-# WARNING: Plain ws:// over public networks exposes audio frames and ?token= in cleartext.
-# Only enable --allow-insecure for stock open-xiaoai-client (which lacks TLS) when no TLS-terminating proxy is used:
-az containerapp ingress update --name "$APP_NAME" --resource-group "$RG" --allow-insecure
 EOF
   exit 0
 fi
@@ -67,8 +70,10 @@ if [ -z "$VM_TARGET" ]; then
   exit 2
 fi
 
-if [ -z "${XSA_RELAY_TOKEN:-}" ]; then
-  echo "ERROR: Set XSA_RELAY_TOKEN in your environment first (e.g. openssl rand -hex 32)." >&2
+HOST_TOK="${XSA_RELAY_HOST_TOKEN:-${XSA_RELAY_TOKEN:-}}"
+SPK_TOK="${XSA_RELAY_SPEAKER_TOKEN:-${XSA_RELAY_TOKEN:-}}"
+if [ -z "$HOST_TOK" ] || [ -z "$SPK_TOK" ]; then
+  echo "ERROR: Set XSA_RELAY_HOST_TOKEN and XSA_RELAY_SPEAKER_TOKEN (or legacy XSA_RELAY_TOKEN) first." >&2
   exit 2
 fi
 
@@ -77,17 +82,33 @@ if [ -n "$SSH_KEY" ]; then
   SSH_ARGS+=(-i "$SSH_KEY")
 fi
 
-tar -C "$REPO_ROOT/relay" -cf - Dockerfile server.py | ssh "${SSH_ARGS[@]}" "$VM_TARGET" "
+# Strip macOS AppleDouble (._*) metadata files when tarring.
+COPYFILE_DISABLE=1 tar -C "$REPO_ROOT/relay" -cf - Dockerfile server.py | ssh "${SSH_ARGS[@]}" "$VM_TARGET" "
   set -euo pipefail
-  mkdir -p ~/xsa-relay && cd ~/xsa-relay
-  tar -xf -
-  docker build -t xsa-relay:latest .
-  docker rm -f xsa-relay >/dev/null 2>&1 || true
-  docker run -d \\
+  sudo mkdir -p /opt/xsa-relay
+  sudo rm -f /opt/xsa-relay/._Dockerfile /opt/xsa-relay/._server.py
+  sudo tar -C /opt/xsa-relay -xf -
+  sudo install -m 600 /dev/null /opt/xsa-relay/relay.env
+  sudo tee /opt/xsa-relay/relay.env >/dev/null <<'ENVEOF'
+RELAY_HOST=0.0.0.0
+RELAY_PORT=8765
+XSA_RELAY_HOST_TOKEN=${HOST_TOK}
+XSA_RELAY_SPEAKER_TOKEN=${SPK_TOK}
+ENVEOF
+  sudo chmod 600 /opt/xsa-relay/relay.env
+  sudo docker build -t xsa-relay:latest /opt/xsa-relay
+  sudo docker rm -f xsa-relay >/dev/null 2>&1 || true
+  sudo docker run -d \\
     --name xsa-relay \\
     --restart unless-stopped \\
-    -p ${RELAY_PORT}:8765 \\
-    -e XSA_RELAY_TOKEN=$(printf '%q' "$XSA_RELAY_TOKEN") \\
+    --user 65532:65532 \\
+    --read-only \\
+    --cap-drop=ALL \\
+    --security-opt=no-new-privileges:true \\
+    --memory=256m \\
+    --pids-limit=128 \\
+    --env-file /opt/xsa-relay/relay.env \\
+    -p ${RELAY_BIND}:${RELAY_PORT}:8765 \\
     xsa-relay:latest
-  echo 'Relay container running on port ${RELAY_PORT}.'
+  echo 'Relay container running (bind=${RELAY_BIND}:${RELAY_PORT}, uid=65532, read-only).'
 "

@@ -8,6 +8,8 @@ import hmac
 import logging
 import os
 import sys
+import time
+from collections import deque
 from http import HTTPStatus
 from typing import Literal
 from urllib.parse import parse_qs, urlsplit
@@ -22,11 +24,19 @@ Role = Literal["speaker", "host"]
 CLOSE_REPLACED = 4000
 CLOSE_UNAUTHORIZED = 4401
 CLOSE_NOT_FOUND = 4404
+CLOSE_RATE_LIMITED = 4429
 
 
 def _read_token_from_env(env_name: str = "XSA_RELAY_TOKEN") -> str | None:
     value = os.environ.get(env_name, "").strip()
     return value or None
+
+
+def _read_bool_env(env_name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _extract_bearer_token(authorization_header: str) -> str | None:
@@ -44,6 +54,17 @@ async def _safe_close(conn: ServerConnection, code: int, reason: str) -> None:
         pass
 
 
+def _client_ip(conn: ServerConnection) -> str:
+    if conn.request is not None:
+        xff = conn.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if xff:
+            return xff
+    remote = conn.remote_address
+    if isinstance(remote, tuple) and remote:
+        return str(remote[0])
+    return str(remote or "unknown")
+
+
 class RelayServer:
     """Stateless bidirectional relay between one active speaker and one active host."""
 
@@ -53,12 +74,41 @@ class RelayServer:
         port: int = 8765,
         *,
         token: str | None = None,
+        host_token: str | None = None,
+        speaker_token: str | None = None,
+        allow_insecure_no_auth: bool = False,
         max_size: int | None = 1048576,
+        auth_fail_limit: int = 10,
+        auth_fail_window_sec: float = 60.0,
+        auth_ban_sec: float = 300.0,
     ) -> None:
         self.host = host
         self.port = port
-        self._token = _read_token_from_env() if token is None else (token.strip() or None)
+        legacy_token = _read_token_from_env("XSA_RELAY_TOKEN") if token is None else (token.strip() or None)
+        resolved_host_token = (
+            _read_token_from_env("XSA_RELAY_HOST_TOKEN")
+            if host_token is None
+            else (host_token.strip() or None)
+        )
+        resolved_speaker_token = (
+            _read_token_from_env("XSA_RELAY_SPEAKER_TOKEN")
+            if speaker_token is None
+            else (speaker_token.strip() or None)
+        )
+        self._host_token = resolved_host_token or legacy_token
+        self._speaker_token = resolved_speaker_token or legacy_token
+        self._allow_insecure_no_auth = allow_insecure_no_auth
+        if not self._allow_insecure_no_auth and (not self._host_token or not self._speaker_token):
+            raise ValueError(
+                "Relay authentication token is required. Set XSA_RELAY_HOST_TOKEN + "
+                "XSA_RELAY_SPEAKER_TOKEN (or XSA_RELAY_TOKEN), or explicitly pass allow_insecure_no_auth=True."
+            )
         self._max_size = max_size
+        self._auth_fail_limit = max(1, int(auth_fail_limit))
+        self._auth_fail_window_sec = max(1.0, float(auth_fail_window_sec))
+        self._auth_ban_sec = max(1.0, float(auth_ban_sec))
+        self._auth_failures: dict[str, deque[float]] = {}
+        self._banned_until: dict[str, float] = {}
         self._speaker: ServerConnection | None = None
         self._host_conn: ServerConnection | None = None
         self._server: Server | None = None
@@ -69,20 +119,67 @@ class RelayServer:
             return self.port
         return int(self._server.sockets[0].getsockname()[1])
 
-    def _is_authorized(self, conn: ServerConnection, *, allow_query_token: bool = False) -> bool:
-        if self._token is None:
+    @property
+    def separate_role_tokens(self) -> bool:
+        return bool(
+            self._host_token
+            and self._speaker_token
+            and not hmac.compare_digest(self._host_token, self._speaker_token)
+        )
+
+    def _is_banned(self, ip: str, now: float) -> bool:
+        until = self._banned_until.get(ip)
+        if until is None:
+            return False
+        if now >= until:
+            self._banned_until.pop(ip, None)
+            return False
+        return True
+
+    def _record_auth_failure(self, ip: str, now: float) -> bool:
+        q = self._auth_failures.get(ip)
+        if q is None:
+            if len(self._auth_failures) > 4096:
+                self._auth_failures.clear()
+            q = deque()
+            self._auth_failures[ip] = q
+        cutoff = now - self._auth_fail_window_sec
+        while q and q[0] < cutoff:
+            q.popleft()
+        q.append(now)
+        if len(q) >= self._auth_fail_limit:
+            self._banned_until[ip] = now + self._auth_ban_sec
+            q.clear()
             return True
+        return False
+
+    def _clear_auth_failures(self, ip: str) -> None:
+        self._auth_failures.pop(ip, None)
+
+    def _expected_token_for_role(self, role: Role) -> str | None:
+        return self._speaker_token if role == "speaker" else self._host_token
+
+    def _is_authorized(
+        self,
+        conn: ServerConnection,
+        *,
+        role: Role,
+        allow_query_token: bool = False,
+    ) -> bool:
+        expected = self._expected_token_for_role(role)
+        if expected is None:
+            return self._allow_insecure_no_auth
         if conn.request is None:
             return False
         raw_header = conn.request.headers.get("Authorization", "")
         presented = _extract_bearer_token(raw_header)
         if presented is not None:
-            return hmac.compare_digest(presented, self._token)
+            return hmac.compare_digest(presented, expected)
         if allow_query_token:
             query_params = parse_qs(urlsplit(conn.request.path).query, keep_blank_values=False)
             tokens = query_params.get("token")
             if tokens and len(tokens) == 1 and tokens[0].strip():
-                return hmac.compare_digest(tokens[0].strip(), self._token)
+                return hmac.compare_digest(tokens[0].strip(), expected)
         return False
 
     def _get_conn(self, role: Role) -> ServerConnection | None:
@@ -109,20 +206,44 @@ class RelayServer:
         return None
 
     async def _handle_connection(self, conn: ServerConnection) -> None:
-        path = urlsplit(conn.request.path).path if conn.request else ""
-        if not self._is_authorized(conn, allow_query_token=(path == "/ws/speaker")):
-            logger.warning("Rejected unauthorized connection from %s", conn.remote_address)
-            await conn.close(code=CLOSE_UNAUTHORIZED, reason="Unauthorized")
+        ip = _client_ip(conn)
+        now = time.monotonic()
+        if self._is_banned(ip, now):
+            logger.warning("Rejected rate-limited connection from %s", ip)
+            await conn.close(code=CLOSE_RATE_LIMITED, reason="Too Many Requests")
             return
 
-        if path == "/ws/speaker":
+        path = urlsplit(conn.request.path).path if conn.request else ""
+        if path in {"/ws/speaker", "/xsa/ws/speaker"}:
             role: Role = "speaker"
-        elif path == "/ws/host":
+        elif path in {"/ws/host", "/xsa/ws/host"}:
             role = "host"
         else:
-            logger.warning("Rejected unknown endpoint %r from %s", path, conn.remote_address)
+            # Verify host token before revealing 404 so unauthenticated scanners always see 4401.
+            if not self._is_authorized(conn, role="host", allow_query_token=False):
+                self._record_auth_failure(ip, now)
+                logger.warning("Rejected unauthorized connection from %s", ip)
+                await conn.close(code=CLOSE_UNAUTHORIZED, reason="Unauthorized")
+                return
+            logger.warning("Rejected unknown endpoint %r from %s", path, ip)
             await conn.close(code=CLOSE_NOT_FOUND, reason="Not Found")
             return
+
+        if not self._is_authorized(conn, role=role, allow_query_token=(role == "speaker")):
+            banned = self._record_auth_failure(ip, now)
+            logger.warning(
+                "Rejected unauthorized %s connection from %s%s",
+                role,
+                ip,
+                " (IP rate-limited)" if banned else "",
+            )
+            await conn.close(
+                code=CLOSE_RATE_LIMITED if banned else CLOSE_UNAUTHORIZED,
+                reason="Too Many Requests" if banned else "Unauthorized",
+            )
+            return
+
+        self._clear_auth_failures(ip)
 
         previous = self._get_conn(role)
         self._set_conn(role, conn)
@@ -133,7 +254,7 @@ class RelayServer:
                 _safe_close(previous, code=CLOSE_REPLACED, reason=f"Replaced by new {role}")
             )
 
-        logger.info("Connected %s from %s", role, conn.remote_address)
+        logger.info("Connected %s from %s", role, ip)
         try:
             async for message in conn:
                 if self._get_conn(role) is not conn:
@@ -162,11 +283,16 @@ class RelayServer:
             process_request=self._process_request,
             max_size=self._max_size,
         )
+        auth_mode = (
+            "split-role-tokens"
+            if self.separate_role_tokens
+            else ("shared-token" if self._host_token else "disabled")
+        )
         logger.info(
             "Relay listening on ws://%s:%d (auth=%s)",
             self.host,
             self.bound_port,
-            "enabled" if self._token else "disabled",
+            auth_mode,
         )
         return self
 
@@ -213,7 +339,11 @@ def main(argv: list[str] | None = None) -> int:
     # Prevent websockets handshake logs from recording ?token= or Authorization headers at DEBUG.
     logging.getLogger("websockets").setLevel(logging.INFO)
 
-    relay = RelayServer(host=args.host, port=args.port)
+    relay = RelayServer(
+        host=args.host,
+        port=args.port,
+        allow_insecure_no_auth=_read_bool_env("XSA_RELAY_ALLOW_INSECURE_NO_AUTH", default=False),
+    )
     try:
         asyncio.run(relay.serve_forever())
     except KeyboardInterrupt:

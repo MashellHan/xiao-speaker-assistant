@@ -26,10 +26,11 @@ fi
 if [ -x "$XHS_BIN" ]; then
   XHS_BIN_ABS="$(cd "$(dirname "$XHS_BIN")" && pwd)/$(basename "$XHS_BIN")"
   XHS_WORKDIR="${XSA_XHS_WORKDIR:-$HOME/.local/share/xiao-speaker-assistant/xiaohongshu}"
+  XHS_PORT="${XSA_XHS_PORT:-18060}"
   mkdir -m 700 -p "$XHS_WORKDIR"
   chmod 700 "$XHS_WORKDIR"
-  echo "[mcp] Starting Xiaohongshu MCP on http://127.0.0.1:18060/mcp (dir=$XHS_WORKDIR) ..."
-  (umask 077 && cd "$XHS_WORKDIR" && exec "$XHS_BIN_ABS") &
+  echo "[mcp] Starting Xiaohongshu MCP on http://127.0.0.1:${XHS_PORT}/mcp (dir=$XHS_WORKDIR) ..."
+  (umask 077 && cd "$XHS_WORKDIR" && exec "$XHS_BIN_ABS" -port "127.0.0.1:${XHS_PORT}") &
   PIDS+=($!)
 else
   echo "[mcp] INFO: $XHS_BIN not found; skipping Xiaohongshu MCP"

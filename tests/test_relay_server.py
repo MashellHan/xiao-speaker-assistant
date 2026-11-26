@@ -269,6 +269,96 @@ def test_relay_host_client_forwards_frames_to_speaker_gateway() -> None:
     asyncio.run(scenario())
 
 
+def test_relay_refuses_to_start_without_token_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XSA_RELAY_TOKEN", raising=False)
+    monkeypatch.delenv("XSA_RELAY_HOST_TOKEN", raising=False)
+    monkeypatch.delenv("XSA_RELAY_SPEAKER_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="token"):
+        relay_mod.RelayServer(host="127.0.0.1", port=0)
+
+
+def test_split_host_and_speaker_tokens_enforce_role_separation() -> None:
+    host_tok = "host-secret-only"
+    spk_tok = "speaker-secret-only"
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            host_token=host_tok,
+            speaker_token=spk_tok,
+        ) as relay:
+            assert relay.separate_role_tokens is True
+            base = f"ws://127.0.0.1:{relay.bound_port}"
+            # Speaker token MUST NOT authenticate /ws/host (prevents speaker compromise -> RCE/spoof host)
+            await _expect_close_code(
+                f"{base}/ws/host",
+                4401,
+                headers={"Authorization": f"Bearer {spk_tok}"},
+            )
+            await _expect_close_code(
+                f"{base}/xsa/ws/host",
+                4401,
+                headers={"Authorization": f"Bearer {spk_tok}"},
+            )
+            # Host token MUST NOT authenticate /ws/speaker
+            await _expect_close_code(
+                f"{base}/ws/speaker?token={host_tok}",
+                4401,
+            )
+            # Matching role tokens succeed on both /ws/* and /xsa/ws/* prefix
+            async with (
+                websockets.connect(f"{base}/xsa/ws/speaker?token={spk_tok}") as speaker,
+                websockets.connect(
+                    f"{base}/xsa/ws/host",
+                    additional_headers={"Authorization": f"Bearer {host_tok}"},
+                ) as host,
+            ):
+                await host.send('{"Request":{"id":"r1","command":"ping"}}')
+                assert await asyncio.wait_for(speaker.recv(), timeout=2.0) == '{"Request":{"id":"r1","command":"ping"}}'
+                await speaker.send('{"Response":{"id":"r1","code":0}}')
+                assert await asyncio.wait_for(host.recv(), timeout=2.0) == '{"Response":{"id":"r1","code":0}}'
+
+    asyncio.run(scenario())
+
+
+def test_relay_rate_limits_repeated_auth_failures() -> None:
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            host_token="good-host",
+            speaker_token="good-spk",
+            auth_fail_limit=3,
+            auth_fail_window_sec=60.0,
+            auth_ban_sec=30.0,
+        ) as relay:
+            base = f"ws://127.0.0.1:{relay.bound_port}"
+            await _expect_close_code(f"{base}/ws/host", 4401, headers={"Authorization": "Bearer bad1"})
+            await _expect_close_code(f"{base}/ws/host", 4401, headers={"Authorization": "Bearer bad2"})
+            # 3rd failure hits ban threshold -> 4429
+            await _expect_close_code(f"{base}/ws/host", 4429, headers={"Authorization": "Bearer bad3"})
+            # Subsequent attempt (even with valid token) from banned IP is still rejected with 4429
+            await _expect_close_code(f"{base}/ws/host", 4429, headers={"Authorization": "Bearer good-host"})
+
+    asyncio.run(scenario())
+
+
+def test_relay_host_client_prefers_host_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XSA_RELAY_TOKEN", "legacy-shared")
+    monkeypatch.setenv("XSA_RELAY_HOST_TOKEN", "dedicated-host-tok")
+    cfg = AppConfig()
+    cfg.speech.asr_provider = "xiaoai_asr"
+
+    async def dummy(q: str) -> str:
+        return q
+
+    gw = SpeakerGateway(cfg, on_query=dummy)
+    client = RelayHostClient(gw, "wss://relay.mxhan.com/xsa/ws/host")
+    assert client.relay_url == "wss://relay.mxhan.com/xsa/ws/host"
+    assert client._build_headers() == {"Authorization": "Bearer dedicated-host-tok"}
+
+
 def test_relay_host_client_reconnects_with_backoff() -> None:
     token = "reconnect-token"
 
