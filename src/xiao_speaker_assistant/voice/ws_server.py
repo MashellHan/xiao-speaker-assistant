@@ -128,6 +128,7 @@ class SpeakerGateway:
         self._audio_watchdog_interval = audio_watchdog_interval
         self._audio_stall_timeout = audio_stall_timeout
         self._connections: set[ServerConnection] = set()
+        self._relay_connections: set[Any] = set()
         self._sessions: dict[Any, SpeakerSession] = {}
         self._mute_native_until: float = 0.0
         self._pipeline: LocalSpeechPipeline | None = None
@@ -211,12 +212,14 @@ class SpeakerGateway:
                 conn, cmd, payload, wait_response=wait, timeout=timeout
             ),
             on_playback_state=on_state,
+            wan_relay=(conn in self._relay_connections),
         )
         self._playbacks[conn] = pb
         return pb
 
     def _cleanup_connection(self, conn: Any) -> None:
         self._connections.discard(conn)
+        self._relay_connections.discard(conn)
         sess = self._sessions.pop(conn, None)
         if sess is not None and sess.active_reply_task is not None and not sess.active_reply_task.done():
             sess.interrupted = True
@@ -288,6 +291,7 @@ class SpeakerGateway:
         *,
         interrupt: bool = True,
         wait_response: bool = True,
+        keep_stream_open: bool = False,
     ) -> None:
         pb = self._get_playback(conn)
         sess = self._get_session(conn)
@@ -299,7 +303,19 @@ class SpeakerGateway:
                     voice_override = resolve_edge_voice(spk.preferred_voice).id
                 except ValueError:
                     pass
-        await pb.speak(text, interrupt_native=interrupt, voice_override=voice_override)
+        if keep_stream_open:
+            await pb.speak(
+                text,
+                interrupt_native=interrupt,
+                voice_override=voice_override,
+                keep_stream_open=True,
+            )
+        else:
+            await pb.speak(
+                text,
+                interrupt_native=interrupt,
+                voice_override=voice_override,
+            )
 
     async def abort_and_speak(self, conn: Any, text: str) -> None:
         await self.speak_sentence(conn, text, interrupt=True, wait_response=False)
@@ -333,58 +349,58 @@ class SpeakerGateway:
             return True
         return False
 
+    def _recording_params(self, conn: Any) -> dict[str, Any]:
+        # Over WAN/SSH relay, use larger capture periods (60ms vs 22.5ms) so uplink frame rate
+        # drops from ~44 frames/s to ~16.6 frames/s, cutting Dropbear/WS overhead and freeing
+        # bandwidth for downlink TTS playback.
+        is_wan = conn in self._relay_connections
+        period_size = 960 if is_wan else 360
+        buffer_size = 3840 if is_wan else 1440
+        return {
+            "pcm": self._config.speech.capture_pcm,
+            "channels": self._config.speech.capture_channels,
+            "bits_per_sample": self._config.speech.capture_bits_per_sample,
+            "sample_rate": 16000,
+            "period_size": period_size,
+            "buffer_size": buffer_size,
+        }
+
     async def start_recording(self, conn: Any) -> None:
         sess = self._get_session(conn)
-        bits = self._config.speech.capture_bits_per_sample
-        ch = self._config.speech.capture_channels
-        pcm_dev = self._config.speech.capture_pcm
+        params = self._recording_params(conn)
         logger.info(
-            "Starting speaker audio stream (%s, %dch, %d-bit, aec=%s) for local KWS (`%s`) + %s",
-            pcm_dev,
-            ch,
-            bits,
+            "Starting speaker audio stream (%s, %dch, %d-bit, period=%d, aec=%s) for local KWS (`%s`) + %s",
+            params["pcm"],
+            params["channels"],
+            params["bits_per_sample"],
+            params["period_size"],
             self._config.speech.aec_enabled,
             ", ".join(self._config.speech.local_keywords),
             self._config.speech.asr_model,
         )
-        await self.send_command(
-            conn,
-            "start_recording",
-            {
-                "pcm": pcm_dev,
-                "channels": ch,
-                "bits_per_sample": bits,
-                "sample_rate": 16000,
-                "period_size": 360,
-                "buffer_size": 1440,
-            },
-        )
+        await self.send_command(conn, "start_recording", params)
         sess.last_audio_at = time.monotonic()
 
     async def _audio_watchdog(self, conn: Any) -> None:
         sess = self._get_session(conn)
+        consecutive_stalls = 0
         while True:
             await asyncio.sleep(self._audio_watchdog_interval)
             if self._pipeline is None:
                 return
             if (time.monotonic() - sess.last_audio_at) > self._audio_stall_timeout:
-                logger.warning("Audio stream stalled >4s; restarting speaker recording")
-                bits = self._config.speech.capture_bits_per_sample
-                ch = self._config.speech.capture_channels
-                pcm_dev = self._config.speech.capture_pcm
-                await self.send_command(
-                    conn,
-                    "start_recording",
-                    {
-                        "pcm": pcm_dev,
-                        "channels": ch,
-                        "bits_per_sample": bits,
-                        "sample_rate": 16000,
-                        "period_size": 360,
-                        "buffer_size": 1440,
-                    },
-                )
+                consecutive_stalls += 1
+                # Throttle warning logs when the remote speaker is offline (still probe
+                # start_recording periodically so a reconnecting speaker resumes promptly).
+                if consecutive_stalls <= 3 or consecutive_stalls % 5 == 0:
+                    logger.warning("Audio stream stalled >4s; restarting speaker recording")
+                try:
+                    await self.send_command(conn, "start_recording", self._recording_params(conn))
+                except ConnectionClosed:
+                    return
                 sess.last_audio_at = time.monotonic()
+            else:
+                consecutive_stalls = 0
 
     async def _audio_worker(self, conn: Any, queue: asyncio.Queue[bytes]) -> None:
         while True:
@@ -874,6 +890,8 @@ class SpeakerGateway:
 
         prod_task = asyncio.create_task(producer())
         first_spoken = True
+        use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
+        completed_normally = False
         try:
             while True:
                 if sess.interrupted:
@@ -884,12 +902,29 @@ class SpeakerGateway:
                 logger.info("Streaming TTS sentence: %s", sentence)
                 self._record_spoken(sess, sentence)
                 sess.mute_native_until = time.monotonic() + 8.0
-                await self.speak_sentence(conn, sentence, interrupt=first_spoken, wait_response=True)
+                await self.speak_sentence(
+                    conn,
+                    sentence,
+                    interrupt=first_spoken,
+                    wait_response=True,
+                    keep_stream_open=use_continuous_stream,
+                )
                 first_spoken = False
+            if use_continuous_stream and not first_spoken and not sess.interrupted:
+                pb = self._playbacks.get(conn)
+                if pb is not None:
+                    await pb.finish_stream()
+            completed_normally = True
             await prod_task
         except asyncio.CancelledError:
             logger.info("Streaming reply cancelled due to barge-in")
         finally:
+            if use_continuous_stream and not completed_normally and not sess.interrupted:
+                # Mid-stream exception (not barge-in): close any kept-open stream immediately
+                # without padding/draining, and unmute 1ch VAD cleanly.
+                pb = self._playbacks.get(conn)
+                if pb is not None and pb.stream_open:
+                    await pb.abort_stream(unmute=True)
             if not prod_task.done():
                 prod_task.cancel()
             await asyncio.gather(prod_task, return_exceptions=True)

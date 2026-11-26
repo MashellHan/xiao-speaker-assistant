@@ -263,6 +263,8 @@ def test_server_url_validation_and_remote_commands() -> None:
     assert "chmod 600" in tun_key_cmd
 
     assert "trap 'cleanup_tunnel; exit 0' INT TERM" in boot_cmd
+    assert "ssh -y -N -K 10 -i" in boot_cmd
+    assert " -I " not in boot_cmd
     assert "/tmp/xiaoai-agent-tunnel.pid" in build_restart_command()
 
     status_cmd = build_status_command()

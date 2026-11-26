@@ -115,7 +115,9 @@ start_tunnel_if_configured() {{
     cleanup_tunnel
     echo "$(date): starting encrypted SSH tunnel -> ${{TUNNEL_USER}}@${{TUNNEL_HOST}}:${{TUNNEL_PORT}} (127.0.0.1:${{TUNNEL_LOCAL_PORT}} -> 127.0.0.1:${{TUNNEL_REMOTE_PORT}})" >> "$LOG_FILE"
     # Note: Dropbear -y performs TOFU (persisting first host key to ~/.ssh/known_hosts and rejecting changes).
-    ssh -y -N -K 20 -i "$TUNNEL_KEY" -p "$TUNNEL_PORT" \\
+    # -K 10 sends SSH keepalives every 10s; Dropbear disconnects dead links after 3 missed replies (~30s)
+    # without killing healthy idle -N -L tunnels (unlike -I, which is an inactivity timeout).
+    ssh -y -N -K 10 -i "$TUNNEL_KEY" -p "$TUNNEL_PORT" \\
         -L "127.0.0.1:${{TUNNEL_LOCAL_PORT}}:127.0.0.1:${{TUNNEL_REMOTE_PORT}}" \\
         "${{TUNNEL_USER}}@${{TUNNEL_HOST}}" >> "$LOG_FILE" 2>&1 &
     TUNNEL_PID=$!
