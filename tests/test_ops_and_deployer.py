@@ -236,6 +236,34 @@ def test_server_url_validation_and_remote_commands() -> None:
     boot_cmd = build_deploy_boot_script_command()
     assert "/data/xiaoai-agent/boot.sh" in boot_cmd
     assert "chmod 755" in boot_cmd
+    assert "start_tunnel_if_configured" in boot_cmd
+    assert "tunnel.conf" in boot_cmd
+
+    from xiao_speaker_assistant.voice.speaker_deployer import (
+        build_deploy_tunnel_config_command,
+        build_upload_tunnel_key_command,
+    )
+
+    tun_cmd = build_deploy_tunnel_config_command("relay.example.com", tunnel_port=2222)
+    assert "TUNNEL_HOST=relay.example.com" in tun_cmd
+    assert "TUNNEL_PORT=2222" in tun_cmd
+    assert "chmod 600" in tun_cmd
+
+    for bad_host in ("", "-oProxyCommand=id", "bad host", "host;id", "__XSA_TUNNEL_CONF_EOF__"):
+        with pytest.raises(ValueError):
+            build_deploy_tunnel_config_command(bad_host)
+    for bad_user in ("", "-oBad", "root@evil", "a b"):
+        with pytest.raises(ValueError):
+            build_deploy_tunnel_config_command("relay.example.com", tunnel_user=bad_user)
+    with pytest.raises(ValueError):
+        build_deploy_tunnel_config_command("relay.example.com", tunnel_port=0)
+
+    tun_key_cmd = build_upload_tunnel_key_command()
+    assert "tunnel_id_dropbear" in tun_key_cmd
+    assert "chmod 600" in tun_key_cmd
+
+    assert "trap 'cleanup_tunnel; exit 0' INT TERM" in boot_cmd
+    assert "/tmp/xiaoai-agent-tunnel.pid" in build_restart_command()
 
     status_cmd = build_status_command()
     assert "ps" in status_cmd

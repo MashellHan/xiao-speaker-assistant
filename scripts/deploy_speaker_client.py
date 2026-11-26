@@ -94,6 +94,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Upload local open-xiaoai client binary to /data/xiaoai-agent/client.",
     )
     parser.add_argument(
+        "--tunnel-host",
+        help="Configure encrypted Dropbear SSH tunnel to Azure VM host (e.g. relay.mxhan.com).",
+    )
+    parser.add_argument(
+        "--tunnel-port",
+        type=int,
+        default=2222,
+        help="SSH tunnel port on Azure VM (default: 2222).",
+    )
+    parser.add_argument(
+        "--tunnel-user",
+        default="xsa-tunnel",
+        help="Restricted SSH tunnel user on Azure VM (default: xsa-tunnel).",
+    )
+    parser.add_argument(
+        "--tunnel-key",
+        type=Path,
+        help="Upload local Dropbear-format private key to /data/xiaoai-agent/tunnel_id_dropbear.",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Check speaker processes (ps), /data free space, and /tmp/xiaoai-agent.log.",
@@ -148,6 +168,8 @@ def main(
             args.client_bin is not None,
             args.install_boot,
             args.install_aec_alsa,
+            args.tunnel_host is not None,
+            args.tunnel_key is not None,
             args.server_url is not None,
             args.restart,
             args.status,
@@ -155,7 +177,8 @@ def main(
     )
     if not has_action:
         parser.error(
-            "Specify at least one action: --server-url, --install-boot, --install-aec-alsa, --client-bin, --restart, --status, or --print-boot-script."
+            "Specify at least one action: --server-url, --install-boot, --install-aec-alsa, "
+            "--tunnel-host, --tunnel-key, --client-bin, --restart, --status, or --print-boot-script."
         )
 
     if not args.host:
@@ -186,6 +209,19 @@ def main(
         steps.append(("install-boot", deployer.install_boot_script))
     if args.install_aec_alsa:
         steps.append(("install-aec-alsa", deployer.install_aec_alsa))
+    if args.tunnel_key is not None:
+        steps.append(("upload-tunnel-key", lambda: deployer.upload_tunnel_key(args.tunnel_key)))
+    if args.tunnel_host is not None:
+        steps.append(
+            (
+                "install-tunnel-config",
+                lambda: deployer.install_tunnel_config(
+                    args.tunnel_host,
+                    tunnel_port=args.tunnel_port,
+                    tunnel_user=args.tunnel_user,
+                ),
+            )
+        )
     if args.server_url is not None:
         steps.append(("update-server-url", lambda: deployer.update_server_url(args.server_url)))
     if args.restart:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ DEFAULT_KNOWN_HOSTS = Path(".local/known_hosts")
 DEFAULT_REMOTE_DIR = "/data/xiaoai-agent"
 DEFAULT_LOG_PATH = "/tmp/xiaoai-agent.log"
 DEFAULT_PID_FILE = "/tmp/xiaoai-agent-boot.pid"
+DEFAULT_TUNNEL_PID_FILE = "/tmp/xiaoai-agent-tunnel.pid"
+_TUNNEL_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+_TUNNEL_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -46,8 +50,10 @@ def build_boot_script(
     agent_dir: str = DEFAULT_REMOTE_DIR,
     binary_name: str = "client",
     server_file: str = "server.txt",
+    tunnel_conf_file: str = "tunnel.conf",
     log_file: str = DEFAULT_LOG_PATH,
     pid_file: str = DEFAULT_PID_FILE,
+    tunnel_pid_file: str = DEFAULT_TUNNEL_PID_FILE,
     ping_target: str = "223.5.5.5",
     max_net_wait_attempts: int = 60,
     restart_delay: int = 5,
@@ -57,11 +63,27 @@ def build_boot_script(
 AGENT_DIR={shlex.quote(agent_dir)}
 CLIENT_BIN="${{AGENT_DIR}}/{binary_name}"
 SERVER_FILE="${{AGENT_DIR}}/{server_file}"
+TUNNEL_CONF="${{AGENT_DIR}}/{tunnel_conf_file}"
 LOG_FILE={shlex.quote(log_file)}
 PID_FILE={shlex.quote(pid_file)}
+TUNNEL_PID_FILE={shlex.quote(tunnel_pid_file)}
+TUNNEL_PID=""
 
 echo $$ > "$PID_FILE"
 cd "$AGENT_DIR" || exit 1
+
+cleanup_tunnel() {{
+    if [ -n "$TUNNEL_PID" ]; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        TUNNEL_PID=""
+    fi
+    if [ -f "$TUNNEL_PID_FILE" ]; then
+        kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true
+        rm -f "$TUNNEL_PID_FILE"
+    fi
+}}
+trap cleanup_tunnel EXIT
+trap 'cleanup_tunnel; exit 0' INT TERM
 
 i=0
 while [ "$i" -lt {max_net_wait_attempts} ]; do
@@ -71,6 +93,41 @@ while [ "$i" -lt {max_net_wait_attempts} ]; do
     i=$((i + 1))
     sleep 2
 done
+
+start_tunnel_if_configured() {{
+    if [ ! -f "$TUNNEL_CONF" ]; then
+        return 0
+    fi
+    TUNNEL_HOST=""
+    TUNNEL_PORT="2222"
+    TUNNEL_USER="xsa-tunnel"
+    TUNNEL_LOCAL_PORT="8765"
+    TUNNEL_REMOTE_PORT="8765"
+    TUNNEL_KEY="${{AGENT_DIR}}/tunnel_id_dropbear"
+    # shellcheck disable=SC1090
+    . "$TUNNEL_CONF"
+    if [ -z "$TUNNEL_HOST" ] || [ ! -f "$TUNNEL_KEY" ]; then
+        return 0
+    fi
+    if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        return 0
+    fi
+    cleanup_tunnel
+    echo "$(date): starting encrypted SSH tunnel -> ${{TUNNEL_USER}}@${{TUNNEL_HOST}}:${{TUNNEL_PORT}} (127.0.0.1:${{TUNNEL_LOCAL_PORT}} -> 127.0.0.1:${{TUNNEL_REMOTE_PORT}})" >> "$LOG_FILE"
+    # Note: Dropbear -y performs TOFU (persisting first host key to ~/.ssh/known_hosts and rejecting changes).
+    ssh -y -N -K 20 -i "$TUNNEL_KEY" -p "$TUNNEL_PORT" \\
+        -L "127.0.0.1:${{TUNNEL_LOCAL_PORT}}:127.0.0.1:${{TUNNEL_REMOTE_PORT}}" \\
+        "${{TUNNEL_USER}}@${{TUNNEL_HOST}}" >> "$LOG_FILE" 2>&1 &
+    TUNNEL_PID=$!
+    echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+    sleep 2
+    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        echo "$(date): SSH tunnel exited prematurely; will retry next loop" >> "$LOG_FILE"
+        cleanup_tunnel
+        return 1
+    fi
+    return 0
+}}
 
 while true; do
     SERVER_URL=""
@@ -90,6 +147,11 @@ while true; do
         continue
     fi
 
+    if ! start_tunnel_if_configured; then
+        sleep {restart_delay}
+        continue
+    fi
+
     echo "$(date): starting {binary_name} -> $(printf '%s' "$SERVER_URL" | sed 's/token=[^&#]*/token=REDACTED/g')" >> "$LOG_FILE"
     if [ -f "$AGENT_DIR/asound_xsa.conf" ]; then
         export ALSA_CONFIG_PATH="$AGENT_DIR/asound_xsa.conf"
@@ -99,6 +161,7 @@ while true; do
     "$CLIENT_BIN" "$SERVER_URL" >> "$LOG_FILE" 2>&1
     EXIT_CODE=$?
     echo "$(date): {binary_name} exited ($EXIT_CODE), restarting in {restart_delay}s" >> "$LOG_FILE"
+    cleanup_tunnel
     sleep {restart_delay}
 done
 """
@@ -217,6 +280,62 @@ def build_deploy_boot_script_command(
     )
 
 
+def build_deploy_tunnel_config_command(
+    tunnel_host: str,
+    *,
+    tunnel_port: int = 2222,
+    tunnel_user: str = "xsa-tunnel",
+    local_port: int = 8765,
+    remote_port: int = 8765,
+    remote_dir: str = DEFAULT_REMOTE_DIR,
+) -> str:
+    """Write `/data/xiaoai-agent/tunnel.conf` (0600) for Dropbear encrypted SSH tunneling."""
+    clean_host = tunnel_host.strip()
+    if not clean_host or not _TUNNEL_HOST_RE.match(clean_host):
+        raise ValueError(f"Invalid tunnel host: {tunnel_host!r}")
+    clean_user = tunnel_user.strip()
+    if not clean_user or not _TUNNEL_USER_RE.match(clean_user):
+        raise ValueError(f"Invalid tunnel user: {tunnel_user!r}")
+    for label, p in (("tunnel_port", tunnel_port), ("local_port", local_port), ("remote_port", remote_port)):
+        if isinstance(p, bool) or not (1 <= int(p) <= 65535):
+            raise ValueError(f"Invalid {label}: {p}")
+    q_dir = shlex.quote(remote_dir)
+    q_conf = shlex.quote(f"{remote_dir}/tunnel.conf")
+    conf_body = (
+        f"TUNNEL_HOST={shlex.quote(clean_host)}\n"
+        f"TUNNEL_PORT={int(tunnel_port)}\n"
+        f"TUNNEL_USER={shlex.quote(clean_user)}\n"
+        f"TUNNEL_LOCAL_PORT={int(local_port)}\n"
+        f"TUNNEL_REMOTE_PORT={int(remote_port)}\n"
+    )
+    marker = "__XSA_TUNNEL_CONF_EOF__"
+    return (
+        f"mkdir -p {q_dir} && "
+        f"(umask 077 && cat <<'{marker}' > {q_conf}\n"
+        f"{conf_body}"
+        f"{marker}\n"
+        f") && chmod 600 {q_conf}"
+    )
+
+
+def build_upload_tunnel_key_command(
+    *,
+    remote_dir: str = DEFAULT_REMOTE_DIR,
+    key_filename: str = "tunnel_id_dropbear",
+) -> str:
+    """Upload a Dropbear binary private key (0600) to `/data/xiaoai-agent/tunnel_id_dropbear`."""
+    q_dir = shlex.quote(remote_dir)
+    q_tmp = shlex.quote(f"{remote_dir}/{key_filename}.tmp")
+    q_dst = shlex.quote(f"{remote_dir}/{key_filename}")
+    return (
+        f"mkdir -p {q_dir} && "
+        f"(umask 077 && cat > {q_tmp}) && "
+        f"chmod 600 {q_tmp} && "
+        f"mv {q_tmp} {q_dst} && "
+        f"chmod 600 {q_dst}"
+    )
+
+
 def build_upload_client_command(
     *,
     remote_dir: str = DEFAULT_REMOTE_DIR,
@@ -241,14 +360,17 @@ def build_status_command(
 ) -> str:
     q_dir = shlex.quote(remote_dir)
     q_server = shlex.quote(f"{remote_dir}/server.txt")
+    q_tunnel = shlex.quote(f"{remote_dir}/tunnel.conf")
     q_log = shlex.quote(log_path)
     return (
         'echo "=== Processes ===" && '
-        '(ps w 2>/dev/null || ps) | grep -E "xiaoai-agent|client|boot\\.sh" | grep -v grep | sed "s/token=[^&# ]*/token=REDACTED/g" || true; '
+        '(ps w 2>/dev/null || ps) | grep -E "xiaoai-agent|client|boot\\.sh|tunnel_id_dropbear" | grep -v grep | sed "s/token=[^&# ]*/token=REDACTED/g" || true; '
         'echo "=== /data Free Space ===" && '
         'df -h /data && '
         'echo "=== server.txt ===" && '
         f'(sed "s/token=[^&#]*/token=REDACTED/g" {q_server} 2>/dev/null || echo "(missing in {q_dir})") && '
+        'echo "=== tunnel.conf ===" && '
+        f'(cat {q_tunnel} 2>/dev/null || echo "(not configured)") && '
         f'echo "=== {log_path} ===" && '
         f'(tail -n {tail_lines} {q_log} 2>/dev/null || echo "(no log)")'
     )
@@ -258,15 +380,21 @@ def build_restart_command(
     *,
     remote_dir: str = DEFAULT_REMOTE_DIR,
     pid_file: str = DEFAULT_PID_FILE,
+    tunnel_pid_file: str = DEFAULT_TUNNEL_PID_FILE,
     binary_name: str = "client",
 ) -> str:
     q_boot = shlex.quote(f"{remote_dir}/boot.sh")
     q_pid = shlex.quote(pid_file)
+    q_tun_pid = shlex.quote(tunnel_pid_file)
     q_bin = shlex.quote(binary_name)
     return (
         f"if [ -f {q_pid} ]; then "
         f"kill $(cat {q_pid}) 2>/dev/null || true; "
         f"rm -f {q_pid}; "
+        "fi; "
+        f"if [ -f {q_tun_pid} ]; then "
+        f"kill $(cat {q_tun_pid}) 2>/dev/null || true; "
+        f"rm -f {q_tun_pid}; "
         "fi; "
         f"killall {q_bin} 2>/dev/null || true; "
         "sleep 1; "
@@ -364,6 +492,36 @@ class SpeakerDeployer:
 
     def install_aec_alsa(self) -> DeployResult:
         return self.run_remote(build_deploy_asound_command(remote_dir=self.remote_dir))
+
+    def upload_tunnel_key(self, local_key_path: Path) -> DeployResult:
+        key_file = local_key_path.expanduser()
+        if not key_file.is_file():
+            raise FileNotFoundError(f"Tunnel key file not found: {key_file}")
+        payload = None if self.dry_run else key_file.read_bytes()
+        return self.run_remote(
+            build_upload_tunnel_key_command(remote_dir=self.remote_dir),
+            stdin_bytes=payload,
+        )
+
+    def install_tunnel_config(
+        self,
+        tunnel_host: str,
+        *,
+        tunnel_port: int = 2222,
+        tunnel_user: str = "xsa-tunnel",
+        local_port: int = 8765,
+        remote_port: int = 8765,
+    ) -> DeployResult:
+        return self.run_remote(
+            build_deploy_tunnel_config_command(
+                tunnel_host,
+                tunnel_port=tunnel_port,
+                tunnel_user=tunnel_user,
+                local_port=local_port,
+                remote_port=remote_port,
+                remote_dir=self.remote_dir,
+            )
+        )
 
     def upload_client(self, local_binary: Path) -> DeployResult:
         binary_path = local_binary.expanduser()

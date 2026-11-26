@@ -1647,6 +1647,13 @@
               </div>
               <button type="button" class="cap-switch" role="switch" id="toggleOutlook" data-cap-toggle="outlook_enabled" aria-checked="true" aria-label="开关 Outlook 邮件助手"></button>
             </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">敏感工具主人声纹鉴权</span>
+                <span class="info-row-sub">开启后，仅已注册为 host 角色的主人声纹可调用本机文件读取、Codex 分析与 Outlook 邮件</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleHostVoiceprint" data-cap-toggle="require_host_voiceprint" aria-checked="false" aria-label="开关敏感工具主人声纹鉴权"></button>
+            </div>
           </div>
           <div class="card-pad" style="border-top: 1px solid var(--color-border);">
             <form id="quietHoursForm" class="quiet-form">
@@ -2179,6 +2186,7 @@
         $("toggleXiaohongshu").setAttribute("aria-checked", String(Boolean(toggles.xiaohongshu ?? false)));
         $("toggleBrowser").setAttribute("aria-checked", String(Boolean(toggles.browser ?? false)));
         $("toggleOutlook").setAttribute("aria-checked", String(Boolean(toggles.outlook ?? true)));
+        $("toggleHostVoiceprint").setAttribute("aria-checked", String(Boolean(toggles.require_host_voiceprint ?? false)));
         if (rc.quiet_start_hhmm) $("quietStartInput").value = rc.quiet_start_hhmm;
         if (rc.quiet_end_hhmm) $("quietEndInput").value = rc.quiet_end_hhmm;
       }
