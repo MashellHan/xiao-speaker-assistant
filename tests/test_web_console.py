@@ -470,8 +470,11 @@ def test_cli_serve_records_history_on_handle_query_and_stream_query(tmp_path: Pa
         ),
         encoding="utf-8",
     )
+    from xiao_speaker_assistant.tools import TurnTraceStore
+
     hist_path = tmp_path / "history.json"
     recorded_store = ConversationHistoryStore(hist_path)
+    recorded_traces = TurnTraceStore(tmp_path / "traces.json")
 
     class FakeRunner:
         async def cleanup(self) -> None:
@@ -505,6 +508,7 @@ def test_cli_serve_records_history_on_handle_query_and_stream_query(tmp_path: Pa
 
     with (
         patch.object(cli, "ConversationHistoryStore", return_value=recorded_store),
+        patch.object(cli, "TurnTraceStore", return_value=recorded_traces),
         patch.object(cli.McpServer, "start_http_server", fake_start_http),
         patch.object(cli.LLMRouter, "start", fake_router_start),
         patch.object(cli.LLMRouter, "close", fake_router_close),
