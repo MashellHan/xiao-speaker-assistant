@@ -12,6 +12,7 @@ from xiao_speaker_assistant.tools.confirmation import (
     is_cancel_utterance,
     is_confirm_utterance,
 )
+from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient, parse_mcp_http_response
 from xiao_speaker_assistant.tools.mcp_server import McpServer, extract_html_summary
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 
@@ -465,3 +466,65 @@ def test_stdio_loop_and_cli_mcp_server_subcommand(monkeypatch) -> None:
     assert cli.main(["mcp-server"]) == 0
     assert called is True
     assert cli.main(["doctor"]) == 0
+
+
+def test_parse_mcp_http_response_json_and_sse() -> None:
+    json_obj = parse_mcp_http_response(
+        "application/json",
+        '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}',
+        expected_id=1,
+    )
+    assert json_obj["id"] == 1
+
+    # Multi-event SSE with a trailing notification must still pick the matching response
+    sse_body = (
+        "event: message\n"
+        'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"Playwright"}}}\n\n'
+        "event: message\n"
+        'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n'
+    )
+    sse_obj = parse_mcp_http_response("text/event-stream; charset=utf-8", sse_body, expected_id=1)
+    assert sse_obj["result"]["serverInfo"]["name"] == "Playwright"
+
+    # Empty / notification-only SSE and non-dict JSON raise ValueError
+    for ct, bad in [
+        ("text/event-stream", 'data: {"jsonrpc":"2.0","method":"notifications/message"}\n\n'),
+        ("application/json", '["not-a-dict"]'),
+    ]:
+        try:
+            parse_mcp_http_response(ct, bad, expected_id=1)
+            raise AssertionError("Expected ValueError")
+        except ValueError:
+            pass
+
+    # End-to-end HttpMcpClient SSE handshake + notifications/initialized + session header
+    seen_calls: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_calls.append((body["method"], request.headers.get("Mcp-Session-Id")))
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream", "Mcp-Session-Id": "sess-xyz"},
+                text='event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Playwright"}}}\n\n',
+            )
+        if body["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            text='event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"browser_navigate"}]}}\n\n',
+        )
+
+    async def run_client() -> list[dict[str, Any]]:
+        client = HttpMcpClient("http://127.0.0.1:8931/mcp", transport=httpx.MockTransport(handler))
+        return await client.list_tools()
+
+    tools = asyncio.run(run_client())
+    assert [t["name"] for t in tools] == ["browser_navigate"]
+    assert seen_calls == [
+        ("initialize", None),
+        ("notifications/initialized", "sess-xyz"),
+        ("tools/list", "sess-xyz"),
+    ]
