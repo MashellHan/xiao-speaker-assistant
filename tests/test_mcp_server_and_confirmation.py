@@ -12,6 +12,7 @@ from xiao_speaker_assistant.tools.confirmation import (
     is_cancel_utterance,
     is_confirm_utterance,
 )
+from xiao_speaker_assistant.tools.mcp_client import parse_mcp_http_response
 from xiao_speaker_assistant.tools.mcp_server import McpServer, extract_html_summary
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 
@@ -465,3 +466,18 @@ def test_stdio_loop_and_cli_mcp_server_subcommand(monkeypatch) -> None:
     assert cli.main(["mcp-server"]) == 0
     assert called is True
     assert cli.main(["doctor"]) == 0
+
+
+def test_parse_mcp_http_response_json_and_sse() -> None:
+    json_obj = parse_mcp_http_response(
+        "application/json",
+        '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}',
+    )
+    assert json_obj["id"] == 1
+
+    sse_body = (
+        "event: message\n"
+        'data: {"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"Playwright"}},"jsonrpc":"2.0","id":1}\n\n'
+    )
+    sse_obj = parse_mcp_http_response("text/event-stream; charset=utf-8", sse_body)
+    assert sse_obj["result"]["serverInfo"]["name"] == "Playwright"
