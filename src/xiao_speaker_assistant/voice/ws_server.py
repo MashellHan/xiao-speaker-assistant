@@ -1051,13 +1051,13 @@ class SpeakerGateway:
             prewarm_tts_task = asyncio.create_task(_open_prewarm_tts())
             all_prewarm_tasks.append(prewarm_tts_task)
 
-        # Over WAN relay, pre-open `start_play` in parallel with LLM generation so the ~550ms
-        # WAN RPC round-trip finishes before the first TTS chunk is ready.
+        # Over WAN relay, speculatively stop native audio + open `start_play` under `pb._lock`
+        # in parallel with LLM generation so the ~550ms WAN RPC round-trip overlaps LLM think.
         prestart_play_task: asyncio.Task[bool] | None = None
         if use_continuous_stream and conn in self._relay_connections and not pb.stream_open:
             async def _prestart_play() -> bool:
                 try:
-                    return await pb.ensure_stream_started()
+                    return await pb.prestart_stream(stop_native=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1203,8 +1203,11 @@ class SpeakerGateway:
                 sess.mute_native_until = time.monotonic() + 8.0
                 should_interrupt_native = not native_stopped
                 if kind == "ack":
-                    if prestart_play_task is not None and not prestart_play_task.done():
-                        await asyncio.gather(prestart_play_task, return_exceptions=True)
+                    if prestart_play_task is not None:
+                        res_list = await asyncio.gather(prestart_play_task, return_exceptions=True)
+                        if res_list and res_list[0] is True:
+                            native_stopped = True
+                        prestart_play_task = None
                     ack_prewarm = await _take_prewarmed_tts()
                     # Start a fresh pre-warmed Edge-TTS WS for the upcoming real reply while ack plays!
                     if self._config.speaker.tts_provider == "edge":
@@ -1226,7 +1229,7 @@ class SpeakerGateway:
                         await self.speak_sentence(
                             conn,
                             sentence,
-                            interrupt=should_interrupt_native,
+                            interrupt=not native_stopped,
                             wait_response=True,
                             keep_stream_open=False,
                             prefetched_pcm=None,
@@ -1240,8 +1243,12 @@ class SpeakerGateway:
                     if trace is not None:
                         trace.ack_ms = round((time.monotonic() - t_ack) * 1000.0, 1)
                     continue
-                if prestart_play_task is not None and not prestart_play_task.done():
-                    await asyncio.gather(prestart_play_task, return_exceptions=True)
+                if prestart_play_task is not None:
+                    res_list = await asyncio.gather(prestart_play_task, return_exceptions=True)
+                    if res_list and res_list[0] is True:
+                        native_stopped = True
+                    prestart_play_task = None
+                should_interrupt_native = not native_stopped
                 if kind == "error":
                     # Detach trace context so speaking the error notice never pollutes turn TTS/TTFA metrics.
                     err_tok = CURRENT_TURN_TRACE.set(None)

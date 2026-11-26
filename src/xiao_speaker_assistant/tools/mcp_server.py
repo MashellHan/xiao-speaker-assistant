@@ -1208,7 +1208,8 @@ class McpServer:
     _WEATHER_CITY_COORDS: dict[str, tuple[float, float]] = {
         "北京": (39.9042, 116.4074),
         "海淀": (39.9593, 116.2981),
-        "朝阳": (39.9219, 116.4436),
+        "朝阳区": (39.9219, 116.4436),
+        "北京朝阳": (39.9219, 116.4436),
         "延庆": (40.4567, 115.9749),
         "上海": (31.2304, 121.4737),
         "广州": (23.1291, 113.2644),
@@ -1272,7 +1273,7 @@ class McpServer:
                 {"error": "invalid_arguments", "message": "Argument 'city' is required."},
                 is_error=True,
             )
-        cache_key = city.lower()
+        cache_key = (city.rstrip("市区县") or city).lower()
         cache = getattr(self, "_weather_cache", None)
         if cache is None:
             cache = {}
@@ -1345,9 +1346,10 @@ class McpServer:
             if len(ordered) > 1:
                 result["tomorrow_min_c"] = ordered[1].get("min_c")
                 result["tomorrow_max_c"] = ordered[1].get("max_c")
-            if len(cache) >= 64:
-                cache.clear()
-            cache[cache_key] = (time.monotonic(), dict(result))
+            if result.get("current_temp_c") is not None and ordered:
+                if len(cache) >= 64:
+                    cache.clear()
+                cache[cache_key] = (time.monotonic(), dict(result))
             return self._tool_result(result)
         except Exception as exc:
             return self._tool_result(

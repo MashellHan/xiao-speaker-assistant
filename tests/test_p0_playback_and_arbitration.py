@@ -874,3 +874,60 @@ def test_prewarmed_edge_tts_and_speculative_start_play_overlap_with_llm() -> Non
     assert ev_map["start_play"] < ev_map["llm_first"]
     assert received_prewarm == [fake_prewarm]
     assert prewarm_closed is True
+
+
+def test_prewarmed_edge_tts_stream_mp3_escapes_xml_and_parses_audio_frames() -> None:
+    import aiohttp
+    import time
+    from xiao_speaker_assistant.voice.tts_stream import PrewarmedEdgeTTS
+
+    sent_payloads: list[str] = []
+    ws_closed = False
+    sess_closed = False
+
+    class FakeMsg:
+        def __init__(self, msg_type, data):
+            self.type = msg_type
+            self.data = data
+
+    audio_hdr = b"X-RequestId:1\r\nContent-Type:audio/mpeg\r\nPath:audio\r\n\r\n"
+    audio_frame = len(audio_hdr).to_bytes(2, "big") + audio_hdr + b"\xff\xfb\x90\x00MP3DATA"
+    non_audio_hdr = b"Path:audio.metadata\r\n\r\n"
+    meta_frame = len(non_audio_hdr).to_bytes(2, "big") + non_audio_hdr + b"{}"
+
+    class FakeWS:
+        closed = False
+
+        async def send_str(self, s: str) -> None:
+            sent_payloads.append(s)
+
+        async def close(self) -> None:
+            nonlocal ws_closed
+            ws_closed = True
+            self.closed = True
+
+        def __aiter__(self):
+            async def _gen():
+                yield FakeMsg(aiohttp.WSMsgType.BINARY, meta_frame)
+                yield FakeMsg(aiohttp.WSMsgType.BINARY, audio_frame)
+                yield FakeMsg(aiohttp.WSMsgType.TEXT, "Path:turn.end\r\n\r\n")
+            return _gen()
+
+    class FakeSession:
+        async def close(self) -> None:
+            nonlocal sess_closed
+            sess_closed = True
+
+    pre = PrewarmedEdgeTTS(FakeSession(), FakeWS(), created_at=time.monotonic())
+
+    async def run() -> list[bytes]:
+        assert pre.claim() is True
+        assert pre.claim() is False  # cannot claim twice
+        return [chunk async for chunk in pre.stream_mp3("A & B < C > D", voice="zh-CN-XiaoyiNeural", rate="+8%")]
+
+    chunks = asyncio.run(run())
+    assert chunks == [b"\xff\xfb\x90\x00MP3DATA"]
+    assert len(sent_payloads) == 1
+    assert "A &amp; B &lt; C &gt; D" in sent_payloads[0]
+    assert ws_closed is True
+    assert sess_closed is True

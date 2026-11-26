@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 import time
+from xml.sax.saxutils import escape as xml_escape
 
 import numpy as np
 
@@ -35,7 +36,7 @@ class PrewarmedEdgeTTS:
 
     Opening the TLS + WSS connection to Microsoft Speech takes ~550-750ms from China.
     By starting `PrewarmedEdgeTTS.open()` in parallel with LLM generation, sending SSML
-    produces the first PCM chunk in ~150-220ms instead of ~1200-1800ms.
+    produces the first PCM chunk in ~150-350ms instead of ~1200-1800ms.
     """
 
     def __init__(self, session: object, ws: object, *, created_at: float) -> None:
@@ -51,7 +52,9 @@ class PrewarmedEdgeTTS:
         from edge_tts.communicate import connect_id, date_to_string
         from edge_tts.constants import SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
         from edge_tts.drm import DRM
+        import edge_tts.communicate as edge_comm
 
+        ssl_ctx = getattr(edge_comm, "_SSL_CTX", None)
         timeout = aiohttp.ClientTimeout(total=60.0, sock_connect=connect_timeout, sock_read=30.0)
         session = aiohttp.ClientSession(trust_env=True, timeout=timeout)
         ws = None
@@ -62,7 +65,7 @@ class PrewarmedEdgeTTS:
                 f"&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}"
             )
             headers = {**WSS_HEADERS, "Cookie": f"muid={DRM.generate_muid()};"}
-            ws = await session.ws_connect(url, headers=headers)
+            ws = await session.ws_connect(url, headers=headers, compress=15, ssl=ssl_ctx)
             await ws.send_str(
                 f"X-Timestamp:{date_to_string()}\r\n"
                 "Content-Type:application/json; charset=utf-8\r\n"
@@ -73,12 +76,16 @@ class PrewarmedEdgeTTS:
             )
             return cls(session, ws, created_at=time.monotonic())
         except BaseException:
-            if ws is not None:
+            try:
+                if ws is not None:
+                    await asyncio.wait_for(ws.close(), timeout=1.0)
+            except BaseException:
+                pass
+            finally:
                 try:
-                    await ws.close()
+                    await asyncio.wait_for(session.close(), timeout=1.0)
                 except BaseException:
                     pass
-            await session.close()
             raise
 
     @property
@@ -110,17 +117,28 @@ class PrewarmedEdgeTTS:
             remove_incompatible_characters,
             ssml_headers_plus_data,
         )
-        from edge_tts.typing import TTSConfig
+        from edge_tts.data_classes import TTSConfig
 
         try:
             ws = self._ws
-            tts_cfg = TTSConfig(voice=voice, rate=rate, volume="+0%", pitch="+0Hz")
-            cleaned = remove_incompatible_characters(text)
+            tts_cfg = TTSConfig(
+                voice=voice,
+                rate=rate,
+                volume="+0%",
+                pitch="+0Hz",
+                boundary="SentenceBoundary",
+            )
+            cleaned = xml_escape(remove_incompatible_characters(text))
             ssml = mkssml(tts_cfg, cleaned)
             await ws.send_str(ssml_headers_plus_data(connect_id(), date_to_string(), ssml))  # type: ignore[attr-defined]
             async for msg in ws:  # type: ignore[attr-defined]
                 if msg.type == aiohttp.WSMsgType.BINARY and len(msg.data) >= 2:
                     hdr_len = int.from_bytes(msg.data[:2], "big")
+                    if 2 + hdr_len > len(msg.data):
+                        continue
+                    header_bytes = msg.data[2 : 2 + hdr_len]
+                    if not any(line.strip() == b"Path:audio" for line in header_bytes.splitlines()):
+                        continue
                     audio = msg.data[2 + hdr_len :]
                     if audio:
                         yield audio
@@ -141,13 +159,14 @@ class PrewarmedEdgeTTS:
             return
         self._closed = True
         try:
-            await self._ws.close()  # type: ignore[attr-defined]
-        except Exception:
+            await asyncio.wait_for(self._ws.close(), timeout=1.0)  # type: ignore[attr-defined]
+        except BaseException:
             pass
-        try:
-            await self._session.close()  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        finally:
+            try:
+                await asyncio.wait_for(self._session.close(), timeout=1.0)  # type: ignore[attr-defined]
+            except BaseException:
+                pass
 
 
 def generate_chime_pcm(sample_rate: int = 24000) -> bytes:
@@ -260,32 +279,39 @@ async def stream_edge_tts_pcm(
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
+        if prewarmed is not None:
+            await prewarmed.close()
         raise RuntimeError("ffmpeg is required for edge-tts streaming")
 
     use_prewarmed = prewarmed is not None and prewarmed.claim()
-    proc = await asyncio.create_subprocess_exec(
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *_FFMPEG_MP3_LOW_LATENCY_ARGS,
-        "-f",
-        "mp3",
-        "-i",
-        "pipe:0",
-        "-f",
-        "s16le",
-        "-acodec",
-        "pcm_s16le",
-        "-ac",
-        "1",
-        "-ar",
-        str(sample_rate),
-        "pipe:1",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *_FFMPEG_MP3_LOW_LATENCY_ARGS,
+            "-f",
+            "mp3",
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except BaseException:
+        if prewarmed is not None:
+            await prewarmed.close()
+        raise
     assert proc.stdin is not None
     assert proc.stdout is not None
 

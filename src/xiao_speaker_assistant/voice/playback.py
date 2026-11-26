@@ -338,6 +338,21 @@ class PlaybackController:
                     await self._close_stream(wait_ack=False)
                     self._notify_playback_stopped()
 
+    async def prestart_stream(self, *, stop_native: bool = True) -> bool:
+        """Speculatively stop native audio and open `start_play` under lock for a new turn."""
+        epoch = self._cancel_epoch
+        async with self._lock:
+            if epoch != self._cancel_epoch:
+                return False
+            if self._stream_open:
+                return True
+            self._cancel_event.clear()
+            if stop_native:
+                await self._run_shell(STOP_NATIVE_SCRIPT, False, 5.0)
+                if epoch != self._cancel_epoch or self._cancel_event.is_set():
+                    return False
+            return await self.ensure_stream_started(epoch=epoch)
+
     async def abort_stream(self, *, unmute: bool = True) -> None:
         """Close a kept-open stream immediately without padding/draining (e.g. after mid-stream error)."""
         epoch = self._cancel_epoch
@@ -498,10 +513,36 @@ class PlaybackController:
                         if not await self.ensure_stream_started(epoch=epoch):
                             return
                         t_tts_first = time.monotonic()
-                        first_chunk = await anext(tts_stream, None)
-                        trace = CURRENT_TURN_TRACE.get()
-                        if trace is not None and first_chunk is not None:
-                            trace.mark_tts_first_chunk((time.monotonic() - t_tts_first) * 1000.0)
+                        first_task = asyncio.create_task(anext(tts_stream, None))
+                        cancel_task = asyncio.create_task(self._cancel_event.wait())
+                        try:
+                            done, _ = await asyncio.wait(
+                                {first_task, cancel_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if (
+                                cancel_task in done
+                                or epoch != self._cancel_epoch
+                                or self._cancel_event.is_set()
+                            ):
+                                if not first_task.done():
+                                    first_task.cancel()
+                                await asyncio.gather(first_task, return_exceptions=True)
+                                return
+                            first_chunk = await first_task
+                            trace = CURRENT_TURN_TRACE.get()
+                            if trace is not None and first_chunk is not None:
+                                trace.mark_tts_first_chunk((time.monotonic() - t_tts_first) * 1000.0)
+                        except BaseException:
+                            if not first_task.done():
+                                first_task.cancel()
+                            await asyncio.gather(first_task, return_exceptions=True)
+                            raise
+                        finally:
+                            if not cancel_task.done():
+                                cancel_task.cancel()
+                            await asyncio.gather(cancel_task, return_exceptions=True)
+
                         if first_chunk is None:
                             return
 
