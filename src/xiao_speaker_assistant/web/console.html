@@ -682,6 +682,201 @@
       border-top: 1px solid var(--color-border);
     }
 
+    /* Recent 10 Chat Traces & Latency Breakdown */
+    .trace-legend {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-3);
+      flex-wrap: wrap;
+      font-size: var(--text-xs);
+      color: var(--color-text-secondary);
+      padding: var(--spacing-2) var(--spacing-5);
+      border-bottom: 1px solid var(--color-border);
+      background: var(--color-surface-muted);
+    }
+
+    .trace-legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--spacing-1-5);
+    }
+
+    .trace-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    .trace-dot--asr { background: var(--color-success-text); }
+    .trace-dot--llm { background: var(--color-accent); }
+    .trace-dot--tts { background: var(--color-warn-text); }
+    .trace-dot--rest { background: var(--color-border-strong); }
+
+    .trace-list {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .trace-item {
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .trace-item:last-child {
+      border-bottom: 0;
+    }
+
+    .trace-summary {
+      list-style: none;
+      cursor: pointer;
+      padding: var(--spacing-3) var(--spacing-5);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2);
+      transition: background-color var(--dur-fast) var(--ease-out);
+    }
+
+    .trace-summary::-webkit-details-marker { display: none; }
+
+    .trace-summary:hover {
+      background: var(--color-surface-hover);
+    }
+
+    .trace-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-3);
+      flex-wrap: wrap;
+    }
+
+    .trace-head-left {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-2);
+      min-width: 0;
+      flex: 1 1 280px;
+    }
+
+    .trace-query {
+      font-size: var(--text-sm);
+      font-weight: 500;
+      color: var(--color-text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+
+    .trace-head-right {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-2);
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .trace-kpi {
+      font-size: var(--text-xs);
+      color: var(--color-text-secondary);
+      white-space: nowrap;
+    }
+
+    .trace-kpi strong {
+      color: var(--color-text-primary);
+      font-weight: 600;
+    }
+
+    .trace-bar-track {
+      width: 100%;
+      height: 7px;
+      border-radius: var(--radius-pill);
+      background: var(--color-surface-muted);
+      overflow: hidden;
+      display: flex;
+      gap: 1px;
+    }
+
+    .trace-seg {
+      height: 100%;
+      min-width: 2px;
+      transition: width var(--dur-fast) var(--ease-out);
+    }
+
+    .trace-seg--asr { background: var(--color-success-text); }
+    .trace-seg--llm { background: var(--color-accent); }
+    .trace-seg--tts { background: var(--color-warn-text); }
+    .trace-seg--rest { background: var(--color-border-strong); }
+
+    .trace-pills {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-2);
+      flex-wrap: wrap;
+      font-size: 0.6875rem;
+      color: var(--color-text-secondary);
+    }
+
+    .trace-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px var(--spacing-2);
+      border-radius: var(--radius-inner);
+      background: var(--color-surface-muted);
+      border: 1px solid var(--color-border);
+      white-space: nowrap;
+    }
+
+    .trace-detail {
+      padding: var(--spacing-3) var(--spacing-5) var(--spacing-4);
+      background: var(--color-surface-muted);
+      border-top: 1px solid var(--color-border);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2);
+      font-size: var(--text-xs);
+      color: var(--color-text-secondary);
+    }
+
+    .trace-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: var(--spacing-2);
+    }
+
+    .trace-detail-kv {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-inner);
+      padding: var(--spacing-2) var(--spacing-3);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .trace-detail-k {
+      color: var(--color-text-tertiary);
+      font-size: 0.6875rem;
+    }
+
+    .trace-detail-v {
+      color: var(--color-text-primary);
+      font-weight: 500;
+      overflow-wrap: anywhere;
+    }
+
+    .trace-reply-box {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-inner);
+      padding: var(--spacing-2) var(--spacing-3);
+      color: var(--color-text-primary);
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
     .wake-inline-check {
       display: inline-flex;
       align-items: center;
@@ -1476,16 +1671,42 @@
               </div>
               <div>
                 <h2 id="heading-trends">近 14 日用量与趋势</h2>
-                <span class="card-meta">按日统计本地对话轮次、OpenCode 模型 Token 消耗与估算花费</span>
+                <span class="card-meta">按日统计本地对话轮次、平均延迟、OpenCode 模型 Token 消耗与估算花费</span>
               </div>
             </div>
             <div class="trend-controls" role="group" aria-label="趋势指标切换">
               <button type="button" class="trend-seg" data-trend-metric="tokens" aria-pressed="true">Token 趋势</button>
               <button type="button" class="trend-seg" data-trend-metric="cost" aria-pressed="false">花费趋势</button>
               <button type="button" class="trend-seg" data-trend-metric="turns" aria-pressed="false">对话轮次</button>
+              <button type="button" class="trend-seg" data-trend-metric="latency" aria-pressed="false">延迟趋势</button>
             </div>
           </div>
           <div class="trend-chart-wrap" id="trendChartContainer"></div>
+        </section>
+
+        <section class="card" aria-labelledby="heading-traces">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-traces">最近 10 次对话 Trace 与延迟拆解</h2>
+                <span class="card-meta">记录每次对话的 ASR、声纹、LLM 首句、start_play 与 TTS 首块耗时（仅保留最近 10 条）</span>
+              </div>
+            </div>
+            <div class="toolbar-row">
+              <span class="badge" id="traceCountBadge"><span class="num">0</span> / 10</span>
+              <button type="button" class="btn btn--ghost btn--sm" id="clearTracesBtn">清空 Trace</button>
+            </div>
+          </div>
+          <div class="trace-legend" aria-hidden="true">
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--asr"></span>ASR + 声纹</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--llm"></span>LLM 首句 (TTFT)</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--tts"></span>TTS 首块 / start_play</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--rest"></span>后续流式播报</span>
+          </div>
+          <div id="recentTracesContainer"></div>
         </section>
 
         <div class="two-col">
@@ -1973,6 +2194,13 @@
         syncGroupsUI();
       });
 
+      function formatMs(val) {
+        if (val === null || val === undefined || Number.isNaN(Number(val))) return "—";
+        const n = Number(val);
+        if (n >= 1000) return `${(n / 1000).toFixed(2)}s`;
+        return `${Math.round(n)}ms`;
+      }
+
       function renderTrendChart(data) {
         const metric = state.trendMetric;
         document.querySelectorAll("[data-trend-metric]").forEach((btn) => {
@@ -1980,13 +2208,14 @@
         });
         const usageDaily = (data.usage && Array.isArray(data.usage.daily)) ? data.usage.daily : [];
         const turnDaily = Array.isArray(data.daily_turns) ? data.daily_turns : [];
-        const rows = metric === "turns" ? turnDaily : usageDaily;
+        const rows = (metric === "turns" || metric === "latency") ? turnDaily : usageDaily;
         if (!rows.length) {
           $("trendChartContainer").innerHTML = `<div class="empty-state">暂无近 14 日趋势数据。</div>`;
           return;
         }
         const values = rows.map((r) => {
           if (metric === "turns") return Number(r.turns) || 0;
+          if (metric === "latency") return Number(r.avg_latency_ms) || 0;
           if (metric === "cost") return Number(r.cost_usd) || 0;
           return Number(r.total_tokens) || 0;
         });
@@ -1996,21 +2225,32 @@
 
         const fmtVal = (v) => {
           if (v <= 0) return "";
+          if (metric === "latency") return v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`;
           if (metric === "cost") return v >= 0.01 ? `$${v.toFixed(2)}` : `$${v.toFixed(3)}`;
           if (metric === "tokens") return formatCompactNum(v);
           return String(v);
         };
 
-        const summaryLabel =
-          metric === "cost"
-            ? (!data.usage?.available
-                ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
-                : `近 14 日累计估算花费 ${formatUsd(totalVal, 4)} · 活跃 ${activeDays} 天`)
-            : metric === "tokens"
-              ? (!data.usage?.available
-                  ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
-                  : `近 14 日累计消耗 ${formatCompactNum(totalVal)} Token · 活跃 ${activeDays} 天`)
-              : `近 14 日累计对话 ${totalVal} 轮 · 活跃 ${activeDays} 天`;
+        let summaryLabel = "";
+        if (metric === "cost") {
+          summaryLabel = !data.usage?.available
+            ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
+            : `近 14 日累计估算花费 ${formatUsd(totalVal, 4)} · 活跃 ${activeDays} 天`;
+        } else if (metric === "tokens") {
+          summaryLabel = !data.usage?.available
+            ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
+            : `近 14 日累计消耗 ${formatCompactNum(totalVal)} Token · 活跃 ${activeDays} 天`;
+        } else if (metric === "latency") {
+          const weightedTurns = rows.reduce((acc, r) => acc + (Number(r.turns) || 0), 0);
+          const weightedSum = rows.reduce((acc, r) => acc + (Number(r.turns) || 0) * (Number(r.avg_latency_ms) || 0), 0);
+          const avg14 = weightedTurns > 0 ? weightedSum / weightedTurns : 0;
+          const peakP95 = Math.max(...rows.map((r) => Number(r.p95_latency_ms) || 0), 0);
+          summaryLabel = weightedTurns > 0
+            ? `近 14 日加权平均延迟 ${formatMs(avg14)} · 日峰值 P95 ${formatMs(peakP95)} · 活跃 ${activeDays} 天`
+            : "暂无近 14 日延迟记录";
+        } else {
+          summaryLabel = `近 14 日累计对话 ${totalVal} 轮 · 活跃 ${activeDays} 天`;
+        }
 
         $("trendChartContainer").innerHTML = `
           <div class="trend-bars">
@@ -2024,7 +2264,9 @@
                     ? `${r.date}: ${formatUsd(v, 4)} (${r.calls || 0} 次调用)`
                     : metric === "tokens"
                       ? `${r.date}: ${v.toLocaleString()} tokens (${r.calls || 0} 次调用)`
-                      : `${r.date}: ${v} 轮对话`;
+                      : metric === "latency"
+                        ? `${r.date}: 平均 ${Math.round(v)} ms · P95 ${Math.round(Number(r.p95_latency_ms) || 0)} ms (${r.turns || 0} 轮)`
+                        : `${r.date}: ${v} 轮对话`;
                 return `
                   <div class="trend-col" title="${escapeHtml(tip)}">
                     <span class="trend-val">${escapeHtml(fmtVal(v))}</span>
@@ -2044,11 +2286,126 @@
         `;
       }
 
+      function renderRecentTraces(traces) {
+        const list = Array.isArray(traces) ? traces.slice(0, 10) : [];
+        $("traceCountBadge").innerHTML = `<span class="num">${list.length}</span> / 10`;
+        const container = $("recentTracesContainer");
+        if (!list.length) {
+          container.innerHTML = `<div class="empty-state">暂无对话 Trace。对音箱说话后，这里会自动展示最近 10 次完整延迟拆解。</div>`;
+          return;
+        }
+        container.innerHTML = `<div class="trace-list">${list
+          .map((t, idx) => {
+            const bd = t.breakdown_ms || {};
+            const asrMs = bd.asr_ms != null ? Number(bd.asr_ms) : 0;
+            const spkMs = bd.speaker_id_ms != null ? Number(bd.speaker_id_ms) : 0;
+            const queueMs = bd.queue_ms != null ? Number(bd.queue_ms) : 0;
+            const preLlmTotal = asrMs + spkMs + queueMs;
+            const hasLlmTtft = bd.llm_ttft_ms != null;
+            const llmTtft = hasLlmTtft ? Number(bd.llm_ttft_ms) : 0;
+            const llmTotal = bd.llm_total_ms != null ? Number(bd.llm_total_ms) : 0;
+            const llmBarMs = hasLlmTtft ? llmTtft : llmTotal;
+            const startPlay = bd.start_play_ms != null ? Number(bd.start_play_ms) : 0;
+            const ttsFirst = bd.tts_first_chunk_ms != null ? Number(bd.tts_first_chunk_ms) : 0;
+            const ttsHead = Math.max(startPlay, ttsFirst);
+            const ttfaVal = bd.ttfa_ms != null ? Number(bd.ttfa_ms) : null;
+            const totalRaw = bd.total_ms != null ? Number(bd.total_ms) : 0;
+            const total = Math.max(totalRaw, ttfaVal ?? 0, preLlmTotal + llmBarMs + ttsHead);
+            const tailMs =
+              totalRaw > 0
+                ? (ttfaVal != null
+                    ? Math.max(0, totalRaw - Math.max(ttfaVal, preLlmTotal + llmBarMs + ttsHead))
+                    : Math.max(0, totalRaw - (preLlmTotal + llmBarMs + ttsHead)))
+                : 0;
+
+            const denom = preLlmTotal + llmBarMs + ttsHead + tailMs;
+            const pAsr = denom > 0 && preLlmTotal > 0 ? (preLlmTotal / denom) * 100 : 0;
+            const pLlm = denom > 0 && llmBarMs > 0 ? (llmBarMs / denom) * 100 : 0;
+            const pTts = denom > 0 && ttsHead > 0 ? (ttsHead / denom) * 100 : 0;
+            const pRest = denom > 0 && tailMs > 0 ? (tailMs / denom) * 100 : 0;
+
+            const statusCls =
+              t.status === "error"
+                ? "badge--error"
+                : t.status === "interrupted"
+                  ? "badge--warn"
+                  : "badge--success";
+            const statusText =
+              t.status === "error" ? "异常" : t.status === "interrupted" ? "打断" : "正常";
+            const transportLabel =
+              t.transport === "wan_relay"
+                ? `WAN ${t.sample_rate ? `${Math.round(t.sample_rate / 1000)}kHz` : ""}`.trim()
+                : t.transport === "lan"
+                  ? `LAN ${t.sample_rate ? `${Math.round(t.sample_rate / 1000)}kHz` : ""}`.trim()
+                  : String(t.transport || "voice").toUpperCase();
+
+            const pills = [];
+            if (bd.asr_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>ASR <span class="num">${escapeHtml(formatMs(bd.asr_ms))}</span></span>`);
+            if (bd.speaker_id_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>声纹 <span class="num">${escapeHtml(formatMs(bd.speaker_id_ms))}</span></span>`);
+            if (bd.queue_ms != null) pills.push(`<span class="trace-pill">排队/打断清理 <span class="num">${escapeHtml(formatMs(bd.queue_ms))}</span></span>`);
+            if (bd.llm_ttft_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM首句 <span class="num">${escapeHtml(formatMs(bd.llm_ttft_ms))}</span></span>`);
+            if (bd.start_play_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>start_play <span class="num">${escapeHtml(formatMs(bd.start_play_ms))}</span></span>`);
+            if (bd.tts_first_chunk_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>TTS首块 <span class="num">${escapeHtml(formatMs(bd.tts_first_chunk_ms))}</span></span>`);
+            if (bd.tts_total_ms != null) pills.push(`<span class="trace-pill">播报总计 <span class="num">${escapeHtml(formatMs(bd.tts_total_ms))}</span></span>`);
+
+            return `
+              <details class="trace-item" ${idx === 0 ? "open" : ""}>
+                <summary class="trace-summary">
+                  <div class="trace-head">
+                    <div class="trace-head-left">
+                      <span class="badge ${statusCls}">${escapeHtml(statusText)}</span>
+                      <span class="badge badge--accent">${escapeHtml(t.speaker_name || "未知")}</span>
+                      <span class="trace-query" title="${escapeHtml(t.query || "")}">${escapeHtml(t.query || "（无文本）")}</span>
+                    </div>
+                    <div class="trace-head-right">
+                      <span class="badge">${escapeHtml(transportLabel)}</span>
+                      ${t.barge_in ? `<span class="badge badge--warn">插话打断</span>` : ""}
+                      <span class="trace-kpi">首音 <strong class="num">${escapeHtml(formatMs(ttfaVal))}</strong></span>
+                      <span class="trace-kpi">总计 <strong class="num">${escapeHtml(formatMs(bd.total_ms))}</strong></span>
+                      <span class="card-meta num">${escapeHtml(formatTime(t.timestamp))}</span>
+                    </div>
+                  </div>
+                  <div class="trace-bar-track" aria-label="阶段延迟占比">
+                    ${pAsr > 0 ? `<div class="trace-seg trace-seg--asr" style="width: ${pAsr.toFixed(2)}%" title="ASR / 声纹 / 排队: ${escapeHtml(formatMs(preLlmTotal))}"></div>` : ""}
+                    ${pLlm > 0 ? `<div class="trace-seg trace-seg--llm" style="width: ${pLlm.toFixed(2)}%" title="${hasLlmTtft ? "LLM 首句" : "LLM 总计"}: ${escapeHtml(formatMs(llmBarMs))}"></div>` : ""}
+                    ${pTts > 0 ? `<div class="trace-seg trace-seg--tts" style="width: ${pTts.toFixed(2)}%" title="TTS 首块 / start_play: ${escapeHtml(formatMs(ttsHead))}"></div>` : ""}
+                    ${pRest > 0 ? `<div class="trace-seg trace-seg--rest" style="width: ${pRest.toFixed(2)}%" title="后续流式播报: ${escapeHtml(formatMs(tailMs))}"></div>` : ""}
+                  </div>
+                  <div class="trace-pills">${pills.join("") || `<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM总计 <span class="num">${escapeHtml(formatMs(bd.llm_total_ms))}</span></span>`}</div>
+                </summary>
+                <div class="trace-detail">
+                  <div class="trace-detail-grid">
+                    <div class="trace-detail-kv"><span class="trace-detail-k">首音延迟 (TTFA)</span><span class="trace-detail-v num">${escapeHtml(formatMs(bd.ttfa_ms))}</span></div>
+                    <div class="trace-detail-kv"><span class="trace-detail-k">端到端总耗时</span><span class="trace-detail-v num">${escapeHtml(formatMs(bd.total_ms))}</span></div>
+                    <div class="trace-detail-kv"><span class="trace-detail-k">LLM 首句 / 总计</span><span class="trace-detail-v num">${escapeHtml(formatMs(bd.llm_ttft_ms))} / ${escapeHtml(formatMs(bd.llm_total_ms))}</span></div>
+                    <div class="trace-detail-kv"><span class="trace-detail-k">start_play / TTS首块</span><span class="trace-detail-v num">${escapeHtml(formatMs(bd.start_play_ms))} / ${escapeHtml(formatMs(bd.tts_first_chunk_ms))}</span></div>
+                    <div class="trace-detail-kv"><span class="trace-detail-k">模型</span><span class="trace-detail-v num">${escapeHtml(t.model || "—")}</span></div>
+                    <div class="trace-detail-kv"><span class="trace-detail-k">音色 · 分句数</span><span class="trace-detail-v num">${escapeHtml(t.voice || "—")} · ${Number(t.sentence_count || 0)} 句</span></div>
+                  </div>
+                  ${t.reply ? `<div class="trace-reply-box"><strong>回复：</strong>${escapeHtml(t.reply)}</div>` : ""}
+                </div>
+              </details>
+            `;
+          })
+          .join("")}</div>`;
+      }
+
       document.querySelectorAll("[data-trend-metric]").forEach((btn) => {
         btn.addEventListener("click", () => {
           state.trendMetric = btn.getAttribute("data-trend-metric") || "tokens";
           if (state.overview) renderTrendChart(state.overview);
         });
+      });
+
+      $("clearTracesBtn").addEventListener("click", async () => {
+        try {
+          await apiFetch("/api/traces", { method: "DELETE" });
+          if (state.overview) state.overview.recent_traces = [];
+          renderRecentTraces([]);
+          showToast("已清空最近 Trace 记录");
+        } catch (err) {
+          showToast(`清空 Trace 失败：${err.message}`, true);
+        }
       });
 
       function renderOverview(data) {
@@ -2074,6 +2431,7 @@
         $("sidebarVoiceLabel").textContent = `${data.voice_name || data.voice || "—"} (${data.rate || "+8%"})`;
 
         renderTrendChart(data);
+        renderRecentTraces(data.recent_traces || []);
 
         const modelSel = $("modelSelect");
         const models = data.available_models || [];

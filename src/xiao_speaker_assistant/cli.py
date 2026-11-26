@@ -27,6 +27,7 @@ from xiao_speaker_assistant.llm.opencode_server import (
 )
 from xiao_speaker_assistant.llm.router import resolve_binary
 from xiao_speaker_assistant.tools import (
+    CURRENT_TURN_TRACE,
     ConfirmationStore,
     ConversationHistoryStore,
     HttpMcpClient,
@@ -37,6 +38,7 @@ from xiao_speaker_assistant.tools import (
     ReminderEntry,
     ReminderScheduler,
     ReminderStore,
+    TurnTraceStore,
     is_cancel_utterance,
     is_confirm_utterance,
 )
@@ -286,6 +288,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     reminder_store = ReminderStore(active_config.reminders.file_path)
     speaker_store = SpeakerProfileStore(active_config.speech.speaker_profiles_file)
     history_store = ConversationHistoryStore()
+    trace_store = TurnTraceStore()
     agent_home = Path(active_config.llm.providers.opencode.agent_home).expanduser().resolve()
     mcp_token = load_or_create_mcp_token(agent_home)
     console_password = load_or_create_console_password(agent_home)
@@ -374,6 +377,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         reminder_store=reminder_store,
         speaker_store=speaker_store,
         history_store=history_store,
+        trace_store=trace_store,
         console_password=console_password,
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
@@ -451,16 +455,34 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     def _record_turn(query: str, reply: str, started_at: float) -> None:
         latency_ms = round((time.monotonic() - started_at) * 1000.0, 1)
         spk = CURRENT_SPEAKER.get()
+        active_model = _resolve_active_model(active_config, args.provider)
         history_store.record(
             query=query,
             reply=reply,
             latency_ms=latency_ms,
-            model=_resolve_active_model(active_config, args.provider),
+            model=active_model,
             voice=active_config.speaker.edge_voice,
             speaker_name=spk.name if spk is not None else "未知",
             speaker_role=spk.role if spk is not None else "",
             source=history_source,
         )
+        # If invoked outside SpeakerGateway (e.g. openai-bridge), still persist a bounded trace.
+        if CURRENT_TURN_TRACE.get() is None:
+            trace_store.record(
+                query=query,
+                reply=reply,
+                breakdown_ms={"llm_total_ms": latency_ms, "total_ms": latency_ms},
+                model=active_model,
+                voice=active_config.speaker.edge_voice,
+                speaker_name=spk.name if spk is not None else "未知",
+                speaker_role=spk.role if spk is not None else "",
+                transport=history_source,
+                sample_rate=active_config.speaker.tts_sample_rate,
+                sentence_count=1 if reply.strip() else 0,
+                status="ok",
+            )
+        else:
+            CURRENT_TURN_TRACE.get().model = active_model  # type: ignore[union-attr]
 
     async def handle_query(query: str) -> str:
         t0 = time.monotonic()
@@ -605,6 +627,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             on_stream_query=stream_query,
             on_session_reset=reset_all,
             speaker_store=speaker_store,
+            trace_store=trace_store,
         )
         if args.relay:
             await run_with_relay(
