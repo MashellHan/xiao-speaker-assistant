@@ -88,6 +88,72 @@ class SpeakerSession:
 
 _ECHO_STRIP_RE = re.compile(r"[\s，,。.!！？?、；;：:\"'`~～]+")
 
+_KNOWN_WEATHER_CITIES: tuple[str, ...] = tuple(
+    sorted(
+        (
+            "北京", "上海", "广州", "深圳", "杭州", "南京", "成都", "重庆", "武汉", "西安",
+            "天津", "苏州", "长沙", "郑州", "青岛", "大连", "宁波", "厦门", "福州", "济南",
+            "合肥", "昆明", "沈阳", "长春", "哈尔滨", "石家庄", "南昌", "贵阳", "兰州", "海口",
+            "三亚", "珠海", "佛山", "东莞", "无锡", "常州", "南通", "温州", "泉州", "烟台",
+            "太原", "银川", "西宁", "拉萨", "乌鲁木齐", "呼和浩特", "南宁", "桂林", "扬州",
+            "徐州", "绍兴", "嘉兴", "金华", "台州", "惠州", "中山", "江门", "湛江", "汕头",
+            "威海", "潍坊", "临沂", "洛阳", "芜湖", "赣州", "遵义", "大理", "丽江", "西双版纳",
+            "香港", "澳门", "台北", "高雄", "海淀", "朝阳", "浦东", "雄安",
+            "东京", "大阪", "首尔", "新加坡", "曼谷", "纽约", "旧金山", "洛杉矶", "西雅图",
+            "伦敦", "巴黎", "悉尼", "墨尔本", "多伦多", "温哥华",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_SIMPLE_GREETINGS = frozenset({"你好", "您好", "在吗", "在不在", "哈喽", "hello", "hi", "嗨", "早安", "晚安", "谢谢", "感谢"})
+_INDOOR_TEMP_HINTS = ("空调", "室内", "房间", "客厅", "卧室", "热水", "水温", "体温", "发烧", "冰箱", "烤箱")
+
+
+def build_conversational_ack(query: str) -> tuple[str | None, float | None]:
+    """Return `(ack_phrase, delay_sec)` for slow/tool-likely queries, or `(None, None)` to skip.
+
+    Tool-likely intents (weather, Xiaohongshu, email, Mac files, Codex, web search, browser)
+    speak a short context-aware acknowledgement if the LLM hasn't emitted its first sentence
+    within ~1.5s; general slow turns fall back to a gentle filler after `tool_ack_delay_sec`
+    (default 3.5s) so the user never waits 5+ seconds in silence.
+    """
+    text = query.strip()
+    cleaned = _ECHO_STRIP_RE.sub("", text).lower()
+    if len(cleaned) < 2:
+        return None, None
+    if cleaned in _SIMPLE_GREETINGS:
+        return None, None
+    # Only skip short direct confirmation/cancellation utterances, not longer requests like "帮我取消明天的闹钟".
+    if len(cleaned) <= 6 and (is_confirm_utterance(text) or is_cancel_utterance(text)):
+        return None, None
+
+    lowered = text.lower()
+    if "小红书" in text:
+        return "好的，我这就去小红书帮你搜一下。", 1.2
+    if any(k in text for k in ("邮件", "邮箱")) or "outlook" in lowered or "mail" in lowered:
+        return "好的，我这就帮你查一下邮件。", 1.5
+    has_weather_kw = any(k in text for k in ("天气", "气温", "下雨", "下雪", "空气质量", "穿什么")) or (
+        "温度" in text and not any(h in text for h in _INDOOR_TEMP_HINTS)
+    )
+    if has_weather_kw:
+        city = next((c for c in _KNOWN_WEATHER_CITIES if c in text), "")
+        if city:
+            return f"好的，我这就帮你查一下{city}天气。", 1.2
+        return "好的，我这就帮你查一下天气。", 1.2
+    if any(k in text for k in ("磁盘", "硬盘", "磁盘空间", "硬盘空间", "存储空间", "桌面文件", "下载目录", "读一下文件", "查看文件")):
+        return "好的，我这就帮你看一下电脑。", 1.5
+    if any(k in text for k in ("代码", "仓库", "报错")) or "bug" in lowered or "codex" in lowered:
+        return "好的，我这就帮你分析一下。", 1.8
+    if any(k in text for k in ("网页", "网站", "打开链接", "打开浏览器")):
+        return "好的，我这就帮你看一下网页。", 1.5
+    if any(k in text for k in ("搜一下", "搜索", "查一下", "查下", "新闻", "股价", "汇率", "多少钱", "最新")):
+        return "好的，我这就帮你查一下。", 1.5
+    if any(k in text for k in ("提醒我", "定个闹钟", "倒计时", "早报")):
+        return "好的，我这就帮你安排一下。", 1.8
+    # General non-tool query: only speak a gentle filler if LLM/tool takes longer than `tool_ack_delay_sec`.
+    return "稍等一下，我这就帮你查一下。", None
+
 
 def is_self_echo(asr_text: str, recent_spoken: Iterable[str]) -> bool:
     """Return True if `asr_text` looks like a residual TTS self-echo fragment."""
@@ -956,11 +1022,13 @@ class SpeakerGateway:
         use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
         voice_override = self._resolve_active_voice_override(conn)
 
-        # Queue items are `(sentence, optional_prefetch_task, is_error_notice)` so sentences 2+ begin
-        # Edge-TTS synthesis in the background while sentence 1 is still streaming to ALSA.
-        queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None, bool] | None] = asyncio.Queue()
+        # Queue items are `(sentence, optional_prefetch_task, kind)` where kind is
+        # `"reply"` | `"ack"` | `"error"`. Sentences 2+ begin Edge-TTS synthesis in the
+        # background while sentence 1 is still streaming to ALSA.
+        queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None, str] | None] = asyncio.Queue()
         all_prefetch_tasks: list[asyncio.Task[bytes]] = []
         prefetch_sem = asyncio.Semaphore(2)
+        first_llm_ready = asyncio.Event()
 
         async def _prefetch_sentence_pcm(sentence: str) -> bytes:
             async with prefetch_sem:
@@ -985,6 +1053,30 @@ class SpeakerGateway:
                             pass
                 return bytes(buf)
 
+        ack_task: asyncio.Task[None] | None = None
+        if self._config.speaker.tool_ack_enabled:
+            ack_phrase, intent_delay = build_conversational_ack(query)
+            if ack_phrase:
+                cfg_delay = float(self._config.speaker.tool_ack_delay_sec)
+                ack_delay = (
+                    min(intent_delay, cfg_delay)
+                    if intent_delay is not None
+                    else max(0.3, cfg_delay)
+                )
+
+                async def _ack_watchdog(phrase: str = ack_phrase, delay: float = ack_delay) -> None:
+                    try:
+                        await asyncio.wait_for(first_llm_ready.wait(), timeout=delay)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    if sess.interrupted or first_llm_ready.is_set():
+                        return
+                    logger.info("Speaking conversational ack while awaiting LLM/tool: %s", phrase)
+                    await queue.put((phrase, None, "ack"))
+
+                ack_task = asyncio.create_task(_ack_watchdog())
+
         async def producer() -> None:
             emitted = 0
             trace = CURRENT_TURN_TRACE.get()
@@ -993,6 +1085,9 @@ class SpeakerGateway:
                     if not sentence:
                         continue
                     emitted += 1
+                    first_llm_ready.set()
+                    if ack_task is not None and not ack_task.done():
+                        ack_task.cancel()
                     if trace is not None:
                         trace.mark_llm_first_sentence()
                         trace.sentence_count = emitted
@@ -1003,20 +1098,27 @@ class SpeakerGateway:
                     if use_continuous_stream and emitted >= 2 and self._config.speaker.tts_provider == "edge":
                         pf_task = asyncio.create_task(_prefetch_sentence_pcm(sentence))
                         all_prefetch_tasks.append(pf_task)
-                    await queue.put((sentence, pf_task, False))
+                    await queue.put((sentence, pf_task, "reply"))
                 if trace is not None:
                     trace.mark_llm_done()
             except Exception as exc:
+                first_llm_ready.set()
+                if ack_task is not None and not ack_task.done():
+                    ack_task.cancel()
                 if trace is not None:
                     trace.status = "error"
                     trace.mark_llm_done()
                 logger.exception("Streaming error for %r", query)
-                await queue.put((f"处理出错了：{exc}", None, True))
+                await queue.put((f"处理出错了：{exc}", None, "error"))
             finally:
+                first_llm_ready.set()
+                if ack_task is not None and not ack_task.done():
+                    ack_task.cancel()
                 await queue.put(None)
 
         prod_task = asyncio.create_task(producer())
         first_spoken = True
+        native_stopped = False
         completed_normally = False
         trace = CURRENT_TURN_TRACE.get()
         try:
@@ -1026,7 +1128,10 @@ class SpeakerGateway:
                 item = await queue.get()
                 if item is None or sess.interrupted:
                     break
-                sentence, pf_task, is_error_notice = item
+                sentence, pf_task, kind = item
+                if kind == "ack" and (first_llm_ready.is_set() or not queue.empty()):
+                    # Skip obsolete ack when the real reply has already arrived in the queue.
+                    continue
                 prefetched_pcm: bytes | None = None
                 if pf_task is not None:
                     try:
@@ -1038,17 +1143,38 @@ class SpeakerGateway:
                         prefetched_pcm = None
                 if sess.interrupted:
                     break
-                logger.info("Streaming TTS sentence: %s", sentence)
+                logger.info("Streaming TTS sentence (%s): %s", kind, sentence)
                 self._record_spoken(sess, sentence)
                 sess.mute_native_until = time.monotonic() + 8.0
-                if is_error_notice:
+                should_interrupt_native = not native_stopped
+                if kind == "ack":
+                    # Speak the quick acknowledgement and close its stream cleanly so it plays
+                    # immediately without waiting for the slow tool/LLM call to finish.
+                    ack_tok = CURRENT_TURN_TRACE.set(None)
+                    t_ack = time.monotonic()
+                    try:
+                        await self.speak_sentence(
+                            conn,
+                            sentence,
+                            interrupt=should_interrupt_native,
+                            wait_response=True,
+                            keep_stream_open=False,
+                            prefetched_pcm=None,
+                        )
+                    finally:
+                        CURRENT_TURN_TRACE.reset(ack_tok)
+                    native_stopped = True
+                    if trace is not None:
+                        trace.ack_ms = round((time.monotonic() - t_ack) * 1000.0, 1)
+                    continue
+                if kind == "error":
                     # Detach trace context so speaking the error notice never pollutes turn TTS/TTFA metrics.
                     err_tok = CURRENT_TURN_TRACE.set(None)
                     try:
                         await self.speak_sentence(
                             conn,
                             sentence,
-                            interrupt=first_spoken,
+                            interrupt=should_interrupt_native,
                             wait_response=True,
                             keep_stream_open=use_continuous_stream,
                             prefetched_pcm=None,
@@ -1061,11 +1187,12 @@ class SpeakerGateway:
                     await self.speak_sentence(
                         conn,
                         sentence,
-                        interrupt=first_spoken,
+                        interrupt=should_interrupt_native,
                         wait_response=True,
                         keep_stream_open=use_continuous_stream,
                         prefetched_pcm=prefetched_pcm,
                     )
+                native_stopped = True
                 first_spoken = False
             if use_continuous_stream and not first_spoken and not sess.interrupted:
                 await pb.finish_stream()
@@ -1086,12 +1213,17 @@ class SpeakerGateway:
                 # without padding/draining, and unmute 1ch VAD cleanly.
                 if pb.stream_open:
                     await pb.abort_stream(unmute=True)
+            if ack_task is not None and not ack_task.done():
+                ack_task.cancel()
             for t in all_prefetch_tasks:
                 if not t.done():
                     t.cancel()
             if not prod_task.done():
                 prod_task.cancel()
-            await asyncio.gather(prod_task, *all_prefetch_tasks, return_exceptions=True)
+            cleanup_tasks: list[asyncio.Task[Any]] = [prod_task, *all_prefetch_tasks]
+            if ack_task is not None:
+                cleanup_tasks.append(ack_task)
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 
