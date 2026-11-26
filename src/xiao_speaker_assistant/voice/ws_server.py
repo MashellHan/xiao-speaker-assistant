@@ -33,7 +33,7 @@ from xiao_speaker_assistant.voice.audio_pipeline import (
 )
 from xiao_speaker_assistant.voice.playback import PlaybackController
 from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch, SpeakerProfileStore
-from xiao_speaker_assistant.voice.tts_stream import synthesize_tts_pcm_stream
+from xiao_speaker_assistant.voice.tts_stream import PrewarmedEdgeTTS, synthesize_tts_pcm_stream
 from xiao_speaker_assistant.voice.voice_catalog import resolve_edge_voice
 
 logger = logging.getLogger(__name__)
@@ -379,10 +379,11 @@ class SpeakerGateway:
         wait_response: bool = True,
         keep_stream_open: bool = False,
         prefetched_pcm: bytes | None = None,
+        prewarmed_tts: PrewarmedEdgeTTS | None = None,
     ) -> None:
         pb = self._get_playback(conn)
         voice_override = self._resolve_active_voice_override(conn)
-        if keep_stream_open or prefetched_pcm is not None:
+        if keep_stream_open or prefetched_pcm is not None or prewarmed_tts is not None:
             kwargs: dict[str, Any] = {
                 "interrupt_native": interrupt,
                 "voice_override": voice_override,
@@ -390,6 +391,8 @@ class SpeakerGateway:
             }
             if prefetched_pcm is not None:
                 kwargs["prefetched_pcm"] = prefetched_pcm
+            if prewarmed_tts is not None:
+                kwargs["prewarmed_tts"] = prewarmed_tts
             await pb.speak(text, **kwargs)
         else:
             await pb.speak(
@@ -1030,6 +1033,58 @@ class SpeakerGateway:
         prefetch_sem = asyncio.Semaphore(2)
         first_llm_ready = asyncio.Event()
 
+        all_prewarm_tasks: list[asyncio.Task[PrewarmedEdgeTTS | None]] = []
+
+        # Pre-open Edge-TTS WebSocket & speech.config in parallel with LLM generation so the
+        # ~600ms TLS+WSS handshake overlaps with LLM thinking instead of adding serially to TTFA.
+        prewarm_tts_task: asyncio.Task[PrewarmedEdgeTTS | None] | None = None
+        if self._config.speaker.tts_provider == "edge":
+            async def _open_prewarm_tts() -> PrewarmedEdgeTTS | None:
+                try:
+                    return await PrewarmedEdgeTTS.open(connect_timeout=5.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Edge-TTS pre-open skipped: %s", exc)
+                    return None
+
+            prewarm_tts_task = asyncio.create_task(_open_prewarm_tts())
+            all_prewarm_tasks.append(prewarm_tts_task)
+
+        # Over WAN relay, speculatively stop native audio + open `start_play` under `pb._lock`
+        # in parallel with LLM generation so the ~550ms WAN RPC round-trip overlaps LLM think.
+        prestart_play_task: asyncio.Task[bool] | None = None
+        if use_continuous_stream and conn in self._relay_connections and not pb.stream_open:
+            async def _prestart_play() -> bool:
+                try:
+                    return await pb.prestart_stream(stop_native=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Speculative start_play skipped: %s", exc)
+                    return False
+
+            prestart_play_task = asyncio.create_task(_prestart_play())
+
+        async def _take_prewarmed_tts() -> PrewarmedEdgeTTS | None:
+            nonlocal prewarm_tts_task
+            t = prewarm_tts_task
+            if t is None:
+                return None
+            prewarm_tts_task = None
+            if not t.done():
+                # Cancel in-flight prewarm without blocking the ready sentence; finally awaits & closes it.
+                t.cancel()
+                return None
+            try:
+                res = t.result()
+                if res is not None and not res.usable:
+                    await res.close()
+                    return None
+                return res
+            except BaseException:
+                return None
+
         async def _prefetch_sentence_pcm(sentence: str) -> bytes:
             async with prefetch_sem:
                 buf = bytearray()
@@ -1148,6 +1203,24 @@ class SpeakerGateway:
                 sess.mute_native_until = time.monotonic() + 8.0
                 should_interrupt_native = not native_stopped
                 if kind == "ack":
+                    if prestart_play_task is not None:
+                        res_list = await asyncio.gather(prestart_play_task, return_exceptions=True)
+                        if res_list and res_list[0] is True:
+                            native_stopped = True
+                        prestart_play_task = None
+                    ack_prewarm = await _take_prewarmed_tts()
+                    # Start a fresh pre-warmed Edge-TTS WS for the upcoming real reply while ack plays!
+                    if self._config.speaker.tts_provider == "edge":
+                        async def _reopen_prewarm_tts() -> PrewarmedEdgeTTS | None:
+                            try:
+                                return await PrewarmedEdgeTTS.open(connect_timeout=5.0)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                return None
+
+                        prewarm_tts_task = asyncio.create_task(_reopen_prewarm_tts())
+                        all_prewarm_tasks.append(prewarm_tts_task)
                     # Speak the quick acknowledgement and close its stream cleanly so it plays
                     # immediately without waiting for the slow tool/LLM call to finish.
                     ack_tok = CURRENT_TURN_TRACE.set(None)
@@ -1156,17 +1229,26 @@ class SpeakerGateway:
                         await self.speak_sentence(
                             conn,
                             sentence,
-                            interrupt=should_interrupt_native,
+                            interrupt=not native_stopped,
                             wait_response=True,
                             keep_stream_open=False,
                             prefetched_pcm=None,
+                            prewarmed_tts=ack_prewarm,
                         )
                     finally:
                         CURRENT_TURN_TRACE.reset(ack_tok)
+                        if ack_prewarm is not None:
+                            await ack_prewarm.close()
                     native_stopped = True
                     if trace is not None:
                         trace.ack_ms = round((time.monotonic() - t_ack) * 1000.0, 1)
                     continue
+                if prestart_play_task is not None:
+                    res_list = await asyncio.gather(prestart_play_task, return_exceptions=True)
+                    if res_list and res_list[0] is True:
+                        native_stopped = True
+                    prestart_play_task = None
+                should_interrupt_native = not native_stopped
                 if kind == "error":
                     # Detach trace context so speaking the error notice never pollutes turn TTS/TTFA metrics.
                     err_tok = CURRENT_TURN_TRACE.set(None)
@@ -1182,20 +1264,29 @@ class SpeakerGateway:
                     finally:
                         CURRENT_TURN_TRACE.reset(err_tok)
                 else:
+                    reply_prewarm = await _take_prewarmed_tts() if first_spoken and prefetched_pcm is None else None
                     if first_spoken and trace is not None and trace.tts_started_mono is None:
                         trace.tts_started_mono = time.monotonic()
-                    await self.speak_sentence(
-                        conn,
-                        sentence,
-                        interrupt=should_interrupt_native,
-                        wait_response=True,
-                        keep_stream_open=use_continuous_stream,
-                        prefetched_pcm=prefetched_pcm,
-                    )
+                    try:
+                        await self.speak_sentence(
+                            conn,
+                            sentence,
+                            interrupt=should_interrupt_native,
+                            wait_response=True,
+                            keep_stream_open=use_continuous_stream,
+                            prefetched_pcm=prefetched_pcm,
+                            prewarmed_tts=reply_prewarm,
+                        )
+                    finally:
+                        if reply_prewarm is not None:
+                            await reply_prewarm.close()
                 native_stopped = True
                 first_spoken = False
             if use_continuous_stream and not first_spoken and not sess.interrupted:
                 await pb.finish_stream()
+            elif use_continuous_stream and first_spoken and not sess.interrupted and pb.stream_open:
+                # If speculative start_play opened a stream but producer yielded zero sentences, close it cleanly.
+                await pb.abort_stream(unmute=True)
             if trace is not None and trace.tts_started_mono is not None:
                 trace.tts_done_mono = time.monotonic()
             completed_normally = True
@@ -1215,15 +1306,25 @@ class SpeakerGateway:
                     await pb.abort_stream(unmute=True)
             if ack_task is not None and not ack_task.done():
                 ack_task.cancel()
+            if prestart_play_task is not None and not prestart_play_task.done():
+                prestart_play_task.cancel()
+            for t in all_prewarm_tasks:
+                if not t.done():
+                    t.cancel()
             for t in all_prefetch_tasks:
                 if not t.done():
                     t.cancel()
             if not prod_task.done():
                 prod_task.cancel()
-            cleanup_tasks: list[asyncio.Task[Any]] = [prod_task, *all_prefetch_tasks]
+            cleanup_tasks: list[asyncio.Task[Any]] = [prod_task, *all_prefetch_tasks, *all_prewarm_tasks]
             if ack_task is not None:
                 cleanup_tasks.append(ack_task)
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            if prestart_play_task is not None:
+                cleanup_tasks.append(prestart_play_task)
+            results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, PrewarmedEdgeTTS):
+                    await res.close()
             if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 

@@ -13,7 +13,11 @@ from typing import Any
 
 from xiao_speaker_assistant.config import SpeakerConfig
 from xiao_speaker_assistant.tools.history import CURRENT_TURN_TRACE
-from xiao_speaker_assistant.voice.tts_stream import generate_chime_pcm, synthesize_tts_pcm_stream
+from xiao_speaker_assistant.voice.tts_stream import (
+    PrewarmedEdgeTTS,
+    generate_chime_pcm,
+    synthesize_tts_pcm_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +338,21 @@ class PlaybackController:
                     await self._close_stream(wait_ack=False)
                     self._notify_playback_stopped()
 
+    async def prestart_stream(self, *, stop_native: bool = True) -> bool:
+        """Speculatively stop native audio and open `start_play` under lock for a new turn."""
+        epoch = self._cancel_epoch
+        async with self._lock:
+            if epoch != self._cancel_epoch:
+                return False
+            if self._stream_open:
+                return True
+            self._cancel_event.clear()
+            if stop_native:
+                await self._run_shell(STOP_NATIVE_SCRIPT, False, 5.0)
+                if epoch != self._cancel_epoch or self._cancel_event.is_set():
+                    return False
+            return await self.ensure_stream_started(epoch=epoch)
+
     async def abort_stream(self, *, unmute: bool = True) -> None:
         """Close a kept-open stream immediately without padding/draining (e.g. after mid-stream error)."""
         epoch = self._cancel_epoch
@@ -384,6 +403,7 @@ class PlaybackController:
         voice_override: str | None = None,
         keep_stream_open: bool = False,
         prefetched_pcm: bytes | None = None,
+        prewarmed_tts: PrewarmedEdgeTTS | None = None,
     ) -> None:
         if not text.strip():
             return
@@ -423,17 +443,17 @@ class PlaybackController:
                     return
 
                 effective_sr = self._effective_sample_rate()
-                tts_stream = (
-                    synthesize_tts_pcm_stream(
-                        text,
-                        self._config,
-                        voice_override=voice_override,
-                        chunk_bytes=chunk_bytes,
-                        sample_rate_override=effective_sr,
-                    )
-                    if (voice_override or self._wan_relay)
-                    else synthesize_tts_pcm_stream(text, self._config)
-                )
+                if prewarmed_tts is not None or voice_override or self._wan_relay:
+                    synth_kwargs: dict[str, Any] = {
+                        "voice_override": voice_override,
+                        "chunk_bytes": chunk_bytes,
+                        "sample_rate_override": effective_sr,
+                    }
+                    if prewarmed_tts is not None:
+                        synth_kwargs["prewarmed"] = prewarmed_tts
+                    tts_stream = synthesize_tts_pcm_stream(text, self._config, **synth_kwargs)
+                else:
+                    tts_stream = synthesize_tts_pcm_stream(text, self._config)
 
                 try:
                     # Pipeline start_play RPC with Edge-TTS first-chunk synthesis so the WAN RTT
@@ -492,7 +512,46 @@ class PlaybackController:
                     else:
                         if not await self.ensure_stream_started(epoch=epoch):
                             return
-                        active_stream = tts_stream
+                        t_tts_first = time.monotonic()
+                        first_task = asyncio.create_task(anext(tts_stream, None))
+                        cancel_task = asyncio.create_task(self._cancel_event.wait())
+                        try:
+                            done, _ = await asyncio.wait(
+                                {first_task, cancel_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if (
+                                cancel_task in done
+                                or epoch != self._cancel_epoch
+                                or self._cancel_event.is_set()
+                            ):
+                                if not first_task.done():
+                                    first_task.cancel()
+                                await asyncio.gather(first_task, return_exceptions=True)
+                                return
+                            first_chunk = await first_task
+                            trace = CURRENT_TURN_TRACE.get()
+                            if trace is not None and first_chunk is not None:
+                                trace.mark_tts_first_chunk((time.monotonic() - t_tts_first) * 1000.0)
+                        except BaseException:
+                            if not first_task.done():
+                                first_task.cancel()
+                            await asyncio.gather(first_task, return_exceptions=True)
+                            raise
+                        finally:
+                            if not cancel_task.done():
+                                cancel_task.cancel()
+                            await asyncio.gather(cancel_task, return_exceptions=True)
+
+                        if first_chunk is None:
+                            return
+
+                        async def _opened_stream() -> AsyncIterator[bytes]:
+                            yield first_chunk
+                            async for rest_chunk in tts_stream:
+                                yield rest_chunk
+
+                        active_stream = _opened_stream()
 
                     await self._stream_chunks(
                         active_stream,

@@ -791,3 +791,143 @@ def test_conversational_ack_speaks_immediately_for_slow_weather_and_skips_fast_r
 
     asyncio.run(run_off())
     assert spoken_texts == ["上海明天晴，18到24度。", "适合穿长袖衬衫出门。"]
+
+
+def test_prewarmed_edge_tts_and_speculative_start_play_overlap_with_llm() -> None:
+    import time
+    from xiao_speaker_assistant.voice.tts_stream import PrewarmedEdgeTTS
+
+    events: list[tuple[str, float]] = []
+    prewarm_closed = False
+
+    class FakePrewarmed(PrewarmedEdgeTTS):
+        def __init__(self) -> None:
+            super().__init__(object(), type("W", (), {"closed": False})(), created_at=time.monotonic())
+
+        async def close(self) -> None:
+            nonlocal prewarm_closed
+            prewarm_closed = True
+            self._closed = True
+
+    fake_prewarm = FakePrewarmed()
+
+    async def fake_open(*, connect_timeout: float = 8.0):
+        events.append(("prewarm_open", time.monotonic()))
+        return fake_prewarm
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        def __init__(self, target_gw: SpeakerGateway) -> None:
+            self._gw = target_gw
+
+        async def send(self, raw) -> None:
+            if isinstance(raw, (bytes, bytearray)):
+                return
+            msg = json.loads(raw)
+            req = msg.get("Request") or {}
+            cmd = str(req.get("command") or "")
+            if cmd == "start_play":
+                events.append(("start_play", time.monotonic()))
+            if cmd in {"start_play", "stop_play"} and isinstance(req.get("id"), str):
+                rid = req["id"]
+                asyncio.get_running_loop().call_soon(
+                    lambda r=rid, g=self._gw: asyncio.create_task(
+                        g._handle_text_message(
+                            self,
+                            json.dumps({"Response": {"id": r, "code": 0}}),
+                        )
+                    )
+                )
+
+    received_prewarm: list[object] = []
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        received_prewarm.append(kwargs.get("prewarmed"))
+        yield b"\x02\x00" * 3200
+
+    async def slow_llm(query: str):
+        await asyncio.sleep(0.15)
+        events.append(("llm_first", time.monotonic()))
+        yield "我在呢大熊，有什么可以帮你的？"
+
+    cfg = AppConfig()
+    cfg.speaker.tts_provider = "edge"
+    cfg.speaker.tool_ack_enabled = False
+    gw = SpeakerGateway(cfg, on_stream_query=slow_llm)
+
+    async def run() -> None:
+        conn = FakeConn(gw)
+        gw._relay_connections.add(conn)
+        with (
+            patch.object(PrewarmedEdgeTTS, "open", side_effect=fake_open),
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw._run_query_and_speak(conn, "你在吗")
+
+    asyncio.run(run())
+    ev_map = dict(events)
+    assert "prewarm_open" in ev_map and "start_play" in ev_map and "llm_first" in ev_map
+    # Both Edge-TTS WS prewarm and speculative start_play MUST happen BEFORE LLM emits first sentence!
+    assert ev_map["prewarm_open"] < ev_map["llm_first"]
+    assert ev_map["start_play"] < ev_map["llm_first"]
+    assert received_prewarm == [fake_prewarm]
+    assert prewarm_closed is True
+
+
+def test_prewarmed_edge_tts_stream_mp3_escapes_xml_and_parses_audio_frames() -> None:
+    import aiohttp
+    import time
+    from xiao_speaker_assistant.voice.tts_stream import PrewarmedEdgeTTS
+
+    sent_payloads: list[str] = []
+    ws_closed = False
+    sess_closed = False
+
+    class FakeMsg:
+        def __init__(self, msg_type, data):
+            self.type = msg_type
+            self.data = data
+
+    audio_hdr = b"X-RequestId:1\r\nContent-Type:audio/mpeg\r\nPath:audio\r\n\r\n"
+    audio_frame = len(audio_hdr).to_bytes(2, "big") + audio_hdr + b"\xff\xfb\x90\x00MP3DATA"
+    non_audio_hdr = b"Path:audio.metadata\r\n\r\n"
+    meta_frame = len(non_audio_hdr).to_bytes(2, "big") + non_audio_hdr + b"{}"
+
+    class FakeWS:
+        closed = False
+
+        async def send_str(self, s: str) -> None:
+            sent_payloads.append(s)
+
+        async def close(self) -> None:
+            nonlocal ws_closed
+            ws_closed = True
+            self.closed = True
+
+        def __aiter__(self):
+            async def _gen():
+                yield FakeMsg(aiohttp.WSMsgType.BINARY, meta_frame)
+                yield FakeMsg(aiohttp.WSMsgType.BINARY, audio_frame)
+                yield FakeMsg(aiohttp.WSMsgType.TEXT, "Path:turn.end\r\n\r\n")
+            return _gen()
+
+    class FakeSession:
+        async def close(self) -> None:
+            nonlocal sess_closed
+            sess_closed = True
+
+    pre = PrewarmedEdgeTTS(FakeSession(), FakeWS(), created_at=time.monotonic())
+
+    async def run() -> list[bytes]:
+        assert pre.claim() is True
+        assert pre.claim() is False  # cannot claim twice
+        return [chunk async for chunk in pre.stream_mp3("A & B < C > D", voice="zh-CN-XiaoyiNeural", rate="+8%")]
+
+    chunks = asyncio.run(run())
+    assert chunks == [b"\xff\xfb\x90\x00MP3DATA"]
+    assert len(sent_payloads) == 1
+    assert "A &amp; B &lt; C &gt; D" in sent_payloads[0]
+    assert ws_closed is True
+    assert sess_closed is True
