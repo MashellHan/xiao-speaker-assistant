@@ -889,29 +889,31 @@ class SpeakerGateway:
         # Queue items are `(sentence, optional_prefetch_task)` so sentences 2+ begin
         # Edge-TTS synthesis in the background while sentence 1 is still streaming to ALSA.
         queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None] | None] = asyncio.Queue()
-        prefetch_tasks: set[asyncio.Task[bytes]] = set()
+        all_prefetch_tasks: list[asyncio.Task[bytes]] = []
+        prefetch_sem = asyncio.Semaphore(2)
 
         async def _prefetch_sentence_pcm(sentence: str) -> bytes:
-            buf = bytearray()
-            stream = synthesize_tts_pcm_stream(
-                sentence,
-                self._config.speaker,
-                voice_override=voice_override,
-                chunk_bytes=pb._chunk_bytes(),
-                sample_rate_override=pb._effective_sample_rate(),
-            )
-            try:
-                async for ch in stream:
-                    if ch:
-                        buf.extend(ch)
-            finally:
-                aclose = getattr(stream, "aclose", None)
-                if callable(aclose):
-                    try:
-                        await aclose()
-                    except Exception:
-                        pass
-            return bytes(buf)
+            async with prefetch_sem:
+                buf = bytearray()
+                stream = synthesize_tts_pcm_stream(
+                    sentence,
+                    self._config.speaker,
+                    voice_override=voice_override,
+                    chunk_bytes=pb.chunk_bytes,
+                    sample_rate_override=pb.effective_sample_rate,
+                )
+                try:
+                    async for ch in stream:
+                        if ch:
+                            buf.extend(ch)
+                finally:
+                    aclose = getattr(stream, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
+                return bytes(buf)
 
         async def producer() -> None:
             emitted = 0
@@ -925,8 +927,7 @@ class SpeakerGateway:
                     # sentences prefetch in parallel so there is zero pause between sentences.
                     if use_continuous_stream and emitted >= 2 and self._config.speaker.tts_provider == "edge":
                         pf_task = asyncio.create_task(_prefetch_sentence_pcm(sentence))
-                        prefetch_tasks.add(pf_task)
-                        pf_task.add_done_callback(prefetch_tasks.discard)
+                        all_prefetch_tasks.append(pf_task)
                     await queue.put((sentence, pf_task))
             except Exception as exc:
                 logger.exception("Streaming error for %r", query)
@@ -948,7 +949,7 @@ class SpeakerGateway:
                 prefetched_pcm: bytes | None = None
                 if pf_task is not None:
                     try:
-                        prefetched_pcm = await pf_task
+                        prefetched_pcm = await pf_task or None
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -980,12 +981,12 @@ class SpeakerGateway:
                 # without padding/draining, and unmute 1ch VAD cleanly.
                 if pb.stream_open:
                     await pb.abort_stream(unmute=True)
-            for t in list(prefetch_tasks):
+            for t in all_prefetch_tasks:
                 if not t.done():
                     t.cancel()
             if not prod_task.done():
                 prod_task.cancel()
-            await asyncio.gather(prod_task, *list(prefetch_tasks), return_exceptions=True)
+            await asyncio.gather(prod_task, *all_prefetch_tasks, return_exceptions=True)
             if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 

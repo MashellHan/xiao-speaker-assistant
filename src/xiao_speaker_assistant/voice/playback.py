@@ -56,7 +56,8 @@ class PlaybackController:
         self._cancel_event = asyncio.Event()
         self._cancel_epoch = 0
         self._play_drain_until = 0.0
-        self._chime_pcm = generate_chime_pcm(sample_rate=self._effective_sample_rate())
+        self._chime_sample_rate = self._effective_sample_rate()
+        self._chime_pcm = generate_chime_pcm(sample_rate=self._chime_sample_rate)
 
     @property
     def is_playing(self) -> bool:
@@ -65,6 +66,14 @@ class PlaybackController:
     @property
     def stream_open(self) -> bool:
         return self._stream_open
+
+    @property
+    def effective_sample_rate(self) -> int:
+        return self._effective_sample_rate()
+
+    @property
+    def chunk_bytes(self) -> int:
+        return self._chunk_bytes()
 
     def _effective_sample_rate(self) -> int:
         # Over WAN/SSH relay, downlink delivery rate on Chinese broadband -> Azure can hover
@@ -342,6 +351,10 @@ class PlaybackController:
             if not await self.ensure_stream_started(epoch=epoch):
                 return
 
+            effective_sr = self._effective_sample_rate()
+            if effective_sr != self._chime_sample_rate:
+                self._chime_sample_rate = effective_sr
+                self._chime_pcm = generate_chime_pcm(sample_rate=effective_sr)
             chunk_bytes = self._chunk_bytes()
 
             async def chime_iter() -> AsyncIterator[bytes]:
@@ -385,7 +398,7 @@ class PlaybackController:
                         return
 
                 chunk_bytes = self._chunk_bytes()
-                if prefetched_pcm is not None:
+                if prefetched_pcm:
                     if not await self.ensure_stream_started(epoch=epoch):
                         return
 
@@ -396,7 +409,7 @@ class PlaybackController:
                     await self._stream_chunks(
                         _mem_stream(),
                         epoch,
-                        pad_tail_sec=0.40 if self._wan_relay else 0.22,
+                        pad_tail_sec=0.35 if self._wan_relay else 0.22,
                         keep_open=keep_stream_open,
                     )
                     return

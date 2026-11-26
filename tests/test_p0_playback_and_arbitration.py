@@ -617,3 +617,48 @@ def test_barge_in_during_continuous_stream_does_not_drain_or_close_new_chime() -
     # Aborted continuous stream must NOT emit on_playback_state(False) or hang draining tail
     assert states == [True]
     assert sent_rpcs.count("stop_play") == 1
+
+
+def test_empty_prefetched_pcm_falls_back_to_live_tts_and_chime_tracks_sample_rate() -> None:
+    sent_binary: list[dict] = []
+    live_calls: list[str] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary.append(json.loads(b.decode("utf-8")))
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def ok_rpc(cmd: str, payload, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        live_calls.append(text)
+        yield b"\x05\x00" * 3200
+
+    cfg = SpeakerConfig(tts_provider="edge", tts_sample_rate=24000)
+    pb = PlaybackController(
+        cfg,
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=ok_rpc,
+        wan_relay=False,
+    )
+
+    async def run() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts):
+            await pb.speak("空预取回退测试", interrupt_native=False, prefetched_pcm=b"")
+        assert pb._chime_sample_rate == 24000
+        old_len = len(pb._chime_pcm)
+        pb._config = SpeakerConfig(tts_provider="edge", tts_sample_rate=16000)
+        await pb.play_chime()
+        assert pb._chime_sample_rate == 16000
+        assert len(pb._chime_pcm) < old_len
+
+    asyncio.run(run())
+    assert live_calls == ["空预取回退测试"]
+    assert len(sent_binary) >= 2

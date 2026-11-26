@@ -219,7 +219,8 @@ class LLMRouter:
                 agent="nomi",
                 title="xsa-voice",
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("Pre-warm OpenCode session skipped: %s", exc)
             self.opencode_session_id = None
 
     async def close(self) -> None:
