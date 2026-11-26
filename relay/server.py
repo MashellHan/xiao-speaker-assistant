@@ -191,7 +191,8 @@ class RelayServer:
         self._speaker: ServerConnection | None = None
         self._host_conn: ServerConnection | None = None
         self._console_conn: ServerConnection | None = None
-        self._pending_console_reqs: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_console_reqs: dict[str, tuple[ServerConnection, asyncio.Future[dict[str, Any]]]] = {}
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._server: Server | None = None
         self._console_runner: Any = None
         self._bound_console_port: int | None = None
@@ -453,9 +454,11 @@ class RelayServer:
         if previous is not None and previous is not conn:
             logger.info("Replacing active %s connection", role)
             # Close asynchronously so a half-open peer cannot stall the replacement up to close_timeout.
-            asyncio.create_task(
+            close_task = asyncio.create_task(
                 _safe_close(previous, code=CLOSE_REPLACED, reason=f"Replaced by new {role}")
             )
+            self._bg_tasks.add(close_task)
+            close_task.add_done_callback(self._bg_tasks.discard)
 
         logger.info("Connected %s from %s", role, ip)
         try:
@@ -472,13 +475,15 @@ class RelayServer:
                     if not isinstance(payload, dict) or payload.get("type") != "http_response":
                         continue
                     req_id = payload.get("id")
-                    fut = (
+                    entry = (
                         self._pending_console_reqs.get(req_id)
                         if isinstance(req_id, str)
                         else None
                     )
-                    if fut is not None and not fut.done():
-                        fut.set_result(payload)
+                    if entry is not None:
+                        owner_conn, fut = entry
+                        if owner_conn is conn and not fut.done():
+                            fut.set_result(payload)
             else:
                 async for message in conn:
                     if self._get_conn(role) is not conn:
@@ -495,27 +500,36 @@ class RelayServer:
         finally:
             if self._get_conn(role) is conn:
                 self._set_conn(role, None)
-                if role == "console":
-                    for fut in list(self._pending_console_reqs.values()):
-                        if not fut.done():
-                            fut.set_exception(ConnectionError("Console host disconnected"))
+            if role == "console":
+                for owner_conn, fut in list(self._pending_console_reqs.values()):
+                    if owner_conn is conn and not fut.done():
+                        fut.set_exception(ConnectionError("Console host disconnected"))
             logger.info("Disconnected %s", role)
 
     @staticmethod
     def _is_console_path_allowed(raw_path_or_qs: str) -> bool:
         # Never proxy internal /mcp endpoint or traversal variants over the public console tunnel.
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw_path_or_qs):
+            return False
         parts = urlsplit(raw_path_or_qs)
-        if parts.scheme or parts.netloc:
+        if parts.scheme or parts.netloc or parts.fragment:
             return False
         raw_path = parts.path
-        if not raw_path.startswith("/") or "\\" in raw_path or "\x00" in raw_path:
+        if not raw_path.startswith("/") or "\\" in raw_path:
             return False
-        decoded = unquote(raw_path)
-        if "\\" in decoded or "\x00" in decoded:
+        decoded = raw_path
+        for _ in range(3):
+            if "\\" in decoded or any(ord(c) < 0x20 or ord(c) == 0x7F for c in decoded):
+                return False
+            if any(seg == ".." for seg in decoded.split("/")):
+                return False
+            nxt = unquote(decoded)
+            if nxt == decoded:
+                break
+            decoded = nxt
+        if "\\" in decoded or any(ord(c) < 0x20 or ord(c) == 0x7F for c in decoded):
             return False
-        if any(seg == ".." for seg in raw_path.split("/")) or any(
-            seg == ".." for seg in decoded.split("/")
-        ):
+        if any(seg == ".." for seg in decoded.split("/")):
             return False
         normalized = posixpath.normpath(decoded)
         if not normalized.startswith("/"):
@@ -591,7 +605,7 @@ class RelayServer:
 
         req_id = uuid.uuid4().hex
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending_console_reqs[req_id] = fut
+        self._pending_console_reqs[req_id] = (conn, fut)
         try:
             frame = {
                 "type": "http_request",
@@ -639,6 +653,11 @@ class RelayServer:
             hk, hv = str(pair[0]), str(pair[1])
             if hk.lower() in _HOP_BY_HOP_HEADERS:
                 continue
+            if any(ch in hk or ch in hv for ch in ("\r", "\n", "\x00")):
+                return aiohttp_web.json_response(
+                    {"error": "bad_gateway", "message": "Invalid response header from console host"},
+                    status=502,
+                )
             out_headers.append((hk, hv))
         return aiohttp_web.Response(status=status, body=body, headers=out_headers)
 
@@ -685,7 +704,7 @@ class RelayServer:
         return self
 
     async def close(self) -> None:
-        for fut in list(self._pending_console_reqs.values()):
+        for _owner_conn, fut in list(self._pending_console_reqs.values()):
             if not fut.done():
                 fut.set_exception(ConnectionError("Relay server shutting down"))
         self._pending_console_reqs.clear()

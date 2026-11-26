@@ -1999,7 +1999,7 @@ class McpServer:
             remote = (request.remote or "").strip()
             if remote not in _LOOPBACK_REMOTES:
                 return False
-            if any(request.headers.get(h) for h in _PROXY_HEADER_NAMES):
+            if any(h in request.headers for h in _PROXY_HEADER_NAMES):
                 return False
             host_header = request.headers.get("Host", "")
             if host_header and _extract_hostname(host_header) not in _LOOPBACK_HOSTS:
@@ -2181,7 +2181,23 @@ class McpServer:
                 or (request.remote or "unknown")
             )
             now = time.monotonic()
+            if len(login_failures) >= 4096:
+                stale_keys = [
+                    k
+                    for k, ts_list in login_failures.items()
+                    if not ts_list or (now - ts_list[-1]) >= 60.0
+                ]
+                for k in stale_keys:
+                    login_failures.pop(k, None)
+                if len(login_failures) >= 4096:
+                    overflow = len(login_failures) - 4096 + 1
+                    for k, _ in sorted(
+                        login_failures.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
+                    )[:overflow]:
+                        login_failures.pop(k, None)
             recent = [t for t in login_failures.get(client_key, []) if (now - t) < 60.0]
+            if not recent:
+                login_failures.pop(client_key, None)
             if len(recent) >= 5:
                 login_failures[client_key] = recent
                 return web.json_response(

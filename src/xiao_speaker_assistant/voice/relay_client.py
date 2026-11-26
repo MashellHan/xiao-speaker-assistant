@@ -254,6 +254,8 @@ class RelayConsoleClient:
             "transfer-encoding",
             "upgrade",
             "content-length",
+            # httpx transparently decodes Content-Encoding into resp.content.
+            "content-encoding",
         }
     )
 
@@ -309,18 +311,27 @@ class RelayConsoleClient:
 
     @staticmethod
     def _is_path_allowed(path_qs: str) -> bool:
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in path_qs):
+            return False
         parts = urlsplit(path_qs)
-        if parts.scheme or parts.netloc:
+        if parts.scheme or parts.netloc or parts.fragment:
             return False
         raw_path = parts.path
-        if not raw_path.startswith("/") or "\\" in raw_path or "\x00" in raw_path:
+        if not raw_path.startswith("/") or "\\" in raw_path:
             return False
-        decoded = unquote(raw_path)
-        if "\\" in decoded or "\x00" in decoded:
+        decoded = raw_path
+        for _ in range(3):
+            if "\\" in decoded or any(ord(c) < 0x20 or ord(c) == 0x7F for c in decoded):
+                return False
+            if any(seg == ".." for seg in decoded.split("/")):
+                return False
+            nxt = unquote(decoded)
+            if nxt == decoded:
+                break
+            decoded = nxt
+        if "\\" in decoded or any(ord(c) < 0x20 or ord(c) == 0x7F for c in decoded):
             return False
-        if any(seg == ".." for seg in raw_path.split("/")) or any(
-            seg == ".." for seg in decoded.split("/")
-        ):
+        if any(seg == ".." for seg in decoded.split("/")):
             return False
         normalized = posixpath.normpath(decoded)
         if not normalized.startswith("/"):
@@ -364,20 +375,19 @@ class RelayConsoleClient:
         for k, v in raw_headers.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 continue
+            if any(ch in k or ch in v for ch in ("\r", "\n", "\x00")):
+                continue
             lk = k.lower()
             if lk in self._HOP_BY_HOP or lk not in self._ALLOWED_FWD_HEADERS:
                 continue
-            fwd_headers[k] = v
+            # Canonicalize header keys to lowercase so duplicate mixed-case proxy headers
+            # (e.g. `x-forwarded-for: ""` + `X-Forwarded-For: remote`) can never be emitted.
+            fwd_headers[lk] = v.strip()
         # Ensure Mac McpServer ALWAYS recognizes tunneled requests as remote (never loopback-bypass).
-        existing_xff = next((v.strip() for k, v in fwd_headers.items() if k.lower() == "x-forwarded-for"), "")
-        if not existing_xff:
-            fwd_headers["X-Forwarded-For"] = "remote"
-        existing_proto = next(
-            (v.strip().lower() for k, v in fwd_headers.items() if k.lower() == "x-forwarded-proto"),
-            "",
-        )
-        if existing_proto not in {"http", "https"}:
-            fwd_headers["X-Forwarded-Proto"] = "https"
+        if not fwd_headers.get("x-forwarded-for"):
+            fwd_headers["x-forwarded-for"] = "remote"
+        if fwd_headers.get("x-forwarded-proto", "").lower() not in {"http", "https"}:
+            fwd_headers["x-forwarded-proto"] = "https"
 
         body_b64 = str(frame.get("body_b64") or "")
         try:
@@ -484,8 +494,11 @@ class RelayConsoleClient:
                     task.add_done_callback(tasks.discard)
             finally:
                 self._connected_event.clear()
-                for t in list(tasks):
+                pending = list(tasks)
+                for t in pending:
                     t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 if self._active_ws is ws:
                     self._active_ws = None
         return received_any
