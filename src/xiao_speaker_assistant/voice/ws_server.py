@@ -390,10 +390,14 @@ class SpeakerGateway:
                 return
             if (time.monotonic() - sess.last_audio_at) > self._audio_stall_timeout:
                 consecutive_stalls += 1
-                # Avoid spamming start_recording every 4s when the remote speaker is offline.
+                # Throttle warning logs when the remote speaker is offline (still probe
+                # start_recording periodically so a reconnecting speaker resumes promptly).
                 if consecutive_stalls <= 3 or consecutive_stalls % 5 == 0:
                     logger.warning("Audio stream stalled >4s; restarting speaker recording")
-                await self.send_command(conn, "start_recording", self._recording_params(conn))
+                try:
+                    await self.send_command(conn, "start_recording", self._recording_params(conn))
+                except ConnectionClosed:
+                    return
                 sess.last_audio_at = time.monotonic()
             else:
                 consecutive_stalls = 0
@@ -887,6 +891,7 @@ class SpeakerGateway:
         prod_task = asyncio.create_task(producer())
         first_spoken = True
         use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
+        completed_normally = False
         try:
             while True:
                 if sess.interrupted:
@@ -909,14 +914,17 @@ class SpeakerGateway:
                 pb = self._playbacks.get(conn)
                 if pb is not None:
                     await pb.finish_stream()
+            completed_normally = True
             await prod_task
         except asyncio.CancelledError:
             logger.info("Streaming reply cancelled due to barge-in")
         finally:
-            if use_continuous_stream:
+            if use_continuous_stream and not completed_normally and not sess.interrupted:
+                # Mid-stream exception (not barge-in): close any kept-open stream immediately
+                # without padding/draining, and unmute 1ch VAD cleanly.
                 pb = self._playbacks.get(conn)
-                if pb is not None and pb._stream_open:
-                    await pb.finish_stream()
+                if pb is not None and pb.stream_open:
+                    await pb.abort_stream(unmute=True)
             if not prod_task.done():
                 prod_task.cancel()
             await asyncio.gather(prod_task, return_exceptions=True)

@@ -51,6 +51,8 @@ class PlaybackController:
         self._wan_relay = wan_relay
         self._lock = asyncio.Lock()
         self._stream_open = False
+        self._playback_notified = False
+        self._stream_sent_sec = 0.0
         self._cancel_event = asyncio.Event()
         self._cancel_epoch = 0
         self._play_drain_until = 0.0
@@ -58,7 +60,24 @@ class PlaybackController:
 
     @property
     def is_playing(self) -> bool:
-        return self._lock.locked()
+        return self._lock.locked() or self._stream_open
+
+    @property
+    def stream_open(self) -> bool:
+        return self._stream_open
+
+    def _alsa_buffer_frames(self) -> int:
+        return 19200 if self._wan_relay else 4800
+
+    def _notify_playback_started(self) -> None:
+        if self._on_playback_state and not self._playback_notified:
+            self._playback_notified = True
+            self._on_playback_state(True)
+
+    def _notify_playback_stopped(self) -> None:
+        if self._on_playback_state and self._playback_notified:
+            self._playback_notified = False
+            self._on_playback_state(False)
 
     async def _send_rpc(
         self,
@@ -86,8 +105,9 @@ class PlaybackController:
         # Mark stream open before awaiting the start_play Response so a mid-flight stop_playback()
         # still sends `stop_play` to tear down `aplay` if it finished spawning on the speaker.
         self._stream_open = True
+        self._stream_sent_sec = 0.0
         period_size = 2400 if self._wan_relay else 1200
-        buffer_size = 19200 if self._wan_relay else 4800
+        buffer_size = self._alsa_buffer_frames()
         try:
             # Wait for open-xiaoai-client to spawn `aplay` and initialize its `AudioPlayer.sender`
             # channel before sending binary `tag="play"` frames (prevents silent initial drops).
@@ -118,6 +138,7 @@ class PlaybackController:
 
     async def _close_stream(self) -> None:
         self._play_drain_until = 0.0
+        self._stream_sent_sec = 0.0
         if self._stream_open:
             self._stream_open = False
             try:
@@ -129,6 +150,7 @@ class PlaybackController:
         """Immediately halt active and queued playback and optionally stop native players."""
         self._cancel_epoch += 1
         self._cancel_event.set()
+        self._playback_notified = False
         await self._close_stream()
         if stop_native:
             try:
@@ -169,8 +191,28 @@ class PlaybackController:
         ).encode("utf-8")
         await self._send_binary(frame)
         chunk_dur = len(chunk) / bytes_per_sec
+        self._stream_sent_sec += chunk_dur
         self._play_drain_until = max(now, self._play_drain_until) + chunk_dur
         return True
+
+    def _effective_tail_pad_sec(self, base_pad_sec: float) -> float:
+        """Ensure total written PCM exceeds ALSA buffer_size (start_threshold) so short audio never drops."""
+        min_total_sec = (self._alsa_buffer_frames() / self._config.tts_sample_rate) + 0.05
+        min_pad_for_start = max(0.0, min_total_sec - self._stream_sent_sec)
+        return max(base_pad_sec, min_pad_for_start)
+
+    async def _flush_tail_and_wait(self, epoch: int, *, pad_tail_sec: float) -> None:
+        effective_pad = self._effective_tail_pad_sec(pad_tail_sec)
+        if effective_pad > 0 and epoch == self._cancel_epoch and not self._cancel_event.is_set():
+            pad_bytes = int(self._config.tts_sample_rate * effective_pad) * 2
+            chunk_bytes = 9600 if self._wan_relay else 4800
+            for i in range(0, pad_bytes, chunk_bytes):
+                silence = b"\x00" * min(chunk_bytes, pad_bytes - i)
+                if not await self._send_play_chunk(silence, epoch):
+                    return
+        remaining = self._play_drain_until - time.monotonic()
+        if remaining > 0 and epoch == self._cancel_epoch:
+            await self._wait_cancellable(remaining)
 
     async def _stream_chunks(
         self,
@@ -192,48 +234,42 @@ class PlaybackController:
             # so back-to-back sentences play seamlessly with zero underrun gap.
             return
 
-        # Pad trailing silence so ALSA `aplay` flushes the final audio past its start_threshold/buffer.
-        if sent_any and pad_tail_sec > 0 and epoch == self._cancel_epoch and not self._cancel_event.is_set():
-            pad_bytes = int(self._config.tts_sample_rate * pad_tail_sec) * 2
-            chunk_bytes = 9600 if self._wan_relay else 4800
-            for i in range(0, pad_bytes, chunk_bytes):
-                silence = b"\x00" * min(chunk_bytes, pad_bytes - i)
-                if not await self._send_play_chunk(silence, epoch):
-                    return
-
-        # Wait until the speaker actually finishes draining the prebuffered tail before unmuting.
-        remaining = self._play_drain_until - time.monotonic()
-        if remaining > 0 and epoch == self._cancel_epoch:
-            await self._wait_cancellable(remaining)
+        if sent_any:
+            await self._flush_tail_and_wait(epoch, pad_tail_sec=pad_tail_sec)
 
     async def finish_stream(self, *, pad_tail_sec: float | None = None) -> None:
         """Flush trailing silence, wait for ALSA drain, and close a kept-open multi-sentence stream."""
         epoch = self._cancel_epoch
         async with self._lock:
-            if not self._stream_open:
+            if epoch != self._cancel_epoch or self._cancel_event.is_set():
                 return
-            effective_pad = (
+            if not self._stream_open:
+                self._notify_playback_stopped()
+                return
+            base_pad = (
                 pad_tail_sec
                 if pad_tail_sec is not None
                 else (0.45 if self._wan_relay else 0.22)
             )
             try:
-                if epoch == self._cancel_epoch and not self._cancel_event.is_set():
-                    if effective_pad > 0:
-                        pad_bytes = int(self._config.tts_sample_rate * effective_pad) * 2
-                        chunk_bytes = 9600 if self._wan_relay else 4800
-                        for i in range(0, pad_bytes, chunk_bytes):
-                            silence = b"\x00" * min(chunk_bytes, pad_bytes - i)
-                            if not await self._send_play_chunk(silence, epoch):
-                                break
-                    remaining = self._play_drain_until - time.monotonic()
-                    if remaining > 0 and epoch == self._cancel_epoch:
-                        await self._wait_cancellable(remaining)
+                if self._stream_sent_sec > 0:
+                    await self._flush_tail_and_wait(epoch, pad_tail_sec=base_pad)
             finally:
-                await self._close_stream()
                 aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
-                if self._on_playback_state and not aborted:
-                    self._on_playback_state(False)
+                if not aborted:
+                    await self._close_stream()
+                    self._notify_playback_stopped()
+
+    async def abort_stream(self, *, unmute: bool = True) -> None:
+        """Close a kept-open stream immediately without padding/draining (e.g. after mid-stream error)."""
+        epoch = self._cancel_epoch
+        async with self._lock:
+            if epoch != self._cancel_epoch or self._cancel_event.is_set():
+                return
+            if self._stream_open:
+                await self._close_stream()
+            if unmute:
+                self._notify_playback_stopped()
 
     async def play_chime(self) -> None:
         """Play crisp wakeup tone without resetting VAD or erasing one-shot follow-up speech."""
@@ -277,8 +313,7 @@ class PlaybackController:
             if epoch != self._cancel_epoch:
                 return
             self._cancel_event.clear()
-            if self._on_playback_state:
-                self._on_playback_state(True)
+            self._notify_playback_started()
             try:
                 if self._config.tts_provider == "xiaoai":
                     quoted = shlex.quote(text)
@@ -315,5 +350,5 @@ class PlaybackController:
                 aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
                 if self._config.tts_provider != "xiaoai" and (not keep_stream_open or aborted):
                     await self._close_stream()
-                if self._on_playback_state and not aborted and not keep_stream_open:
-                    self._on_playback_state(False)
+                if not aborted and (not keep_stream_open or not self._stream_open):
+                    self._notify_playback_stopped()
