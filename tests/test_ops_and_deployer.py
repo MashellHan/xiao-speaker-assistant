@@ -185,6 +185,17 @@ def test_boot_script_busybox_features_and_shell_syntax(tmp_path: Path) -> None:
     )
     assert syntax_check.returncode == 0, syntax_check.stderr
 
+    restart_file = tmp_path / "restart.sh"
+    restart_file.write_text(build_restart_command() + "\n", encoding="utf-8")
+    restart_check = subprocess.run(
+        ["/bin/sh", "-n", str(restart_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert restart_check.returncode == 0, restart_check.stderr
+
 
 def test_build_ssh_command_options_and_target() -> None:
     cmd = build_ssh_command(
@@ -262,10 +273,17 @@ def test_server_url_validation_and_remote_commands() -> None:
     assert "tunnel_id_dropbear" in tun_key_cmd
     assert "chmod 600" in tun_key_cmd
 
-    assert "trap 'cleanup_tunnel; exit 0' INT TERM" in boot_cmd
+    assert "trap 'trap - EXIT; cleanup_all; exit 0' INT TERM" in boot_cmd
+    assert "run_tunnel_supervisor" in boot_cmd
+    assert "trim_log_if_needed" in boot_cmd
+    assert "interruptible_sleep" in boot_cmd
+    assert 'wait "$CHILD_SSH"' in boot_cmd
+    assert 'wait "$CLIENT_PID"' in boot_cmd
     assert "ssh -y -N -K 10 -i" in boot_cmd
     assert " -I " not in boot_cmd
     assert "/tmp/xiaoai-agent-tunnel.pid" in build_restart_command()
+    assert "/tmp/xiaoai-agent-tunnel-sup.pid" in build_restart_command()
+    assert "stop_pidfile" in build_restart_command()
 
     status_cmd = build_status_command()
     assert "ps" in status_cmd

@@ -17,6 +17,7 @@ DEFAULT_REMOTE_DIR = "/data/xiaoai-agent"
 DEFAULT_LOG_PATH = "/tmp/xiaoai-agent.log"
 DEFAULT_PID_FILE = "/tmp/xiaoai-agent-boot.pid"
 DEFAULT_TUNNEL_PID_FILE = "/tmp/xiaoai-agent-tunnel.pid"
+DEFAULT_TUNNEL_SUP_PID_FILE = "/tmp/xiaoai-agent-tunnel-sup.pid"
 _TUNNEL_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 _TUNNEL_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 
@@ -54,84 +55,178 @@ def build_boot_script(
     log_file: str = DEFAULT_LOG_PATH,
     pid_file: str = DEFAULT_PID_FILE,
     tunnel_pid_file: str = DEFAULT_TUNNEL_PID_FILE,
+    tunnel_sup_pid_file: str = DEFAULT_TUNNEL_SUP_PID_FILE,
     ping_target: str = "223.5.5.5",
     max_net_wait_attempts: int = 60,
     restart_delay: int = 5,
 ) -> str:
     """Return a BusyBox `/bin/sh` compatible `boot.sh` for `/data/xiaoai-agent/`."""
+    max_net_wait = max(0, int(max_net_wait_attempts))
+    delay_sec = max(1, int(restart_delay))
     return f"""#!/bin/sh
 AGENT_DIR={shlex.quote(agent_dir)}
-CLIENT_BIN="${{AGENT_DIR}}/{binary_name}"
-SERVER_FILE="${{AGENT_DIR}}/{server_file}"
-TUNNEL_CONF="${{AGENT_DIR}}/{tunnel_conf_file}"
+BINARY_NAME={shlex.quote(binary_name)}
+CLIENT_BIN="${{AGENT_DIR}}/${{BINARY_NAME}}"
+SERVER_FILE="${{AGENT_DIR}}/{shlex.quote(server_file)}"
+TUNNEL_CONF="${{AGENT_DIR}}/{shlex.quote(tunnel_conf_file)}"
 LOG_FILE={shlex.quote(log_file)}
 PID_FILE={shlex.quote(pid_file)}
 TUNNEL_PID_FILE={shlex.quote(tunnel_pid_file)}
-TUNNEL_PID=""
+TUNNEL_SUP_PID_FILE={shlex.quote(tunnel_sup_pid_file)}
+BOOT_PID=$$
+TUNNEL_SUP_PID=""
+CLIENT_PID=""
+SLEEP_PID=""
 
-echo $$ > "$PID_FILE"
+echo "$BOOT_PID" > "$PID_FILE"
 cd "$AGENT_DIR" || exit 1
 
-cleanup_tunnel() {{
-    if [ -n "$TUNNEL_PID" ]; then
-        kill "$TUNNEL_PID" 2>/dev/null || true
-        TUNNEL_PID=""
-    fi
-    if [ -f "$TUNNEL_PID_FILE" ]; then
-        kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true
-        rm -f "$TUNNEL_PID_FILE"
+trim_log_if_needed() {{
+    if [ -f "$LOG_FILE" ]; then
+        LOG_BYTES=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$LOG_BYTES" -gt 262144 ] 2>/dev/null; then
+            tail -n 200 "$LOG_FILE" > "${{LOG_FILE}}.tmp" 2>/dev/null && mv "${{LOG_FILE}}.tmp" "$LOG_FILE" 2>/dev/null || true
+        fi
     fi
 }}
-trap cleanup_tunnel EXIT
-trap 'cleanup_tunnel; exit 0' INT TERM
+
+interruptible_sleep() {{
+    sleep "$1" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
+}}
+
+cleanup_tunnel() {{
+    if [ -n "$TUNNEL_SUP_PID" ]; then
+        kill "$TUNNEL_SUP_PID" 2>/dev/null || true
+        if [ -f "$TUNNEL_SUP_PID_FILE" ] && [ "$(cat "$TUNNEL_SUP_PID_FILE" 2>/dev/null)" = "$TUNNEL_SUP_PID" ]; then
+            rm -f "$TUNNEL_SUP_PID_FILE"
+        fi
+        TUNNEL_SUP_PID=""
+    fi
+}}
+
+cleanup_all() {{
+    if [ -n "$SLEEP_PID" ]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+        SLEEP_PID=""
+    fi
+    if [ -n "$CLIENT_PID" ]; then
+        kill "$CLIENT_PID" 2>/dev/null || true
+        CLIENT_PID=""
+    fi
+    cleanup_tunnel
+    if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$BOOT_PID" ]; then
+        rm -f "$PID_FILE"
+    fi
+}}
+trap cleanup_all EXIT
+trap 'trap - EXIT; cleanup_all; exit 0' INT TERM
 
 i=0
-while [ "$i" -lt {max_net_wait_attempts} ]; do
+while [ "$i" -lt {max_net_wait} ]; do
     if ping -c 1 {shlex.quote(ping_target)} >/dev/null 2>&1; then
         break
     fi
     i=$((i + 1))
-    sleep 2
+    interruptible_sleep 2
 done
+
+# Run Dropbear SSH tunnel in its own independent supervisor loop so a Wi-Fi blip or
+# dead link immediately auto-reconnects even while open-xiaoai-client stays running.
+run_tunnel_supervisor() {{
+    CHILD_SSH=""
+    SUP_SLEEP=""
+    BACKOFF=3
+    cleanup_sup() {{
+        if [ -n "$SUP_SLEEP" ]; then
+            kill "$SUP_SLEEP" 2>/dev/null || true
+            SUP_SLEEP=""
+        fi
+        if [ -n "$CHILD_SSH" ]; then
+            kill "$CHILD_SSH" 2>/dev/null || true
+            if [ -f "$TUNNEL_PID_FILE" ] && [ "$(cat "$TUNNEL_PID_FILE" 2>/dev/null)" = "$CHILD_SSH" ]; then
+                rm -f "$TUNNEL_PID_FILE"
+            fi
+            CHILD_SSH=""
+        fi
+    }}
+    sup_sleep() {{
+        sleep "$1" &
+        SUP_SLEEP=$!
+        wait "$SUP_SLEEP" 2>/dev/null || true
+        SUP_SLEEP=""
+    }}
+    trap cleanup_sup EXIT
+    trap 'trap - EXIT; cleanup_sup; exit 0' INT TERM
+    while true; do
+        trim_log_if_needed
+        if [ ! -f "$TUNNEL_CONF" ]; then
+            sup_sleep {delay_sec}
+            continue
+        fi
+        TUNNEL_HOST=""
+        TUNNEL_PORT="2222"
+        TUNNEL_USER="xsa-tunnel"
+        TUNNEL_LOCAL_PORT="8765"
+        TUNNEL_REMOTE_PORT="8765"
+        TUNNEL_KEY="${{AGENT_DIR}}/tunnel_id_dropbear"
+        # shellcheck disable=SC1090
+        . "$TUNNEL_CONF"
+        if [ -z "$TUNNEL_HOST" ] || [ ! -f "$TUNNEL_KEY" ]; then
+            sup_sleep {delay_sec}
+            continue
+        fi
+        STARTED_AT=$(date +%s 2>/dev/null || echo 0)
+        echo "$(date): starting encrypted SSH tunnel -> ${{TUNNEL_USER}}@${{TUNNEL_HOST}}:${{TUNNEL_PORT}} (127.0.0.1:${{TUNNEL_LOCAL_PORT}} -> 127.0.0.1:${{TUNNEL_REMOTE_PORT}})" >> "$LOG_FILE"
+        # Note: Dropbear -y performs TOFU (persisting first host key to ~/.ssh/known_hosts and rejecting changes).
+        # -K 10 sends SSH keepalives every 10s; Dropbear disconnects dead links after 3 missed replies (~30s)
+        # without killing healthy idle -N -L tunnels (unlike -I, which is an inactivity timeout).
+        ssh -y -N -K 10 -i "$TUNNEL_KEY" -p "$TUNNEL_PORT" \\
+            -L "127.0.0.1:${{TUNNEL_LOCAL_PORT}}:127.0.0.1:${{TUNNEL_REMOTE_PORT}}" \\
+            "${{TUNNEL_USER}}@${{TUNNEL_HOST}}" >> "$LOG_FILE" 2>&1 &
+        CHILD_SSH=$!
+        echo "$CHILD_SSH" > "$TUNNEL_PID_FILE"
+        wait "$CHILD_SSH"
+        TUN_RC=$?
+        if [ -f "$TUNNEL_PID_FILE" ] && [ "$(cat "$TUNNEL_PID_FILE" 2>/dev/null)" = "$CHILD_SSH" ]; then
+            rm -f "$TUNNEL_PID_FILE"
+        fi
+        CHILD_SSH=""
+        ENDED_AT=$(date +%s 2>/dev/null || echo 0)
+        UPTIME=$((ENDED_AT - STARTED_AT))
+        if [ "$UPTIME" -ge 30 ] 2>/dev/null; then
+            BACKOFF=3
+        fi
+        echo "$(date): SSH tunnel exited ($TUN_RC), reconnecting in ${{BACKOFF}}s" >> "$LOG_FILE"
+        sup_sleep "$BACKOFF"
+        if [ "$BACKOFF" -lt 30 ]; then
+            BACKOFF=$((BACKOFF * 2))
+            if [ "$BACKOFF" -gt 30 ]; then
+                BACKOFF=30
+            fi
+        fi
+    done
+}}
 
 start_tunnel_if_configured() {{
     if [ ! -f "$TUNNEL_CONF" ]; then
         return 0
     fi
-    TUNNEL_HOST=""
-    TUNNEL_PORT="2222"
-    TUNNEL_USER="xsa-tunnel"
-    TUNNEL_LOCAL_PORT="8765"
-    TUNNEL_REMOTE_PORT="8765"
-    TUNNEL_KEY="${{AGENT_DIR}}/tunnel_id_dropbear"
-    # shellcheck disable=SC1090
-    . "$TUNNEL_CONF"
-    if [ -z "$TUNNEL_HOST" ] || [ ! -f "$TUNNEL_KEY" ]; then
-        return 0
-    fi
-    if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    if [ -n "$TUNNEL_SUP_PID" ] && kill -0 "$TUNNEL_SUP_PID" 2>/dev/null; then
         return 0
     fi
     cleanup_tunnel
-    echo "$(date): starting encrypted SSH tunnel -> ${{TUNNEL_USER}}@${{TUNNEL_HOST}}:${{TUNNEL_PORT}} (127.0.0.1:${{TUNNEL_LOCAL_PORT}} -> 127.0.0.1:${{TUNNEL_REMOTE_PORT}})" >> "$LOG_FILE"
-    # Note: Dropbear -y performs TOFU (persisting first host key to ~/.ssh/known_hosts and rejecting changes).
-    # -K 10 sends SSH keepalives every 10s; Dropbear disconnects dead links after 3 missed replies (~30s)
-    # without killing healthy idle -N -L tunnels (unlike -I, which is an inactivity timeout).
-    ssh -y -N -K 10 -i "$TUNNEL_KEY" -p "$TUNNEL_PORT" \\
-        -L "127.0.0.1:${{TUNNEL_LOCAL_PORT}}:127.0.0.1:${{TUNNEL_REMOTE_PORT}}" \\
-        "${{TUNNEL_USER}}@${{TUNNEL_HOST}}" >> "$LOG_FILE" 2>&1 &
-    TUNNEL_PID=$!
-    echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
-    sleep 2
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        echo "$(date): SSH tunnel exited prematurely; will retry next loop" >> "$LOG_FILE"
-        cleanup_tunnel
-        return 1
-    fi
+    run_tunnel_supervisor &
+    TUNNEL_SUP_PID=$!
+    echo "$TUNNEL_SUP_PID" > "$TUNNEL_SUP_PID_FILE"
+    interruptible_sleep 2
     return 0
 }}
 
 while true; do
+    trim_log_if_needed
     SERVER_URL=""
     if [ -f "$SERVER_FILE" ]; then
         SERVER_URL=$(tr -d '\\r\\n ' < "$SERVER_FILE")
@@ -139,32 +234,31 @@ while true; do
 
     if [ -z "$SERVER_URL" ]; then
         echo "$(date): waiting for $SERVER_FILE" >> "$LOG_FILE"
-        sleep {restart_delay}
+        interruptible_sleep {delay_sec}
         continue
     fi
 
     if [ ! -x "$CLIENT_BIN" ]; then
         echo "$(date): missing executable $CLIENT_BIN" >> "$LOG_FILE"
-        sleep {restart_delay}
+        interruptible_sleep {delay_sec}
         continue
     fi
 
-    if ! start_tunnel_if_configured; then
-        sleep {restart_delay}
-        continue
-    fi
+    start_tunnel_if_configured
 
-    echo "$(date): starting {binary_name} -> $(printf '%s' "$SERVER_URL" | sed 's/token=[^&#]*/token=REDACTED/g')" >> "$LOG_FILE"
+    echo "$(date): starting $BINARY_NAME -> $(printf '%s' "$SERVER_URL" | sed 's/token=[^&#]*/token=REDACTED/g')" >> "$LOG_FILE"
     if [ -f "$AGENT_DIR/asound_xsa.conf" ]; then
         export ALSA_CONFIG_PATH="$AGENT_DIR/asound_xsa.conf"
     else
         unset ALSA_CONFIG_PATH
     fi
-    "$CLIENT_BIN" "$SERVER_URL" >> "$LOG_FILE" 2>&1
+    "$CLIENT_BIN" "$SERVER_URL" >> "$LOG_FILE" 2>&1 &
+    CLIENT_PID=$!
+    wait "$CLIENT_PID"
     EXIT_CODE=$?
-    echo "$(date): {binary_name} exited ($EXIT_CODE), restarting in {restart_delay}s" >> "$LOG_FILE"
-    cleanup_tunnel
-    sleep {restart_delay}
+    CLIENT_PID=""
+    echo "$(date): $BINARY_NAME exited ($EXIT_CODE), restarting in {delay_sec}s" >> "$LOG_FILE"
+    interruptible_sleep {delay_sec}
 done
 """
 
@@ -383,21 +477,28 @@ def build_restart_command(
     remote_dir: str = DEFAULT_REMOTE_DIR,
     pid_file: str = DEFAULT_PID_FILE,
     tunnel_pid_file: str = DEFAULT_TUNNEL_PID_FILE,
+    tunnel_sup_pid_file: str = DEFAULT_TUNNEL_SUP_PID_FILE,
     binary_name: str = "client",
 ) -> str:
     q_boot = shlex.quote(f"{remote_dir}/boot.sh")
     q_pid = shlex.quote(pid_file)
+    q_tun_sup_pid = shlex.quote(tunnel_sup_pid_file)
     q_tun_pid = shlex.quote(tunnel_pid_file)
     q_bin = shlex.quote(binary_name)
     return (
-        f"if [ -f {q_pid} ]; then "
-        f"kill $(cat {q_pid}) 2>/dev/null || true; "
-        f"rm -f {q_pid}; "
+        "stop_pidfile() { "
+        'pf="$1"; [ -f "$pf" ] || return 0; '
+        'p=$(cat "$pf" 2>/dev/null); '
+        'if [ -n "$p" ]; then '
+        'kill "$p" 2>/dev/null || true; '
+        'i=0; while [ "$i" -lt 20 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1 2>/dev/null || sleep 1; i=$((i + 1)); done; '
+        'kill -9 "$p" 2>/dev/null || true; '
         "fi; "
-        f"if [ -f {q_tun_pid} ]; then "
-        f"kill $(cat {q_tun_pid}) 2>/dev/null || true; "
-        f"rm -f {q_tun_pid}; "
-        "fi; "
+        'rm -f "$pf"; '
+        "}; "
+        f"stop_pidfile {q_pid}; "
+        f"stop_pidfile {q_tun_sup_pid}; "
+        f"stop_pidfile {q_tun_pid}; "
         f"killall {q_bin} 2>/dev/null || true; "
         "sleep 1; "
         f"start-stop-daemon -S -b -x /bin/sh -- {q_boot}"
