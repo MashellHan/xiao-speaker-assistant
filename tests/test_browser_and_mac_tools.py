@@ -530,66 +530,145 @@ def test_mcp_server_registers_and_dispatches_edge_and_mac_tools(
 
 
 def test_host_voiceprint_guard_blocks_non_host_and_allows_host(tmp_path: Path) -> None:
-    from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch
+    import time
+    from xiao_speaker_assistant.cli import execute_tool
+    from xiao_speaker_assistant.config import load_config
+    from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch, SpeakerProfileStore
+    from xiao_speaker_assistant.voice.ws_server import CURRENT_SPEAKER
 
     desktop = tmp_path / "Desktop"
     desktop.mkdir()
     note = desktop / "plan.txt"
     note.write_text("秘密计划", encoding="utf-8")
 
+    spk_store = SpeakerProfileStore(tmp_path / "speakers.json")
+    spk_store.enroll("大雄", [1.0, 0.0, 0.0], role="host")
+    spk_store.record_utterance("你好", [0.0, 1.0, 0.0])
+
+    cfg_path = tmp_path / "config.yaml"
     cfg = AppConfig()
     cfg.tools.require_host_voiceprint_for_sensitive_tools = True
-    server = McpServer(cfg, include_local_tools=True, mac_allowed_roots=[desktop])
+    server = McpServer(
+        cfg,
+        include_local_tools=True,
+        mac_allowed_roots=[desktop],
+        speaker_store=spk_store,
+        config_path=cfg_path,
+    )
 
-    def call_read() -> dict:
+    def call_tool_sync(name: str, arguments: dict) -> dict:
         resp = asyncio.run(
             server.handle_message(
                 {
                     "jsonrpc": "2.0",
                     "id": 99,
                     "method": "tools/call",
-                    "params": {
-                        "name": "mac_read_text_file",
-                        "arguments": {"path": str(note)},
-                    },
+                    "params": {"name": name, "arguments": arguments},
                 }
             )
         )
         assert resp is not None
         return resp["result"]
 
-    # 1. Unknown speaker -> blocked
-    r_unknown = call_read()
+    # 1. Unknown speaker -> blocked on mac_read_text_file & voiceprint self-promotion!
+    r_unknown = call_tool_sync("mac_read_text_file", {"path": str(note)})
     assert r_unknown["isError"] is True
     assert json.loads(r_unknown["content"][0]["text"])["error"] == "host_voiceprint_required"
 
-    # 2. Child/guest speaker -> blocked
-    server.set_active_voice_speaker(
+    r_promote = call_tool_sync("speaker_enroll_voiceprint", {"name": "黑客", "role": "host", "target": "current"})
+    assert r_promote["isError"] is True
+    assert json.loads(r_promote["content"][0]["text"])["error"] == "host_voiceprint_required"
+
+    # 2. Child speaker -> blocked
+    t_child = server.begin_voice_turn(
         SpeakerMatch(id="c1", name="拳拳", role="child", style_hint="", score=0.88)
     )
-    r_child = call_read()
+    r_child = call_tool_sync("mac_read_text_file", {"path": str(note)})
     assert r_child["isError"] is True
-    assert json.loads(r_child["content"][0]["text"])["error"] == "host_voiceprint_required"
 
-    # 3. Host speaker -> allowed
-    server.set_active_voice_speaker(
+    # 3. Concurrent host + child turn -> STILL blocked (fail-closed against concurrent non-host turn!)
+    t_host = server.begin_voice_turn(
         SpeakerMatch(id="h1", name="大雄", role="host", style_hint="", score=0.91)
     )
-    r_host = call_read()
+    r_mixed = call_tool_sync("mac_read_text_file", {"path": str(note)})
+    assert r_mixed["isError"] is True
+
+    # End child turn -> only host turn active -> allowed!
+    server.end_voice_turn(t_child)
+    r_host = call_tool_sync("mac_read_text_file", {"path": str(note)})
     assert r_host["isError"] is False
     assert "秘密计划" in r_host["content"][0]["text"]
 
-    # 4. Non-sensitive tool (e.g. speaker_list_voices) remains allowed for child/unknown
-    server.set_active_voice_speaker(None)
-    voices_resp = asyncio.run(
-        server.handle_message(
-            {
-                "jsonrpc": "2.0",
-                "id": 100,
-                "method": "tools/call",
-                "params": {"name": "speaker_list_voices", "arguments": {}},
-            }
-        )
+    # 4. Stale (>120s) host turn -> expired & blocked
+    server._active_voice_turns[t_host] = (
+        server._active_voice_turns[t_host][0],
+        time.monotonic() - 125.0,
     )
-    assert voices_resp is not None
-    assert voices_resp["result"]["isError"] is False
+    r_stale = call_tool_sync("mac_read_text_file", {"path": str(note)})
+    assert r_stale["isError"] is True
+    assert json.loads(r_stale["content"][0]["text"])["error"] == "host_voiceprint_required"
+
+    # 5. Non-sensitive tool remains allowed
+    voices_res = call_tool_sync("speaker_list_voices", {})
+    assert voices_res["isError"] is False
+
+    # 6. cli.execute_tool also enforces require_host_voiceprint for non-OpenCode providers
+    class DummyOutlook:
+        async def list_recent_emails(self, limit: int = 5, unread_only: bool = False):
+            return [{"subject": "ok"}]
+
+    tok_none = CURRENT_SPEAKER.set(None)
+    try:
+        denied_exec = json.loads(
+            asyncio.run(
+                execute_tool(
+                    {"outlook": DummyOutlook()},
+                    "outlook_list_emails",
+                    {},
+                    require_host_voiceprint=True,
+                )
+            )
+        )
+        assert denied_exec["error"] == "host_voiceprint_required"
+    finally:
+        CURRENT_SPEAKER.reset(tok_none)
+
+    tok_host = CURRENT_SPEAKER.set(
+        SpeakerMatch(id="h1", name="大雄", role="host", style_hint="", score=0.92)
+    )
+    try:
+        allowed_exec = json.loads(
+            asyncio.run(
+                execute_tool(
+                    {"outlook": DummyOutlook()},
+                    "outlook_list_emails",
+                    {},
+                    require_host_voiceprint=True,
+                )
+            )
+        )
+        assert allowed_exec == [{"subject": "ok"}]
+    finally:
+        CURRENT_SPEAKER.reset(tok_host)
+
+    # 7. Web Console /api/capabilities persists require_host_voiceprint and reflects in /api/overview
+    async def check_api() -> None:
+        runner, port = await server.start_http_server(host="127.0.0.1", port=0, auth_token="tok")
+        try:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as c:
+                r_off = await c.post("/api/capabilities", json={"require_host_voiceprint": False})
+                assert r_off.status_code == 200
+                assert r_off.json()["toggles"]["require_host_voiceprint"] is False
+                assert load_config(cfg_path).tools.require_host_voiceprint_for_sensitive_tools is False
+
+                r_on = await c.post("/api/capabilities", json={"require_host_voiceprint": True})
+                assert r_on.status_code == 200
+                assert r_on.json()["toggles"]["require_host_voiceprint"] is True
+                assert load_config(cfg_path).tools.require_host_voiceprint_for_sensitive_tools is True
+
+                ov = await c.get("/api/overview")
+                assert ov.json()["toggles"]["require_host_voiceprint"] is True
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(check_api())

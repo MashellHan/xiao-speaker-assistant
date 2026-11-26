@@ -568,14 +568,28 @@ class McpServer:
         self._mac_allowed_roots = mac_allowed_roots
         self._edge_dry_run = edge_dry_run
         self._http_sessions: set[str] = set()
-        self._active_voice_speaker: SpeakerMatch | None = None
-        self._active_voice_speaker_set_at: float = 0.0
+        # Track all concurrent in-flight voice/query turns by token -> (speaker, started_at).
+        # Fail closed: sensitive tools are allowed ONLY when at least one active turn exists,
+        # EVERY concurrent active turn is an authenticated host speaker, and none is expired.
+        self._active_voice_turns: dict[str, tuple[SpeakerMatch | None, float]] = {}
+
+    def begin_voice_turn(self, speaker: SpeakerMatch | None) -> str:
+        """Register an in-flight spoken/query turn and return a token for `end_voice_turn`."""
+        turn_id = uuid.uuid4().hex
+        self._active_voice_turns[turn_id] = (speaker, time.monotonic())
+        return turn_id
+
+    def end_voice_turn(self, turn_id: str) -> None:
+        """Unregister a finished/cancelled turn without disturbing other active turns."""
+        self._active_voice_turns.pop(turn_id, None)
 
     def set_active_voice_speaker(self, speaker: SpeakerMatch | None) -> None:
-        """Record the voiceprint match of the active spoken turn (or None on turn end)."""
-        self._active_voice_speaker = speaker
-        self._active_voice_speaker_set_at = time.monotonic() if speaker is not None else 0.0
+        """Convenience helper for single-turn callers/tests."""
+        self._active_voice_turns.clear()
+        if speaker is not None:
+            self._active_voice_turns["__direct__"] = (speaker, time.monotonic())
 
+    _HOST_ROLES: frozenset[str] = frozenset({"host", "主人", "owner"})
     _SENSITIVE_VOICEPRINT_TOOLS: frozenset[str] = frozenset(
         {
             "mac_read_text_file",
@@ -584,21 +598,47 @@ class McpServer:
             "outlook_list_emails",
             "outlook_prepare_email",
             "outlook_send_email",
+            "speaker_enroll_voiceprint",
+            "speaker_update_voiceprint",
+            "speaker_delete_voiceprint",
         }
     )
+
+    @classmethod
+    def is_host_speaker(cls, speaker: SpeakerMatch | None) -> bool:
+        return speaker is not None and speaker.role.strip().lower() in cls._HOST_ROLES
+
+    def _has_enrolled_host_voiceprint(self) -> bool:
+        return any(
+            str(p.get("role") or "").strip().lower() in self._HOST_ROLES
+            for p in self.speaker_store.list_profiles()
+        )
 
     def _check_host_voiceprint_guard(self, tool_name: str) -> dict[str, Any] | None:
         if not self._config.tools.require_host_voiceprint_for_sensitive_tools:
             return None
         if tool_name not in self._SENSITIVE_VOICEPRINT_TOOLS:
             return None
-        spk = self._active_voice_speaker
-        # Expire stale match after 120s so a long-past host turn cannot authorize later calls.
-        if spk is not None and (time.monotonic() - self._active_voice_speaker_set_at) > 120.0:
-            spk = None
-        if spk is not None and spk.role.strip().lower() in {"host", "主人", "owner"}:
+        # Allow bootstrapping the very first host voiceprint when none is enrolled yet.
+        if tool_name == "speaker_enroll_voiceprint" and not self._has_enrolled_host_voiceprint():
             return None
-        who = f"{spk.name} ({spk.role})" if spk is not None else "未识别声纹"
+
+        now = time.monotonic()
+        # Drop stale turns older than 120s so a leaked/abandoned turn can never keep privilege alive.
+        stale_ids = [tid for tid, (_s, ts) in self._active_voice_turns.items() if (now - ts) > 120.0]
+        for tid in stale_ids:
+            self._active_voice_turns.pop(tid, None)
+
+        if self._active_voice_turns and all(
+            self.is_host_speaker(s) for s, _ts in self._active_voice_turns.values()
+        ):
+            return None
+
+        non_host = next(
+            (s for s, _ts in self._active_voice_turns.values() if not self.is_host_speaker(s)),
+            None,
+        )
+        who = f"{non_host.name} ({non_host.role})" if non_host is not None else "未识别声纹"
         return self._tool_result(
             {
                 "error": "host_voiceprint_required",

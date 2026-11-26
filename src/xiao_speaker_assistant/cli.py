@@ -112,7 +112,32 @@ def build_tool_registry(
     return tools, clients
 
 
-async def execute_tool(clients: dict[str, Any], name: str, args: dict[str, Any]) -> str:
+async def execute_tool(
+    clients: dict[str, Any],
+    name: str,
+    args: dict[str, Any],
+    *,
+    require_host_voiceprint: bool = False,
+) -> str:
+    if require_host_voiceprint and name in {
+        "outlook_list_emails",
+        "outlook_prepare_email",
+        "outlook_send_email",
+    }:
+        spk = CURRENT_SPEAKER.get()
+        if not McpServer.is_host_speaker(spk):
+            who = f"{spk.name} ({spk.role})" if spk is not None else "未识别声纹"
+            return json.dumps(
+                {
+                    "error": "host_voiceprint_required",
+                    "tool": name,
+                    "speaker": who,
+                    "message": (
+                        f"已开启敏感工具主人声纹鉴权，当前说话人（{who}）无权调用 {name}。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
     if name == "outlook_list_emails":
         outlook: OutlookClient = clients["outlook"]
         items = await outlook.list_recent_emails(
@@ -321,6 +346,17 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     def on_capabilities_changed() -> None:
         nonlocal tools, clients, outlook_client
+        # Keep active_config synced with mcp_server._config even if reloaded from separate snapshots.
+        active_config.reminders.enabled = mcp_server._config.reminders.enabled
+        active_config.reminders.quiet_start_hhmm = mcp_server._config.reminders.quiet_start_hhmm
+        active_config.reminders.quiet_end_hhmm = mcp_server._config.reminders.quiet_end_hhmm
+        active_config.memory.enabled = mcp_server._config.memory.enabled
+        active_config.tools.xiaohongshu.enabled = mcp_server._config.tools.xiaohongshu.enabled
+        active_config.tools.browser.enabled = mcp_server._config.tools.browser.enabled
+        active_config.tools.outlook.enabled = mcp_server._config.tools.outlook.enabled
+        active_config.tools.require_host_voiceprint_for_sensitive_tools = (
+            mcp_server._config.tools.require_host_voiceprint_for_sensitive_tools
+        )
         mcp_server.reload_config(active_config)
         tools, clients = build_tool_registry(active_config, confirmation_store=confirmations)
         outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
@@ -431,8 +467,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         spk = CURRENT_SPEAKER.get()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
-                if active_config.tools.require_host_voiceprint_for_sensitive_tools and (
-                    spk is None or spk.role.strip().lower() not in {"host", "主人", "owner"}
+                if active_config.tools.require_host_voiceprint_for_sensitive_tools and not McpServer.is_host_speaker(
+                    spk
                 ):
                     reply = "已开启主人声纹鉴权，需要主人本人语音确认才能发送邮件。"
                     _record_turn(query, reply, t0)
@@ -449,17 +485,22 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 _record_turn(query, reply, t0)
                 return reply
 
-        mcp_server.set_active_voice_speaker(spk)
+        turn_id = mcp_server.begin_voice_turn(spk)
         try:
             reply = await router.ask(
                 query,
                 provider=args.provider,
                 tools=tools,
-                executor=lambda name, t_args: execute_tool(clients, name, t_args),
+                executor=lambda name, t_args: execute_tool(
+                    clients,
+                    name,
+                    t_args,
+                    require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
+                ),
                 speaker_context=spk.format_context_prefix() if spk is not None else None,
             )
         finally:
-            mcp_server.set_active_voice_speaker(None)
+            mcp_server.end_voice_turn(turn_id)
         _record_turn(query, reply, t0)
         return reply
 
@@ -468,8 +509,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         spk = CURRENT_SPEAKER.get()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
-                if active_config.tools.require_host_voiceprint_for_sensitive_tools and (
-                    spk is None or spk.role.strip().lower() not in {"host", "主人", "owner"}
+                if active_config.tools.require_host_voiceprint_for_sensitive_tools and not McpServer.is_host_speaker(
+                    spk
                 ):
                     reply = "已开启主人声纹鉴权，需要主人本人语音确认才能发送邮件。"
                     _record_turn(query, reply, t0)
@@ -491,20 +532,25 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
         chunks: list[str] = []
         completed = False
-        mcp_server.set_active_voice_speaker(spk)
+        turn_id = mcp_server.begin_voice_turn(spk)
         try:
             async for sentence in router.stream_ask(
                 query,
                 provider=args.provider,
                 tools=tools,
-                executor=lambda name, t_args: execute_tool(clients, name, t_args),
+                executor=lambda name, t_args: execute_tool(
+                    clients,
+                    name,
+                    t_args,
+                    require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
+                ),
                 speaker_context=spk.format_context_prefix() if spk is not None else None,
             ):
                 chunks.append(sentence)
                 yield sentence
             completed = True
         finally:
-            mcp_server.set_active_voice_speaker(None)
+            mcp_server.end_voice_turn(turn_id)
             if completed and chunks:
                 _record_turn(query, "".join(chunks), t0)
 

@@ -177,7 +177,8 @@ def main(
     )
     if not has_action:
         parser.error(
-            "Specify at least one action: --server-url, --install-boot, --install-aec-alsa, --client-bin, --restart, --status, or --print-boot-script."
+            "Specify at least one action: --server-url, --install-boot, --install-aec-alsa, "
+            "--tunnel-host, --tunnel-key, --client-bin, --restart, --status, or --print-boot-script."
         )
 
     if not args.host:
