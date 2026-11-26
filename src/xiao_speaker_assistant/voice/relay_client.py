@@ -61,7 +61,11 @@ class RelayHostClient:
         if auth_token is not None:
             self._auth_token: str | None = auth_token.strip() or None
         else:
-            self._auth_token = read_env_secret(token_env)
+            self._auth_token = (
+                read_env_secret("XSA_RELAY_HOST_TOKEN")
+                if token_env == "XSA_RELAY_TOKEN"
+                else None
+            ) or read_env_secret(token_env)
 
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
