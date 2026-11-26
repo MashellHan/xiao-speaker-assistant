@@ -2346,6 +2346,7 @@
             if (bd.llm_ttft_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM首句 <span class="num">${escapeHtml(formatMs(bd.llm_ttft_ms))}</span></span>`);
             if (bd.start_play_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>start_play <span class="num">${escapeHtml(formatMs(bd.start_play_ms))}</span></span>`);
             if (bd.tts_first_chunk_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>TTS首块 <span class="num">${escapeHtml(formatMs(bd.tts_first_chunk_ms))}</span></span>`);
+            if (bd.ack_ms != null) pills.push(`<span class="trace-pill">先导回应 <span class="num">${escapeHtml(formatMs(bd.ack_ms))}</span></span>`);
             if (bd.tts_total_ms != null) pills.push(`<span class="trace-pill">播报总计 <span class="num">${escapeHtml(formatMs(bd.tts_total_ms))}</span></span>`);
 
             return `

@@ -33,6 +33,7 @@ class TurnTraceBuilder:
     llm_done_mono: float | None = None
     start_play_ms: float | None = None
     tts_first_chunk_ms: float | None = None
+    ack_ms: float | None = None
     first_audio_sent_mono: float | None = None
     tts_started_mono: float | None = None
     tts_done_mono: float | None = None
@@ -85,6 +86,8 @@ class TurnTraceBuilder:
             out["start_play_ms"] = round(max(0.0, self.start_play_ms), 1)
         if self.tts_first_chunk_ms is not None:
             out["tts_first_chunk_ms"] = round(max(0.0, self.tts_first_chunk_ms), 1)
+        if self.ack_ms is not None:
+            out["ack_ms"] = round(max(0.0, self.ack_ms), 1)
         if self.tts_started_mono is not None:
             tts_end = self.tts_done_mono or end
             out["tts_total_ms"] = round(max(0.0, (tts_end - self.tts_started_mono) * 1000.0), 1)
@@ -144,6 +147,7 @@ class TurnTraceStore:
             "llm_total_ms",
             "start_play_ms",
             "tts_first_chunk_ms",
+            "ack_ms",
             "tts_total_ms",
             "ttfa_ms",
             "total_ms",
