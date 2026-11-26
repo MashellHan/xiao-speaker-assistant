@@ -1205,19 +1205,47 @@ class McpServer:
             except OSError:
                 pass
 
+    _WEATHER_CITY_COORDS: dict[str, tuple[float, float]] = {
+        "北京": (39.9042, 116.4074),
+        "海淀": (39.9593, 116.2981),
+        "朝阳": (39.9219, 116.4436),
+        "延庆": (40.4567, 115.9749),
+        "上海": (31.2304, 121.4737),
+        "广州": (23.1291, 113.2644),
+        "深圳": (22.5431, 114.0579),
+        "杭州": (30.2741, 120.1551),
+        "南京": (32.0603, 118.7969),
+        "成都": (30.5728, 104.0668),
+        "重庆": (29.5630, 106.5516),
+        "武汉": (30.5928, 114.3055),
+        "西安": (34.3416, 108.9398),
+        "天津": (39.3434, 117.3616),
+        "苏州": (31.2989, 120.5853),
+        "长沙": (28.2282, 112.9388),
+        "郑州": (34.7466, 113.6253),
+        "青岛": (36.0671, 120.3826),
+        "厦门": (24.4798, 118.0894),
+        "三亚": (18.2528, 109.5119),
+    }
+
     async def _fetch_open_meteo_7d(
         self, client: httpx.AsyncClient, city: str
     ) -> list[dict[str, Any]]:
-        geo = await client.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "zh"},
-        )
-        geo.raise_for_status()
-        results = geo.json().get("results") or []
-        if not results:
-            return []
-        lat = results[0]["latitude"]
-        lon = results[0]["longitude"]
+        clean = city.strip().rstrip("市区县")
+        coords = self._WEATHER_CITY_COORDS.get(city.strip()) or self._WEATHER_CITY_COORDS.get(clean)
+        if coords is not None:
+            lat, lon = coords
+        else:
+            geo = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "zh"},
+            )
+            geo.raise_for_status()
+            results = geo.json().get("results") or []
+            if not results:
+                return []
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
         fc = await client.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -1244,6 +1272,14 @@ class McpServer:
                 {"error": "invalid_arguments", "message": "Argument 'city' is required."},
                 is_error=True,
             )
+        cache_key = city.lower()
+        cache = getattr(self, "_weather_cache", None)
+        if cache is None:
+            cache = {}
+            self._weather_cache = cache
+        cached = cache.get(cache_key)
+        if cached is not None and (time.monotonic() - cached[0]) < 300.0:
+            return self._tool_result(dict(cached[1]))
         owns_client = self._http_client is None
         client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
         try:
@@ -1309,6 +1345,9 @@ class McpServer:
             if len(ordered) > 1:
                 result["tomorrow_min_c"] = ordered[1].get("min_c")
                 result["tomorrow_max_c"] = ordered[1].get("max_c")
+            if len(cache) >= 64:
+                cache.clear()
+            cache[cache_key] = (time.monotonic(), dict(result))
             return self._tool_result(result)
         except Exception as exc:
             return self._tool_result(

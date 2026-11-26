@@ -341,7 +341,7 @@ class LLMRouter:
         system_prompt = self._build_system_prompt()
         prompt_text = f"{speaker_context}\n{user_text}" if speaker_context else user_text
         splitter = SentenceStreamBuffer(
-            first_sentence_min_chars=18,
+            first_sentence_min_chars=12,
             max_total_chars=self._config.spoken_max_chars,
         )
 
