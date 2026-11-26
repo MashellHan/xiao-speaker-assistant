@@ -9,7 +9,7 @@ from types import ModuleType
 
 import pytest
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from xiao_speaker_assistant.config import AppConfig
 from xiao_speaker_assistant.voice.relay_client import RelayHostClient, normalize_host_ws_url
@@ -30,6 +30,13 @@ relay_mod = _load_relay_module()
 
 
 async def _expect_close_code(uri: str, expected_code: int, headers: dict[str, str] | None = None) -> None:
+    expected_http_map = {4401: 401, 4404: 404, 4429: 429}
+    if expected_code in expected_http_map:
+        with pytest.raises(InvalidStatus) as exc_info:
+            async with websockets.connect(uri, additional_headers=headers) as ws:
+                await ws.recv()
+        assert exc_info.value.response.status_code == expected_http_map[expected_code]
+        return
     with pytest.raises(ConnectionClosed) as exc_info:
         async with websockets.connect(uri, additional_headers=headers) as ws:
             await ws.recv()

@@ -11,7 +11,7 @@ import sys
 import time
 from collections import deque
 from http import HTTPStatus
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 import websockets
@@ -67,11 +67,12 @@ def _peer_ip(conn: ServerConnection) -> str:
     return str(remote or "unknown")
 
 
-def _client_ip(conn: ServerConnection, trusted_proxies: frozenset[str]) -> str:
-    peer = _peer_ip(conn)
-    if peer not in trusted_proxies or conn.request is None:
+def _client_ip_from_headers(
+    peer: str, headers: Any, trusted_proxies: frozenset[str]
+) -> str:
+    if peer not in trusted_proxies or headers is None:
         return peer
-    header_values = conn.request.headers.get_all("X-Forwarded-For")
+    header_values = headers.get_all("X-Forwarded-For")
     if not header_values:
         return peer
     # Walk right-to-left: a trusted reverse proxy appends the real peer on the right,
@@ -86,6 +87,12 @@ def _client_ip(conn: ServerConnection, trusted_proxies: frozenset[str]) -> str:
         if hop not in trusted_proxies:
             return hop
     return peer
+
+
+def _client_ip(conn: ServerConnection, trusted_proxies: frozenset[str]) -> str:
+    peer = _peer_ip(conn)
+    headers = conn.request.headers if conn.request is not None else None
+    return _client_ip_from_headers(peer, headers, trusted_proxies)
 
 
 class RelayServer:
@@ -218,9 +225,9 @@ class RelayServer:
     def _expected_token_for_role(self, role: Role) -> str | None:
         return self._speaker_token if role == "speaker" else self._host_token
 
-    def _is_authorized(
+    def _is_request_authorized(
         self,
-        conn: ServerConnection,
+        request: Request | None,
         *,
         role: Role,
         allow_query_token: bool = False,
@@ -228,9 +235,9 @@ class RelayServer:
         expected = self._expected_token_for_role(role)
         if expected is None:
             return self._allow_insecure_no_auth
-        if conn.request is None:
+        if request is None:
             return False
-        auth_values = conn.request.headers.get_all("Authorization")
+        auth_values = request.headers.get_all("Authorization")
         if len(auth_values) > 1:
             return False
         raw_header = auth_values[0] if auth_values else ""
@@ -238,11 +245,22 @@ class RelayServer:
         if presented is not None:
             return hmac.compare_digest(presented, expected)
         if allow_query_token:
-            query_params = parse_qs(urlsplit(conn.request.path).query, keep_blank_values=False)
+            query_params = parse_qs(urlsplit(request.path).query, keep_blank_values=False)
             tokens = query_params.get("token")
             if tokens and len(tokens) == 1 and tokens[0].strip():
                 return hmac.compare_digest(tokens[0].strip(), expected)
         return False
+
+    def _is_authorized(
+        self,
+        conn: ServerConnection,
+        *,
+        role: Role,
+        allow_query_token: bool = False,
+    ) -> bool:
+        return self._is_request_authorized(
+            conn.request, role=role, allow_query_token=allow_query_token
+        )
 
     def _get_conn(self, role: Role) -> ServerConnection | None:
         return self._speaker if role == "speaker" else self._host_conn
@@ -260,11 +278,63 @@ class RelayServer:
         self, conn: ServerConnection, request: Request
     ) -> Response | None:
         # Allow HTTP health checks (for example Azure Container Apps probes) without a WS upgrade.
-        if request.headers.get("Upgrade", "").lower() != "websocket":
+        upgrade_values = request.headers.get_all("Upgrade")
+        is_ws = len(upgrade_values) == 1 and upgrade_values[0].lower() == "websocket"
+        if not is_ws:
             path = urlsplit(request.path).path
             if path in {"/", "/health", "/healthz"}:
                 return conn.respond(HTTPStatus.OK, "ok\n")
             return conn.respond(HTTPStatus.NOT_FOUND, "not found\n")
+
+        # Reject banned, unauthorized, or unknown WebSocket handshakes at the HTTP layer
+        # (401/404/429) BEFORE completing a 101 Switching Protocols upgrade.
+        ip = _client_ip_from_headers(_peer_ip(conn), request.headers, self._trusted_proxies)
+        now = time.monotonic()
+        if self._is_banned(ip, now):
+            logger.warning("Rejected rate-limited handshake from %s", ip)
+            return conn.respond(HTTPStatus.TOO_MANY_REQUESTS, "too many requests\n")
+
+        path = urlsplit(request.path).path
+        if path in {"/ws/speaker", "/xsa/ws/speaker"}:
+            role: Role = "speaker"
+        elif path in {"/ws/host", "/xsa/ws/host"}:
+            role = "host"
+        else:
+            authed = self._is_request_authorized(
+                request, role="host", allow_query_token=False
+            ) or self._is_request_authorized(
+                request, role="speaker", allow_query_token=False
+            )
+            if not authed:
+                banned = self._record_auth_failure(ip, now)
+                logger.warning(
+                    "Rejected unauthorized handshake from %s%s",
+                    ip,
+                    " (IP rate-limited)" if banned else "",
+                )
+                return conn.respond(
+                    HTTPStatus.TOO_MANY_REQUESTS if banned else HTTPStatus.UNAUTHORIZED,
+                    "too many requests\n" if banned else "unauthorized\n",
+                )
+            logger.warning("Rejected unknown endpoint %r from %s", path, ip)
+            return conn.respond(HTTPStatus.NOT_FOUND, "not found\n")
+
+        if not self._is_request_authorized(
+            request, role=role, allow_query_token=(role == "speaker")
+        ):
+            banned = self._record_auth_failure(ip, now)
+            logger.warning(
+                "Rejected unauthorized %s handshake from %s%s",
+                role,
+                ip,
+                " (IP rate-limited)" if banned else "",
+            )
+            return conn.respond(
+                HTTPStatus.TOO_MANY_REQUESTS if banned else HTTPStatus.UNAUTHORIZED,
+                "too many requests\n" if banned else "unauthorized\n",
+            )
+
+        self._clear_auth_failures(ip)
         return None
 
     async def _handle_connection(self, conn: ServerConnection) -> None:

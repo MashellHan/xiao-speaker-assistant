@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import InvalidStatus
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
 from xiao_speaker_assistant.voice.ws_server import (
@@ -155,6 +156,14 @@ class RelayHostClient:
                     received_any = await self._serve_connection(ws)
             except asyncio.CancelledError:
                 raise
+            except InvalidStatus as exc:
+                status = exc.response.status_code
+                if status == 401:
+                    logger.error("Relay rejected host authentication (HTTP 401 Unauthorized)")
+                elif status == 429:
+                    logger.error("Relay rate-limited host connection (HTTP 429 Too Many Requests)")
+                else:
+                    logger.warning("Relay rejected host handshake (HTTP %s)", status)
             except websockets.ConnectionClosed as exc:
                 code = exc.rcvd.code if exc.rcvd else None
                 if code == 4401:

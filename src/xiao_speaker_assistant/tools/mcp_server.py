@@ -46,8 +46,10 @@ from xiao_speaker_assistant.tools.history import (
 )
 from xiao_speaker_assistant.tools.mac_local import (
     MacLocalAccessError,
+    is_sensitive_path,
     list_recent_files,
     read_local_text_file,
+    resolve_allowed_roots,
 )
 from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
@@ -858,7 +860,12 @@ class McpServer:
     async def _call_browser_fetch_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         raw_url = str(args.get("url") or "").strip()
         try:
-            url = validate_http_url(raw_url)
+            url = await asyncio.to_thread(
+                validate_http_url,
+                raw_url,
+                block_private_network=True,
+                resolve_dns=(self._http_client is None),
+            )
         except ValueError as exc:
             return self._tool_result(
                 {"error": "invalid_url", "message": str(exc)},
@@ -881,6 +888,7 @@ class McpServer:
                 url,
                 max_chars=max_chars,
                 client=self._http_client,
+                block_private_network=True,
             )
         except Exception as exc:
             return self._tool_result(
@@ -893,7 +901,13 @@ class McpServer:
         raw_url = str(args.get("url") or "").strip()
         dry_run = bool(args.get("dry_run", self._edge_dry_run))
         try:
-            result_json = await asyncio.to_thread(open_in_edge, raw_url, dry_run=dry_run)
+            validated_url = await asyncio.to_thread(
+                validate_http_url,
+                raw_url,
+                block_private_network=True,
+                resolve_dns=False,
+            )
+            result_json = await asyncio.to_thread(open_in_edge, validated_url, dry_run=dry_run)
         except ValueError as exc:
             return self._tool_result(
                 {"error": "invalid_url", "message": str(exc)},
@@ -975,6 +989,28 @@ class McpServer:
             }
         )
 
+    def _resolve_codex_workdir(self, raw_workdir: str) -> Path:
+        codex_cfg = self._config.llm.providers.codex
+        configured_root = Path(codex_cfg.workdir).expanduser().resolve(strict=False)
+        allowed_roots = [configured_root, *resolve_allowed_roots(self._mac_allowed_roots)]
+        workspace_dir = Path("~/workspace").expanduser().resolve(strict=False)
+        if workspace_dir.is_dir():
+            allowed_roots.append(workspace_dir)
+
+        candidate = Path(raw_workdir).expanduser().resolve(strict=False)
+        matching_root = next((r for r in allowed_roots if candidate.is_relative_to(r)), None)
+        if matching_root is None:
+            raise MacLocalAccessError(
+                f"Codex workdir is outside allowed directories: {raw_workdir}"
+            )
+        if is_sensitive_path(candidate, root=matching_root):
+            raise MacLocalAccessError(
+                f"Access to sensitive or hidden directory is blocked: {candidate.name}"
+            )
+        if not candidate.is_dir():
+            raise FileNotFoundError(f"Directory does not exist: {raw_workdir}")
+        return candidate
+
     async def _call_codex_analyze(self, args: dict[str, Any]) -> dict[str, Any]:
         prompt = str(args.get("prompt") or "").strip()
         if not prompt:
@@ -984,10 +1020,16 @@ class McpServer:
             )
         codex_cfg = self._config.llm.providers.codex
         raw_workdir = str(args.get("workdir") or codex_cfg.workdir).strip()
-        workdir_path = Path(raw_workdir).expanduser().resolve()
-        if not workdir_path.is_dir():
+        try:
+            workdir_path = self._resolve_codex_workdir(raw_workdir)
+        except MacLocalAccessError as exc:
             return self._tool_result(
-                {"error": "invalid_workdir", "message": f"Directory does not exist: {raw_workdir}"},
+                {"error": "access_denied", "message": str(exc)},
+                is_error=True,
+            )
+        except FileNotFoundError as exc:
+            return self._tool_result(
+                {"error": "invalid_workdir", "message": str(exc)},
                 is_error=True,
             )
         try:

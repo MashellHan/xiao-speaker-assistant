@@ -51,6 +51,22 @@ def test_validate_http_url_accepts_safe_and_rejects_unsafe() -> None:
         with pytest.raises(ValueError):
             validate_http_url(bad)
 
+    # SSRF protection when block_private_network=True
+    for ssrf_url in (
+        "http://127.0.0.1:4397/api/overview",
+        "http://localhost:4396/api/info",
+        "http://[::1]:4397/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/",
+        "http://192.168.1.1/",
+        "http://172.16.0.1/",
+        "http://0.0.0.0:4397/",
+        "http://router.local/",
+    ):
+        with pytest.raises(ValueError):
+            validate_http_url(ssrf_url, block_private_network=True)
+    assert validate_http_url("https://example.com/ok", block_private_network=True) == "https://example.com/ok"
+
 
 def test_open_in_edge_command_building_dry_run_and_mocked_subprocess(monkeypatch) -> None:
     cmd = build_edge_open_command("https://example.com/docs?p=1")
@@ -388,3 +404,41 @@ def test_mcp_server_registers_and_dispatches_edge_and_mac_tools(
         )
         assert blocked_read is not None
         assert blocked_read["result"]["isError"] is True
+
+    # browser_fetch_summary & browser_open_edge reject loopback/private SSRF URLs
+    for tool_name in ("browser_fetch_summary", "browser_open_edge"):
+        ssrf_resp = asyncio.run(
+            server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": {"url": "http://127.0.0.1:4397/api/overview"},
+                    },
+                }
+            )
+        )
+        assert ssrf_resp is not None
+        assert ssrf_resp["result"]["isError"] is True
+
+    # codex_analyze rejects sensitive/outside workdirs
+    for bad_workdir in ("~/.ssh", "~/.config", str(tmp_path / "outside")):
+        codex_blocked = asyncio.run(
+            server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "codex_analyze",
+                        "arguments": {"prompt": "inspect", "workdir": bad_workdir},
+                    },
+                }
+            )
+        )
+        assert codex_blocked is not None
+        assert codex_blocked["result"]["isError"] is True
+        err_payload = json.loads(codex_blocked["result"]["content"][0]["text"])
+        assert err_payload["error"] == "access_denied"

@@ -209,6 +209,7 @@ def test_http_mcp_server_shares_confirmation_store_and_exposes_codex_and_disk(tm
         outlook_client=FakeOutlook(),  # type: ignore[arg-type]
         confirmation_store=store,
         include_local_tools=True,
+        mac_allowed_roots=[tmp_path],
     )
 
     class FakeCodexProc:
