@@ -28,6 +28,7 @@ from xiao_speaker_assistant.voice.audio_pipeline import (
 )
 from xiao_speaker_assistant.voice.playback import PlaybackController
 from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch, SpeakerProfileStore
+from xiao_speaker_assistant.voice.tts_stream import synthesize_tts_pcm_stream
 from xiao_speaker_assistant.voice.voice_catalog import resolve_edge_voice
 
 logger = logging.getLogger(__name__)
@@ -284,16 +285,7 @@ class SpeakerGateway:
         pb = self._get_playback(conn)
         await pb.play_chime()
 
-    async def speak_sentence(
-        self,
-        conn: Any,
-        text: str,
-        *,
-        interrupt: bool = True,
-        wait_response: bool = True,
-        keep_stream_open: bool = False,
-    ) -> None:
-        pb = self._get_playback(conn)
+    def _resolve_active_voice_override(self, conn: Any) -> str | None:
         sess = self._get_session(conn)
         voice_override = sess.active_voice
         if voice_override is None:
@@ -303,13 +295,29 @@ class SpeakerGateway:
                     voice_override = resolve_edge_voice(spk.preferred_voice).id
                 except ValueError:
                     pass
-        if keep_stream_open:
-            await pb.speak(
-                text,
-                interrupt_native=interrupt,
-                voice_override=voice_override,
-                keep_stream_open=True,
-            )
+        return voice_override
+
+    async def speak_sentence(
+        self,
+        conn: Any,
+        text: str,
+        *,
+        interrupt: bool = True,
+        wait_response: bool = True,
+        keep_stream_open: bool = False,
+        prefetched_pcm: bytes | None = None,
+    ) -> None:
+        pb = self._get_playback(conn)
+        voice_override = self._resolve_active_voice_override(conn)
+        if keep_stream_open or prefetched_pcm is not None:
+            kwargs: dict[str, Any] = {
+                "interrupt_native": interrupt,
+                "voice_override": voice_override,
+                "keep_stream_open": keep_stream_open,
+            }
+            if prefetched_pcm is not None:
+                kwargs["prefetched_pcm"] = prefetched_pcm
+            await pb.speak(text, **kwargs)
         else:
             await pb.speak(
                 text,
@@ -350,9 +358,8 @@ class SpeakerGateway:
         return False
 
     def _recording_params(self, conn: Any) -> dict[str, Any]:
-        # Over WAN/SSH relay, use larger capture periods (60ms vs 22.5ms) so uplink frame rate
-        # drops from ~44 frames/s to ~16.6 frames/s, cutting Dropbear/WS overhead and freeing
-        # bandwidth for downlink TTS playback.
+        # Over WAN/SSH relay, use 60ms capture periods (960 frames vs 360) so uplink frame rate
+        # drops from ~44 frames/s to ~16.6 frames/s, cutting Dropbear/WS overhead.
         is_wan = conn in self._relay_connections
         period_size = 960 if is_wan else 360
         buffer_size = 3840 if is_wan else 1440
@@ -875,29 +882,79 @@ class SpeakerGateway:
     async def _run_streaming_reply(self, conn: Any, query: str) -> None:
         assert self._on_stream_query is not None
         sess = self._get_session(conn)
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        pb = self._get_playback(conn)
+        use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
+        voice_override = self._resolve_active_voice_override(conn)
+
+        # Queue items are `(sentence, optional_prefetch_task)` so sentences 2+ begin
+        # Edge-TTS synthesis in the background while sentence 1 is still streaming to ALSA.
+        queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None] | None] = asyncio.Queue()
+        prefetch_tasks: set[asyncio.Task[bytes]] = set()
+
+        async def _prefetch_sentence_pcm(sentence: str) -> bytes:
+            buf = bytearray()
+            stream = synthesize_tts_pcm_stream(
+                sentence,
+                self._config.speaker,
+                voice_override=voice_override,
+                chunk_bytes=pb._chunk_bytes(),
+                sample_rate_override=pb._effective_sample_rate(),
+            )
+            try:
+                async for ch in stream:
+                    if ch:
+                        buf.extend(ch)
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+            return bytes(buf)
 
         async def producer() -> None:
+            emitted = 0
             try:
                 async for sentence in self._on_stream_query(query):
-                    if sentence:
-                        await queue.put(sentence)
+                    if not sentence:
+                        continue
+                    emitted += 1
+                    pf_task: asyncio.Task[bytes] | None = None
+                    # First sentence streams chunk-by-chunk for minimum TTFA; subsequent
+                    # sentences prefetch in parallel so there is zero pause between sentences.
+                    if use_continuous_stream and emitted >= 2 and self._config.speaker.tts_provider == "edge":
+                        pf_task = asyncio.create_task(_prefetch_sentence_pcm(sentence))
+                        prefetch_tasks.add(pf_task)
+                        pf_task.add_done_callback(prefetch_tasks.discard)
+                    await queue.put((sentence, pf_task))
             except Exception as exc:
                 logger.exception("Streaming error for %r", query)
-                await queue.put(f"处理出错了：{exc}")
+                await queue.put((f"处理出错了：{exc}", None))
             finally:
                 await queue.put(None)
 
         prod_task = asyncio.create_task(producer())
         first_spoken = True
-        use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
         completed_normally = False
         try:
             while True:
                 if sess.interrupted:
                     break
-                sentence = await queue.get()
-                if sentence is None or sess.interrupted:
+                item = await queue.get()
+                if item is None or sess.interrupted:
+                    break
+                sentence, pf_task = item
+                prefetched_pcm: bytes | None = None
+                if pf_task is not None:
+                    try:
+                        prefetched_pcm = await pf_task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("TTS prefetch failed for %r (%s); falling back to live stream", sentence[:20], exc)
+                        prefetched_pcm = None
+                if sess.interrupted:
                     break
                 logger.info("Streaming TTS sentence: %s", sentence)
                 self._record_spoken(sess, sentence)
@@ -908,12 +965,11 @@ class SpeakerGateway:
                     interrupt=first_spoken,
                     wait_response=True,
                     keep_stream_open=use_continuous_stream,
+                    prefetched_pcm=prefetched_pcm,
                 )
                 first_spoken = False
             if use_continuous_stream and not first_spoken and not sess.interrupted:
-                pb = self._playbacks.get(conn)
-                if pb is not None:
-                    await pb.finish_stream()
+                await pb.finish_stream()
             completed_normally = True
             await prod_task
         except asyncio.CancelledError:
@@ -922,12 +978,14 @@ class SpeakerGateway:
             if use_continuous_stream and not completed_normally and not sess.interrupted:
                 # Mid-stream exception (not barge-in): close any kept-open stream immediately
                 # without padding/draining, and unmute 1ch VAD cleanly.
-                pb = self._playbacks.get(conn)
-                if pb is not None and pb.stream_open:
+                if pb.stream_open:
                     await pb.abort_stream(unmute=True)
+            for t in list(prefetch_tasks):
+                if not t.done():
+                    t.cancel()
             if not prod_task.done():
                 prod_task.cancel()
-            await asyncio.gather(prod_task, return_exceptions=True)
+            await asyncio.gather(prod_task, *list(prefetch_tasks), return_exceptions=True)
             if self._pipeline is not None and not sess.interrupted:
                 self._pipeline.refresh_activity()
 

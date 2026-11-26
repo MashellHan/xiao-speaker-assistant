@@ -210,8 +210,10 @@ async def synthesize_tts_pcm_stream(
     *,
     voice_override: str | None = None,
     chunk_bytes: int = 4800,
+    sample_rate_override: int | None = None,
 ) -> AsyncIterator[bytes]:
     """Stream PCM chunks using configured TTS provider with offline macOS `say` fallback."""
+    effective_sr = sample_rate_override or config.tts_sample_rate
     if config.tts_provider == "edge":
         try:
             got_any = False
@@ -219,7 +221,7 @@ async def synthesize_tts_pcm_stream(
                 text,
                 voice=voice_override or config.edge_voice,
                 rate=config.edge_rate,
-                sample_rate=config.tts_sample_rate,
+                sample_rate=effective_sr,
                 chunk_bytes=chunk_bytes,
             ):
                 got_any = True
@@ -234,7 +236,7 @@ async def synthesize_tts_pcm_stream(
     pcm = await synthesize_say_pcm(
         text,
         voice=config.say_voice,
-        sample_rate=config.tts_sample_rate,
+        sample_rate=effective_sr,
     )
     for i in range(0, len(pcm), chunk_bytes):
         yield pcm[i : i + chunk_bytes]
