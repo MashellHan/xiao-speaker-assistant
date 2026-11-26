@@ -40,7 +40,10 @@ from xiao_speaker_assistant.tools.browser import (
     validate_http_url,
 )
 from xiao_speaker_assistant.tools.confirmation import ConfirmationStore
-from xiao_speaker_assistant.tools.history import ConversationHistoryStore
+from xiao_speaker_assistant.tools.history import (
+    ConversationHistoryStore,
+    read_local_opencode_usage,
+)
 from xiao_speaker_assistant.tools.mac_local import (
     MacLocalAccessError,
     list_recent_files,
@@ -519,6 +522,7 @@ class McpServer:
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
         on_model_changed: Callable[[str], None] | None = None,
+        on_wakewords_changed: Callable[[list[str], list[str], bool], None] | None = None,
         on_reminders_config_changed: Callable[[bool, str, str], None] | None = None,
         on_capabilities_changed: Callable[[], None] | None = None,
         config_path: str | Path | None = None,
@@ -551,6 +555,7 @@ class McpServer:
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
         self._on_model_changed = on_model_changed
+        self._on_wakewords_changed = on_wakewords_changed
         self._on_reminders_config_changed = on_reminders_config_changed
         self._on_capabilities_changed = on_capabilities_changed
         self._config_path = config_path
@@ -1665,7 +1670,7 @@ class McpServer:
             "capture_channels": cfg.speech.capture_channels,
             "wakewords": {
                 "local": list(cfg.speech.local_keywords),
-                "english": list(cfg.speech.en_keywords) if cfg.speech.en_kws_enabled else [],
+                "english": list(cfg.speech.en_keywords),
                 "en_kws_enabled": bool(cfg.speech.en_kws_enabled),
             },
             "reminders_config": {
@@ -1682,6 +1687,8 @@ class McpServer:
             },
             "config_path": str(self._config_path) if self._config_path else "config.yaml",
             "stats": self.history_store.stats(),
+            "daily_turns": self.history_store.daily_turns(days=14),
+            "usage": read_local_opencode_usage(cfg.llm.providers.opencode.agent_home, days=14),
             "capabilities": self._build_capabilities(),
         }
 
@@ -2160,15 +2167,46 @@ class McpServer:
             has_model = "model" in body and str(body.get("model") or "").strip() != ""
             has_voice = "edge_voice" in body and str(body.get("edge_voice") or "").strip() != ""
             has_rate = "edge_rate" in body and str(body.get("edge_rate") or "").strip() != ""
-            if not (has_model or has_voice or has_rate):
+            has_local_kw = "local_keywords" in body and body.get("local_keywords") is not None
+            has_en_kw = "en_keywords" in body and body.get("en_keywords") is not None
+            has_en_enabled = "en_kws_enabled" in body and body.get("en_kws_enabled") is not None
+            if not (has_model or has_voice or has_rate or has_local_kw or has_en_kw or has_en_enabled):
                 return web.json_response(
-                    {"error": "invalid_arguments", "message": "Provide at least one of 'model', 'edge_voice', or 'edge_rate'."},
+                    {
+                        "error": "invalid_arguments",
+                        "message": "Provide at least one setting field (model, edge_voice, edge_rate, local_keywords, en_keywords, or en_kws_enabled).",
+                    },
                     status=400,
                 )
 
             new_model = self._config.llm.providers.opencode.model
             new_voice = self._config.speaker.edge_voice
             new_rate = self._config.speaker.edge_rate
+            new_local_kw = list(self._config.speech.local_keywords)
+            new_en_kw = list(self._config.speech.en_keywords)
+            new_en_enabled = bool(self._config.speech.en_kws_enabled)
+
+            def _clean_kw_list(raw_val: Any, *, uppercase: bool = False) -> list[str]:
+                if isinstance(raw_val, str):
+                    parts = re.split(r"[,，、;\n]+", raw_val)
+                elif isinstance(raw_val, list):
+                    parts = [str(item) for item in raw_val]
+                else:
+                    raise ValueError("Keywords must be a list of strings or comma-separated string.")
+                cleaned: list[str] = []
+                for p in parts:
+                    s = re.sub(r"\s+", " ", p.strip())
+                    if not s:
+                        continue
+                    if len(s) > 40:
+                        raise ValueError("Each wake keyword must be at most 40 characters.")
+                    if uppercase:
+                        s = s.upper()
+                    if s not in cleaned:
+                        cleaned.append(s)
+                if len(cleaned) > 20:
+                    raise ValueError("At most 20 wake keywords are allowed per list.")
+                return cleaned
 
             try:
                 if has_model:
@@ -2177,29 +2215,55 @@ class McpServer:
                     new_voice = resolve_edge_voice(str(body["edge_voice"])).id
                 if has_rate:
                     new_rate = normalize_edge_rate(str(body["edge_rate"]))
+                if has_local_kw:
+                    new_local_kw = _clean_kw_list(body["local_keywords"], uppercase=False)
+                    if not new_local_kw:
+                        raise ValueError("At least one Chinese/local wake keyword is required.")
+                if has_en_kw:
+                    new_en_kw = _clean_kw_list(body["en_keywords"], uppercase=True)
+                if has_en_enabled:
+                    if not isinstance(body["en_kws_enabled"], bool):
+                        raise ValueError("en_kws_enabled must be a boolean.")
+                    new_en_enabled = body["en_kws_enabled"]
+                if (has_en_kw or has_en_enabled) and new_en_enabled and not new_en_kw:
+                    raise ValueError("At least one English wake keyword is required when English KWS is enabled.")
             except ValueError as exc:
                 return web.json_response({"error": "invalid_settings", "message": str(exc)}, status=400)
-
-            self._config.llm.providers.opencode.model = new_model
-            self._config.speaker.edge_voice = new_voice
-            self._config.speaker.edge_rate = new_rate
 
             should_persist = self._config_path is not None
             persisted = False
             if should_persist:
-                await asyncio.to_thread(
-                    persist_runtime_settings,
-                    self._config_path,
-                    model=new_model if has_model else None,
-                    edge_voice=new_voice if has_voice else None,
-                    edge_rate=new_rate if has_rate else None,
-                )
-                persisted = True
+                try:
+                    await asyncio.to_thread(
+                        persist_runtime_settings,
+                        self._config_path,
+                        model=new_model if has_model else None,
+                        edge_voice=new_voice if has_voice else None,
+                        edge_rate=new_rate if has_rate else None,
+                        local_keywords=new_local_kw if has_local_kw else None,
+                        en_keywords=new_en_kw if has_en_kw else None,
+                        en_kws_enabled=new_en_enabled if has_en_enabled else None,
+                    )
+                    persisted = True
+                except OSError as exc:
+                    return web.json_response(
+                        {"error": "persist_failed", "message": f"Failed saving config.yaml: {exc}"},
+                        status=500,
+                    )
+
+            self._config.llm.providers.opencode.model = new_model
+            self._config.speaker.edge_voice = new_voice
+            self._config.speaker.edge_rate = new_rate
+            self._config.speech.local_keywords = new_local_kw
+            self._config.speech.en_keywords = new_en_kw
+            self._config.speech.en_kws_enabled = new_en_enabled
 
             if (has_voice or has_rate) and self._on_voice_changed is not None:
                 self._on_voice_changed(new_voice, new_rate)
             if has_model and self._on_model_changed is not None:
                 self._on_model_changed(new_model)
+            if (has_local_kw or has_en_kw or has_en_enabled) and self._on_wakewords_changed is not None:
+                self._on_wakewords_changed(new_local_kw, new_en_kw, new_en_enabled)
 
             return web.json_response(
                 {
@@ -2207,6 +2271,11 @@ class McpServer:
                     "model": new_model,
                     "edge_voice": new_voice,
                     "edge_rate": new_rate,
+                    "wakewords": {
+                        "local": new_local_kw,
+                        "english": new_en_kw,
+                        "en_kws_enabled": new_en_enabled,
+                    },
                     "persisted": persisted,
                 }
             )

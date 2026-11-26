@@ -27,6 +27,8 @@ def test_reduplicated_wakewords_matching() -> None:
     assert match_wakeup_phrase("糯米诺米，明天北京天气", kws) == ("糯米糯米", "明天北京天气")
     assert match_wakeup_phrase("Hey Nuomi, what time is it", kws) == ("hi nomi", "what time is it")
     assert match_wakeup_phrase("Hey Nomi", kws) == ("hi nomi", "")
+    assert match_wakeup_phrase("Hi Nuomi, tell me a joke", kws) == ("hi nomi", "tell me a joke")
+    assert match_wakeup_phrase("Ni Naomi", kws) == ("hi nomi", "")
 
 
 def test_speaker_profile_store_enroll_previous_update_and_identify(tmp_path: Path) -> None:

@@ -54,7 +54,16 @@ class SpeechConfig(BaseModel):
     )
     en_kws_enabled: bool = True
     en_keywords: list[str] = Field(
-        default_factory=lambda: ["HEY NUOMI", "HEY NOMI", "HEY NOUMI", "HEY NAOMI"]
+        default_factory=lambda: [
+            "HEY NUOMI",
+            "HEY NOMI",
+            "HEY NOUMI",
+            "HEY NAOMI",
+            "HI NOMI",
+            "HI NUOMI",
+            "HI NAOMI",
+            "NI NAOMI",
+        ]
     )
     en_kws_score: float = 1.5
     en_kws_threshold: float = 0.20
@@ -201,6 +210,9 @@ def persist_runtime_settings(
     model: str | None = None,
     edge_voice: str | None = None,
     edge_rate: str | None = None,
+    local_keywords: list[str] | None = None,
+    en_keywords: list[str] | None = None,
+    en_kws_enabled: bool | None = None,
     reminders_enabled: bool | None = None,
     quiet_start_hhmm: str | None = None,
     quiet_end_hhmm: str | None = None,
@@ -237,6 +249,15 @@ def persist_runtime_settings(
             providers = _ensure_dict(llm, "providers")
             opencode = _ensure_dict(providers, "opencode")
             opencode["model"] = model
+
+        if local_keywords is not None or en_keywords is not None or en_kws_enabled is not None:
+            speech = _ensure_dict(data, "speech")
+            if local_keywords is not None:
+                speech["local_keywords"] = list(local_keywords)
+            if en_keywords is not None:
+                speech["en_keywords"] = list(en_keywords)
+            if en_kws_enabled is not None:
+                speech["en_kws_enabled"] = bool(en_kws_enabled)
 
         if reminders_enabled is not None or quiet_start_hhmm is not None or quiet_end_hhmm is not None:
             reminders = _ensure_dict(data, "reminders")

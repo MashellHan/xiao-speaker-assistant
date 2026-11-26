@@ -70,7 +70,16 @@ def find_english_kws_dir(models_dir: Path) -> Path | None:
 def generate_english_keywords_file(en_dir: Path, keywords: list[str] | None = None) -> Path:
     from sherpa_onnx import text2token
 
-    phrases = keywords or ["HI NOMI", "HI NAOMI", "HI KNOW ME", "HI NO ME", "HEY NOMI"]
+    phrases = keywords or [
+        "HEY NUOMI",
+        "HEY NOMI",
+        "HEY NOUMI",
+        "HEY NAOMI",
+        "HI NOMI",
+        "HI NUOMI",
+        "HI NAOMI",
+        "NI NAOMI",
+    ]
     encoded = text2token(
         [p.strip().upper() for p in phrases if p.strip()],
         tokens=str(en_dir / "tokens.txt"),
