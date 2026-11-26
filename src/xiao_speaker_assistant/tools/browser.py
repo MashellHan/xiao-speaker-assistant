@@ -62,10 +62,18 @@ def extract_html_summary(raw_html: str, max_chars: int = 2000) -> tuple[str | No
 
 
 def _is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
-        ip_obj = ip_obj.ipv4_mapped
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return _is_non_public_ip(ip_obj.ipv4_mapped)
+        if ip_obj.sixtofour is not None and _is_non_public_ip(ip_obj.sixtofour):
+            return True
+        if ip_obj.teredo is not None:
+            server_ip, client_ip = ip_obj.teredo
+            if _is_non_public_ip(server_ip) or _is_non_public_ip(client_ip):
+                return True
     return (
-        ip_obj.is_private
+        not ip_obj.is_global
+        or ip_obj.is_private
         or ip_obj.is_loopback
         or ip_obj.is_link_local
         or ip_obj.is_multicast
@@ -74,23 +82,40 @@ def _is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
     )
 
 
+def _parse_ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse canonical IPv4/IPv6 AND alternate IPv4 notations (octal/hex/decimal/short)."""
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    # Catch non-canonical IPv4 literals (e.g. 2130706433, 0x7f000001, 127.1, 0177.0.0.1)
+    # that Chromium/Edge/WHATWG URL parsers normalize to loopback/private IPs.
+    try:
+        packed = socket.inet_aton(hostname)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
 def _check_public_host(hostname: str, *, resolve_dns: bool = False) -> None:
     lower = hostname.strip().rstrip(".").lower()
     if lower in _BLOCKED_HOSTNAMES or lower.endswith((".localhost", ".local", ".internal")):
         raise ValueError(f"Access to local/internal host is blocked: {hostname}")
-    try:
-        ip_obj = ipaddress.ip_address(lower)
-    except ValueError:
-        ip_obj = None
+    ip_obj = _parse_ip_literal(lower)
     if ip_obj is not None:
+        # Reject any non-public IP, or ambiguous non-canonical IPv4 literal (octal/hex/decimal/short).
         if _is_non_public_ip(ip_obj):
             raise ValueError(f"Access to loopback/private/link-local IP is blocked: {hostname}")
+        if isinstance(ip_obj, ipaddress.IPv4Address) and str(ip_obj) != lower:
+            raise ValueError(f"Non-canonical IPv4 literal is blocked: {hostname}")
         return
     if resolve_dns:
         try:
             infos = socket.getaddrinfo(lower, None, type=socket.SOCK_STREAM)
-        except OSError:
-            return
+        except OSError as exc:
+            raise ValueError(f"Failed to resolve host {hostname}: {exc}") from exc
+        if not infos:
+            raise ValueError(f"Host {hostname} did not resolve to any IP address.")
         for _fam, _type, _proto, _canon, sockaddr in infos:
             addr = sockaddr[0]
             try:
@@ -237,7 +262,7 @@ async def async_fetch_webpage_summary(
         current_url = validated_url
         resp: httpx.Response | None = None
         for _ in range(5):
-            resp = await http.get(current_url)
+            resp = await http.get(current_url, follow_redirects=False)
             if resp.is_redirect and resp.headers.get("location"):
                 next_url = str(resp.url.join(resp.headers["location"]))
                 current_url = validate_http_url(
@@ -248,6 +273,8 @@ async def async_fetch_webpage_summary(
                 continue
             break
         assert resp is not None
+        if resp.is_redirect:
+            raise ValueError("Too many redirects.")
         resp.raise_for_status()
     finally:
         if owns_client:

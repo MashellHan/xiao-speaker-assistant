@@ -51,21 +51,83 @@ def test_validate_http_url_accepts_safe_and_rejects_unsafe() -> None:
         with pytest.raises(ValueError):
             validate_http_url(bad)
 
-    # SSRF protection when block_private_network=True
+    # SSRF protection when block_private_network=True (including CGNAT and alternate IPv4 notations)
     for ssrf_url in (
         "http://127.0.0.1:4397/api/overview",
         "http://localhost:4396/api/info",
         "http://[::1]:4397/",
+        "http://[::ffff:127.0.0.1]:4397/",
+        "http://[::ffff:100.64.0.1]/",
+        "http://100.64.0.1/",
         "http://169.254.169.254/latest/meta-data/",
         "http://10.0.0.1/",
         "http://192.168.1.1/",
         "http://172.16.0.1/",
         "http://0.0.0.0:4397/",
         "http://router.local/",
+        "http://2130706433:4397/",
+        "http://0x7f000001:4397/",
+        "http://127.1:4397/",
+        "http://0177.0.0.1:4397/",
     ):
         with pytest.raises(ValueError):
             validate_http_url(ssrf_url, block_private_network=True)
     assert validate_http_url("https://example.com/ok", block_private_network=True) == "https://example.com/ok"
+
+
+def test_ssrf_dns_fail_closed_and_redirect_validation(monkeypatch) -> None:
+    import socket
+    from xiao_speaker_assistant.tools.browser import async_fetch_webpage_summary
+
+    def fake_getaddrinfo_fail(*_args, **_kwargs):
+        raise socket.gaierror("DNS failed")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo_fail)
+    with pytest.raises(ValueError, match="Failed to resolve"):
+        validate_http_url("https://unresolvable.example/", block_private_network=True, resolve_dns=True)
+
+    # Redirect to loopback must be blocked even if injected httpx.AsyncClient has follow_redirects=True
+    def redirect_to_loopback(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "public.example":
+            return httpx.Response(
+                302,
+                headers={"Location": "http://127.0.0.1:4397/api/overview"},
+                request=request,
+            )
+        return httpx.Response(200, text="LEAKED", request=request)
+
+    async def run_redirect_ssrf() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(redirect_to_loopback),
+            follow_redirects=True,
+        ) as client:
+            with pytest.raises(ValueError, match="blocked"):
+                await async_fetch_webpage_summary(
+                    "https://public.example/start",
+                    client=client,
+                    block_private_network=True,
+                )
+
+    asyncio.run(run_redirect_ssrf())
+
+    # Redirect loop (>5 hops) raises explicit ValueError
+    def endless_redirect(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"Location": "https://public.example/next"},
+            request=request,
+        )
+
+    async def run_too_many_redirects() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endless_redirect)) as client:
+            with pytest.raises(ValueError, match="Too many redirects"):
+                await async_fetch_webpage_summary(
+                    "https://public.example/loop",
+                    client=client,
+                    block_private_network=True,
+                )
+
+    asyncio.run(run_too_many_redirects())
 
 
 def test_open_in_edge_command_building_dry_run_and_mocked_subprocess(monkeypatch) -> None:
@@ -423,8 +485,10 @@ def test_mcp_server_registers_and_dispatches_edge_and_mac_tools(
         assert ssrf_resp is not None
         assert ssrf_resp["result"]["isError"] is True
 
-    # codex_analyze rejects sensitive/outside workdirs
-    for bad_workdir in ("~/.ssh", "~/.config", str(tmp_path / "outside")):
+    # codex_analyze rejects sensitive/outside workdirs, NUL bytes, hidden symlinks, and broad $HOME cwd
+    hidden_link = desktop / ".hidden_link"
+    hidden_link.symlink_to(desktop)
+    for bad_workdir in ("~/.ssh", "~/.config", str(tmp_path / "outside"), str(hidden_link), f"{desktop}\x00x"):
         codex_blocked = asyncio.run(
             server.handle_message(
                 {
@@ -442,3 +506,24 @@ def test_mcp_server_registers_and_dispatches_edge_and_mac_tools(
         assert codex_blocked["result"]["isError"] is True
         err_payload = json.loads(codex_blocked["result"]["content"][0]["text"])
         assert err_payload["error"] == "access_denied"
+
+    # When codex.workdir='.' resolves to $HOME, it must NOT silently allow $HOME or ~/Library
+    home_cfg = AppConfig()
+    home_cfg.llm.providers.codex.workdir = str(Path.home())
+    home_server = McpServer(home_cfg, include_local_tools=True, mac_allowed_roots=[desktop])
+    home_blocked = asyncio.run(
+        home_server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "codex_analyze",
+                    "arguments": {"prompt": "inspect", "workdir": "   "},
+                },
+            }
+        )
+    )
+    assert home_blocked is not None
+    assert home_blocked["result"]["isError"] is True
+    assert json.loads(home_blocked["result"]["content"][0]["text"])["error"] == "access_denied"

@@ -540,6 +540,7 @@ class McpServer:
         self._xiaohongshu = xiaohongshu_client or HttpMcpClient(
             self._config.tools.xiaohongshu.mcp_url
         )
+        self._browser_injected = browser_client is not None
         self._browser = browser_client or HttpMcpClient(self._config.tools.browser.mcp_url)
         self.confirmation_store = confirmation_store or ConfirmationStore()
         self.memory_store = memory_store or MemoryStore(
@@ -859,12 +860,13 @@ class McpServer:
 
     async def _call_browser_fetch_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         raw_url = str(args.get("url") or "").strip()
+        should_resolve_dns = self._http_client is None and not self._browser_injected
         try:
             url = await asyncio.to_thread(
                 validate_http_url,
                 raw_url,
                 block_private_network=True,
-                resolve_dns=(self._http_client is None),
+                resolve_dns=should_resolve_dns,
             )
         except ValueError as exc:
             return self._tool_result(
@@ -905,7 +907,7 @@ class McpServer:
                 validate_http_url,
                 raw_url,
                 block_private_network=True,
-                resolve_dns=False,
+                resolve_dns=not dry_run,
             )
             result_json = await asyncio.to_thread(open_in_edge, validated_url, dry_run=dry_run)
         except ValueError as exc:
@@ -990,14 +992,33 @@ class McpServer:
         )
 
     def _resolve_codex_workdir(self, raw_workdir: str) -> Path:
+        if "\x00" in raw_workdir:
+            raise MacLocalAccessError("Codex workdir contains NUL byte.")
+        cleaned = raw_workdir.strip()
+        if not cleaned:
+            raise MacLocalAccessError("A non-empty Codex workdir is required.")
+
         codex_cfg = self._config.llm.providers.codex
+        home_resolved = Path.home().resolve(strict=False)
+        overly_broad_roots = {
+            Path("/"),
+            home_resolved,
+            Path("/Users").resolve(strict=False),
+            Path("/private").resolve(strict=False),
+            Path("/etc").resolve(strict=False),
+            Path("/var").resolve(strict=False),
+            Path("/tmp").resolve(strict=False),
+        }
+        allowed_roots: list[Path] = list(resolve_allowed_roots(self._mac_allowed_roots))
         configured_root = Path(codex_cfg.workdir).expanduser().resolve(strict=False)
-        allowed_roots = [configured_root, *resolve_allowed_roots(self._mac_allowed_roots)]
+        if configured_root not in overly_broad_roots:
+            allowed_roots.insert(0, configured_root)
         workspace_dir = Path("~/workspace").expanduser().resolve(strict=False)
         if workspace_dir.is_dir():
             allowed_roots.append(workspace_dir)
 
-        candidate = Path(raw_workdir).expanduser().resolve(strict=False)
+        expanded = Path(cleaned).expanduser()
+        candidate = expanded.resolve(strict=False)
         matching_root = next((r for r in allowed_roots if candidate.is_relative_to(r)), None)
         if matching_root is None:
             raise MacLocalAccessError(
@@ -1007,6 +1028,12 @@ class McpServer:
             raise MacLocalAccessError(
                 f"Access to sensitive or hidden directory is blocked: {candidate.name}"
             )
+        unfollowed_abs = expanded if expanded.is_absolute() else Path.cwd() / expanded
+        for root in allowed_roots:
+            if unfollowed_abs.is_relative_to(root) and is_sensitive_path(unfollowed_abs, root=root):
+                raise MacLocalAccessError(
+                    f"Access to sensitive or hidden directory is blocked: {unfollowed_abs.name}"
+                )
         if not candidate.is_dir():
             raise FileNotFoundError(f"Directory does not exist: {raw_workdir}")
         return candidate
@@ -1019,7 +1046,7 @@ class McpServer:
                 is_error=True,
             )
         codex_cfg = self._config.llm.providers.codex
-        raw_workdir = str(args.get("workdir") or codex_cfg.workdir).strip()
+        raw_workdir = str(args.get("workdir") or "").strip() or codex_cfg.workdir
         try:
             workdir_path = self._resolve_codex_workdir(raw_workdir)
         except MacLocalAccessError as exc:

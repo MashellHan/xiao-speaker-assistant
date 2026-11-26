@@ -409,6 +409,28 @@ def test_relay_trusted_proxy_uses_rightmost_untrusted_xff_hop() -> None:
     asyncio.run(scenario())
 
 
+def test_relay_http_health_and_non_ws_paths() -> None:
+    import httpx
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            host_token="good-host",
+            speaker_token="good-spk",
+        ) as relay:
+            base = f"http://127.0.0.1:{relay.bound_port}"
+            async with httpx.AsyncClient() as client:
+                for ok_path in ("/", "/health", "/healthz"):
+                    r = await client.get(f"{base}{ok_path}")
+                    assert r.status_code == 200
+                for bad_path in ("/ws/host", "/ws/speaker", "/xsa/ws/host", "/unknown"):
+                    r = await client.get(f"{base}{bad_path}")
+                    assert r.status_code == 404
+
+    asyncio.run(scenario())
+
+
 def test_relay_host_client_prefers_host_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XSA_RELAY_TOKEN", "legacy-shared")
     monkeypatch.setenv("XSA_RELAY_HOST_TOKEN", "dedicated-host-tok")

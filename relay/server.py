@@ -274,12 +274,25 @@ class RelayServer:
     def _get_peer(self, role: Role) -> ServerConnection | None:
         return self._host_conn if role == "speaker" else self._speaker
 
+    @staticmethod
+    def _resolve_role(path: str) -> Role | None:
+        if path in {"/ws/speaker", "/xsa/ws/speaker"}:
+            return "speaker"
+        if path in {"/ws/host", "/xsa/ws/host"}:
+            return "host"
+        return None
+
     def _process_request(
         self, conn: ServerConnection, request: Request
     ) -> Response | None:
         # Allow HTTP health checks (for example Azure Container Apps probes) without a WS upgrade.
-        upgrade_values = request.headers.get_all("Upgrade")
-        is_ws = len(upgrade_values) == 1 and upgrade_values[0].lower() == "websocket"
+        upgrade_tokens = [
+            tok.strip().lower()
+            for raw_val in request.headers.get_all("Upgrade")
+            for tok in raw_val.split(",")
+            if tok.strip()
+        ]
+        is_ws = len(upgrade_tokens) == 1 and upgrade_tokens[0] == "websocket"
         if not is_ws:
             path = urlsplit(request.path).path
             if path in {"/", "/health", "/healthz"}:
@@ -295,11 +308,8 @@ class RelayServer:
             return conn.respond(HTTPStatus.TOO_MANY_REQUESTS, "too many requests\n")
 
         path = urlsplit(request.path).path
-        if path in {"/ws/speaker", "/xsa/ws/speaker"}:
-            role: Role = "speaker"
-        elif path in {"/ws/host", "/xsa/ws/host"}:
-            role = "host"
-        else:
+        role = self._resolve_role(path)
+        if role is None:
             authed = self._is_request_authorized(
                 request, role="host", allow_query_token=False
             ) or self._is_request_authorized(
@@ -346,12 +356,9 @@ class RelayServer:
             return
 
         path = urlsplit(conn.request.path).path if conn.request else ""
-        if path in {"/ws/speaker", "/xsa/ws/speaker"}:
-            role: Role = "speaker"
-        elif path in {"/ws/host", "/xsa/ws/host"}:
-            role = "host"
-        else:
-            # Verify Bearer auth (either role) before revealing 404 so unauthenticated scanners always see 4401.
+        role = self._resolve_role(path)
+        if role is None:
+            # Defense-in-depth if _handle_connection is ever invoked without _process_request.
             authed = self._is_authorized(conn, role="host", allow_query_token=False) or self._is_authorized(
                 conn, role="speaker", allow_query_token=False
             )
