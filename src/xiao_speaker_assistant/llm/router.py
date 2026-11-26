@@ -210,6 +210,18 @@ class LLMRouter:
             base_url, password=password, timeout_sec=cfg.timeout_sec
         )
         self._v2_active = True
+        # Pre-warm an OpenCode V2 session at startup so the very first voice turn skips
+        # `POST /api/session` (~100-200ms) and immediately streams `/prompt`.
+        try:
+            self.opencode_session_id = await self._opencode_v2.create_session(
+                model=cfg.model,
+                directory=str(self._opencode_mgr.agent_home),
+                agent="nomi",
+                title="xsa-voice",
+            )
+        except Exception as exc:
+            logger.debug("Pre-warm OpenCode session skipped: %s", exc)
+            self.opencode_session_id = None
 
     async def close(self) -> None:
         await self._opencode_mgr.stop()
@@ -329,7 +341,7 @@ class LLMRouter:
         system_prompt = self._build_system_prompt()
         prompt_text = f"{speaker_context}\n{user_text}" if speaker_context else user_text
         splitter = SentenceStreamBuffer(
-            first_sentence_min_chars=6,
+            first_sentence_min_chars=18,
             max_total_chars=self._config.spoken_max_chars,
         )
 

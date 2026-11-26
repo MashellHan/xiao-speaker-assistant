@@ -56,7 +56,8 @@ class PlaybackController:
         self._cancel_event = asyncio.Event()
         self._cancel_epoch = 0
         self._play_drain_until = 0.0
-        self._chime_pcm = generate_chime_pcm(sample_rate=config.tts_sample_rate)
+        self._chime_sample_rate = self._effective_sample_rate()
+        self._chime_pcm = generate_chime_pcm(sample_rate=self._chime_sample_rate)
 
     @property
     def is_playing(self) -> bool:
@@ -66,11 +67,34 @@ class PlaybackController:
     def stream_open(self) -> bool:
         return self._stream_open
 
+    @property
+    def effective_sample_rate(self) -> int:
+        return self._effective_sample_rate()
+
+    @property
+    def chunk_bytes(self) -> int:
+        return self._chunk_bytes()
+
+    def _effective_sample_rate(self) -> int:
+        # Over WAN/SSH relay, downlink delivery rate on Chinese broadband -> Azure can hover
+        # around ~370-500 kbps. 16kHz mono PCM cuts JSON-array wire rate by 33% (~1.0 Mbps ->
+        # ~680 kbps uncompressed, well within link capacity with TCP BBR) without audible speech loss.
+        if self._wan_relay:
+            return min(self._config.tts_sample_rate, 16000)
+        return self._config.tts_sample_rate
+
+    def _chunk_bytes(self) -> int:
+        # 200ms chunks over WAN (6400B @ 16kHz), 100ms chunks on LAN (4800B @ 24kHz).
+        if self._wan_relay:
+            return int(self._effective_sample_rate() * 0.20) * 2
+        return 4800
+
     def _alsa_buffer_frames(self) -> int:
-        # 400ms ALSA ring buffer over WAN (9600 frames @ 24kHz) vs 200ms on LAN:
-        # cuts initial ALSA start_threshold audio latency in half (400ms vs 800ms) while
-        # still absorbing internet jitter alongside the 1.2s client-side mpsc prebuffer.
-        return 9600 if self._wan_relay else 4800
+        # 500ms ALSA ring buffer over WAN (8000 frames @ 16kHz) vs 200ms on LAN (4800 @ 24kHz):
+        # absorbs WAN/broadband jitter cleanly while keeping first-sound delay low.
+        if self._wan_relay:
+            return int(self._effective_sample_rate() * 0.50)
+        return 4800
 
     def _notify_playback_started(self) -> None:
         if self._on_playback_state and not self._playback_notified:
@@ -109,7 +133,8 @@ class PlaybackController:
         # still sends `stop_play` to tear down `aplay` if it finished spawning on the speaker.
         self._stream_open = True
         self._stream_sent_sec = 0.0
-        period_size = 2400 if self._wan_relay else 1200
+        sample_rate = self._effective_sample_rate()
+        period_size = int(sample_rate * 0.10) if self._wan_relay else 1200
         buffer_size = self._alsa_buffer_frames()
         try:
             # Wait for open-xiaoai-client to spawn `aplay` and initialize its `AudioPlayer.sender`
@@ -121,9 +146,9 @@ class PlaybackController:
                         "pcm": "default",
                         "channels": 1,
                         "bits_per_sample": 16,
-                        "sample_rate": self._config.tts_sample_rate,
+                        "sample_rate": sample_rate,
                         "period_size": period_size,
-                        "buffer_size": buffer_size,  # 400ms WAN jitter buffer / 200ms LAN buffer at 24kHz
+                        "buffer_size": buffer_size,  # 500ms WAN jitter buffer / 200ms LAN buffer
                     },
                     wait_response=True,
                     timeout=5.0,
@@ -213,10 +238,11 @@ class PlaybackController:
             return False
         if not chunk:
             return True
-        bytes_per_sec = self._config.tts_sample_rate * 2
-        # Over WAN/SSH relay, prebuffer ~1.2s of PCM ahead of real-time (well below the 50-slot
+        sample_rate = self._effective_sample_rate()
+        bytes_per_sec = sample_rate * 2
+        # Over WAN/SSH relay, prebuffer ~1.4s of PCM ahead of real-time (well below the 50-slot
         # open-xiaoai-client mpsc queue when using 200ms chunks) to absorb internet jitter.
-        lead_buffer_sec = 1.20 if self._wan_relay else 0.30
+        lead_buffer_sec = 1.40 if self._wan_relay else 0.30
         now = time.monotonic()
         if self._play_drain_until > now + lead_buffer_sec:
             if not await self._wait_cancellable(self._play_drain_until - now - lead_buffer_sec):
@@ -237,15 +263,15 @@ class PlaybackController:
 
     def _effective_tail_pad_sec(self, base_pad_sec: float) -> float:
         """Ensure total written PCM exceeds ALSA buffer_size (start_threshold) so short audio never drops."""
-        min_total_sec = (self._alsa_buffer_frames() / self._config.tts_sample_rate) + 0.05
+        min_total_sec = (self._alsa_buffer_frames() / self._effective_sample_rate()) + 0.05
         min_pad_for_start = max(0.0, min_total_sec - self._stream_sent_sec)
         return max(base_pad_sec, min_pad_for_start)
 
     async def _flush_tail_and_wait(self, epoch: int, *, pad_tail_sec: float) -> None:
         effective_pad = self._effective_tail_pad_sec(pad_tail_sec)
         if effective_pad > 0 and epoch == self._cancel_epoch and not self._cancel_event.is_set():
-            pad_bytes = int(self._config.tts_sample_rate * effective_pad) * 2
-            chunk_bytes = 9600 if self._wan_relay else 4800
+            pad_bytes = int(self._effective_sample_rate() * effective_pad) * 2
+            chunk_bytes = self._chunk_bytes()
             for i in range(0, pad_bytes, chunk_bytes):
                 silence = b"\x00" * min(chunk_bytes, pad_bytes - i)
                 if not await self._send_play_chunk(silence, epoch):
@@ -325,14 +351,18 @@ class PlaybackController:
             if not await self.ensure_stream_started(epoch=epoch):
                 return
 
-            chunk_bytes = 9600 if self._wan_relay else 4800
+            effective_sr = self._effective_sample_rate()
+            if effective_sr != self._chime_sample_rate:
+                self._chime_sample_rate = effective_sr
+                self._chime_pcm = generate_chime_pcm(sample_rate=effective_sr)
+            chunk_bytes = self._chunk_bytes()
 
             async def chime_iter() -> AsyncIterator[bytes]:
                 for i in range(0, len(self._chime_pcm), chunk_bytes):
                     yield self._chime_pcm[i : i + chunk_bytes]
 
             # Pad trailing silence beyond ALSA buffer_size so short chime always flushes immediately.
-            pad_sec = 0.35 if self._wan_relay else 0.25
+            pad_sec = 0.45 if self._wan_relay else 0.25
             try:
                 await self._stream_chunks(chime_iter(), epoch, pad_tail_sec=pad_sec)
             finally:
@@ -345,6 +375,7 @@ class PlaybackController:
         interrupt_native: bool = True,
         voice_override: str | None = None,
         keep_stream_open: bool = False,
+        prefetched_pcm: bytes | None = None,
     ) -> None:
         if not text.strip():
             return
@@ -366,13 +397,31 @@ class PlaybackController:
                     if epoch != self._cancel_epoch or self._cancel_event.is_set():
                         return
 
-                chunk_bytes = 9600 if self._wan_relay else 4800
+                chunk_bytes = self._chunk_bytes()
+                if prefetched_pcm:
+                    if not await self.ensure_stream_started(epoch=epoch):
+                        return
+
+                    async def _mem_stream() -> AsyncIterator[bytes]:
+                        for i in range(0, len(prefetched_pcm), chunk_bytes):
+                            yield prefetched_pcm[i : i + chunk_bytes]
+
+                    await self._stream_chunks(
+                        _mem_stream(),
+                        epoch,
+                        pad_tail_sec=0.35 if self._wan_relay else 0.22,
+                        keep_open=keep_stream_open,
+                    )
+                    return
+
+                effective_sr = self._effective_sample_rate()
                 tts_stream = (
                     synthesize_tts_pcm_stream(
                         text,
                         self._config,
                         voice_override=voice_override,
                         chunk_bytes=chunk_bytes,
+                        sample_rate_override=effective_sr,
                     )
                     if (voice_override or self._wan_relay)
                     else synthesize_tts_pcm_stream(text, self._config)

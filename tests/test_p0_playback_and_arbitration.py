@@ -236,8 +236,9 @@ def test_playback_controller_wan_relay_uses_jitter_buffer_and_continuous_stream(
         return {"code": 0}
 
     async def fake_stream(text: str, cfg: SpeakerConfig, **kwargs):
-        assert kwargs.get("chunk_bytes") == 9600
-        yield b"\x02\x00" * 4800
+        assert kwargs.get("chunk_bytes") == 6400
+        assert kwargs.get("sample_rate_override") == 16000
+        yield b"\x02\x00" * 3200
 
     pb = PlaybackController(
         SpeakerConfig(tts_provider="edge"),
@@ -267,9 +268,9 @@ def test_playback_controller_wan_relay_uses_jitter_buffer_and_continuous_stream(
         "pcm": "default",
         "channels": 1,
         "bits_per_sample": 16,
-        "sample_rate": 24000,
-        "period_size": 2400,
-        "buffer_size": 9600,
+        "sample_rate": 16000,
+        "period_size": 1600,
+        "buffer_size": 8000,
     }
     assert len(stop_rpcs) == 1
     # Compact JSON encoding omits spaces after commas/colons (~22% smaller over wire)
@@ -312,9 +313,9 @@ def test_playback_controller_wan_short_utterance_exceeds_alsa_start_threshold() 
             await pb.speak("好的", interrupt_native=True)
 
     asyncio.run(run())
-    # Must exceed ALSA 9600-frame (19200-byte) start_threshold so short utterances never drop!
+    # Must exceed ALSA 8000-frame (16000-byte) start_threshold at 16kHz WAN so short utterances never drop!
     total_bytes = sum(len(frame["bytes"]) for frame in sent_binary)
-    assert total_bytes >= 9600 * 2
+    assert total_bytes >= 8000 * 2
 
 
 def test_playback_controller_keep_open_failure_still_unmutes_vad() -> None:
@@ -491,8 +492,66 @@ def test_pipelined_tts_stream_closes_cleanly_on_start_play_failure_and_barge_in(
             await pb3.speak("空首块测试", interrupt_native=True)
 
     asyncio.run(run_empty_first())
-    assert sum(len(f["bytes"]) for f in sent_binary) >= 9600 * 2
+    assert sum(len(f["bytes"]) for f in sent_binary) >= 8000 * 2
     assert closed_count == 3
+
+
+def test_streaming_reply_prefetches_subsequent_sentences_in_parallel() -> None:
+    import time
+
+    sent_binary: list[dict] = []
+    synth_starts: dict[str, float] = {}
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw) -> None:
+            if isinstance(raw, (bytes, bytearray)):
+                sent_binary.append(json.loads(raw.decode("utf-8")))
+                return
+            msg = json.loads(raw)
+            req = msg.get("Request") or {}
+            cmd = str(req.get("command") or "")
+            if cmd in {"start_play", "stop_play"} and isinstance(req.get("id"), str):
+                rid = req["id"]
+                asyncio.get_running_loop().call_soon(
+                    lambda r=rid: asyncio.create_task(
+                        gw._handle_text_message(
+                            self,
+                            json.dumps({"Response": {"id": r, "code": 0}}),
+                        )
+                    )
+                )
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        synth_starts[text] = time.monotonic()
+        await asyncio.sleep(0.15)
+        yield b"\x02\x00" * 3200
+
+    async def two_sentences(query: str):
+        yield "第一句比较长的话用来测试并行预合成效果。"
+        yield "第二句应该在第一句合成或播放时就提前开始合成。"
+
+    cfg = AppConfig()
+    cfg.speaker.tts_provider = "edge"
+    gw = SpeakerGateway(cfg, on_stream_query=two_sentences)
+
+    async def run() -> None:
+        conn = FakeConn()
+        gw._relay_connections.add(conn)
+        with (
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw._run_query_and_speak(conn, "测试预合成")
+
+    asyncio.run(run())
+    assert len(synth_starts) == 2
+    t1 = synth_starts["第一句比较长的话用来测试并行预合成效果。"]
+    t2 = synth_starts["第二句应该在第一句合成或播放时就提前开始合成。"]
+    # Second sentence must start synthesizing BEFORE the first sentence finishes its 0.15s TTS!
+    assert abs(t2 - t1) < 0.10
+    assert len(sent_binary) >= 2
 
 
 def test_barge_in_during_continuous_stream_does_not_drain_or_close_new_chime() -> None:
@@ -558,3 +617,48 @@ def test_barge_in_during_continuous_stream_does_not_drain_or_close_new_chime() -
     # Aborted continuous stream must NOT emit on_playback_state(False) or hang draining tail
     assert states == [True]
     assert sent_rpcs.count("stop_play") == 1
+
+
+def test_empty_prefetched_pcm_falls_back_to_live_tts_and_chime_tracks_sample_rate() -> None:
+    sent_binary: list[dict] = []
+    live_calls: list[str] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary.append(json.loads(b.decode("utf-8")))
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def ok_rpc(cmd: str, payload, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        live_calls.append(text)
+        yield b"\x05\x00" * 3200
+
+    cfg = SpeakerConfig(tts_provider="edge", tts_sample_rate=24000)
+    pb = PlaybackController(
+        cfg,
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=ok_rpc,
+        wan_relay=False,
+    )
+
+    async def run() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts):
+            await pb.speak("空预取回退测试", interrupt_native=False, prefetched_pcm=b"")
+        assert pb._chime_sample_rate == 24000
+        old_len = len(pb._chime_pcm)
+        pb._config = SpeakerConfig(tts_provider="edge", tts_sample_rate=16000)
+        await pb.play_chime()
+        assert pb._chime_sample_rate == 16000
+        assert len(pb._chime_pcm) < old_len
+
+    asyncio.run(run())
+    assert live_calls == ["空预取回退测试"]
+    assert len(sent_binary) >= 2
