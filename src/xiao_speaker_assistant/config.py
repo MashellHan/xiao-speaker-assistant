@@ -26,6 +26,8 @@ class SpeakerConfig(BaseModel):
     voice_routes: dict[str, str] = Field(default_factory=dict)
     say_voice: str = "Tingting"
     tts_sample_rate: int = 24000
+    tool_ack_enabled: bool = True
+    tool_ack_delay_sec: float = 1.6
 
 
 class SpeechConfig(BaseModel):

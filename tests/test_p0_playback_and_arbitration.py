@@ -662,3 +662,100 @@ def test_empty_prefetched_pcm_falls_back_to_live_tts_and_chime_tracks_sample_rat
     asyncio.run(run())
     assert live_calls == ["空预取回退测试"]
     assert len(sent_binary) >= 2
+
+
+def test_conversational_ack_speaks_immediately_for_slow_weather_and_skips_fast_reply() -> None:
+    from xiao_speaker_assistant.voice.ws_server import build_conversational_ack
+
+    phrase, delay = build_conversational_ack("北京明天天气怎么样")
+    assert phrase == "好的，我这就帮你查一下北京天气。"
+    assert delay is not None and delay <= 0.5
+
+    phrase_b, _ = build_conversational_ack("帮我查一下杭州明天天气怎么样")
+    assert phrase_b == "好的，我这就帮你查一下杭州天气。"
+
+    phrase2, delay2 = build_conversational_ack("天气怎么样")
+    assert phrase2 == "好的，我这就帮你查一下天气。"
+    assert delay2 is not None and delay2 <= 0.5
+
+    phrase2b, _ = build_conversational_ack("帮我查一下今天天气怎么样")
+    assert phrase2b == "好的，我这就帮你查一下天气。"
+
+    phrase3, delay3 = build_conversational_ack("帮我查一下小红书上海美食")
+    assert phrase3 == "好的，我这就帮你去小红书搜一下。"
+    assert delay3 is not None and delay3 <= 0.5
+
+    phrase4, delay4 = build_conversational_ack("确认发送")
+    assert phrase4 is None and delay4 is None
+
+    spoken_texts: list[str] = []
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw) -> None:
+            if isinstance(raw, (bytes, bytearray)):
+                return
+            msg = json.loads(raw)
+            req = msg.get("Request") or {}
+            cmd = str(req.get("command") or "")
+            if cmd in {"start_play", "stop_play"} and isinstance(req.get("id"), str):
+                rid = req["id"]
+                asyncio.get_running_loop().call_soon(
+                    lambda r=rid: asyncio.create_task(
+                        gw._handle_text_message(
+                            self,
+                            json.dumps({"Response": {"id": r, "code": 0}}),
+                        )
+                    )
+                )
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        spoken_texts.append(text)
+        yield b"\x02\x00" * 3200
+
+    # Slow weather tool query (>0.5s) -> speaks ack first, then real weather reply
+    async def slow_weather_stream(query: str):
+        await asyncio.sleep(0.55)
+        yield "上海明天晴，18到24度。"
+
+    cfg = AppConfig()
+    cfg.speaker.tts_provider = "edge"
+    cfg.speaker.tool_ack_enabled = True
+    gw = SpeakerGateway(cfg, on_stream_query=slow_weather_stream)
+
+    async def run_slow() -> None:
+        conn = FakeConn()
+        gw._relay_connections.add(conn)
+        with (
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw._run_query_and_speak(conn, "上海明天天气怎么样")
+
+    asyncio.run(run_slow())
+    assert spoken_texts == [
+        "好的，我这就帮你查一下上海天气。",
+        "上海明天晴，18到24度。",
+    ]
+
+    # Fast reply (<0.1s) -> ack must NOT fire
+    spoken_texts.clear()
+
+    async def fast_stream(query: str):
+        await asyncio.sleep(0.02)
+        yield "你好呀，我在呢。"
+
+    gw_fast = SpeakerGateway(cfg, on_stream_query=fast_stream)
+
+    async def run_fast() -> None:
+        conn = FakeConn()
+        gw_fast._relay_connections.add(conn)
+        with (
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw_fast._run_query_and_speak(conn, "上海天气怎么样")
+
+    asyncio.run(run_fast())
+    assert spoken_texts == ["你好呀，我在呢。"]
