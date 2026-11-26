@@ -112,7 +112,7 @@ chmod 700 "$STAGE_DIR"
 cleanup() {
   rm -rf "$STAGE_DIR"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 cp "$REPO_ROOT/relay/Dockerfile" "$REPO_ROOT/relay/server.py" "$STAGE_DIR/"
 (
@@ -135,7 +135,7 @@ REMOTE_PUBLISH="$(printf '%s:%s:8765' "$RELAY_BIND" "$RELAY_PORT")"
 REMOTE_CMD="set -euo pipefail
 sudo mkdir -p /opt/xsa-relay
 sudo rm -f /opt/xsa-relay/._Dockerfile /opt/xsa-relay/._server.py /opt/xsa-relay/._relay.env
-sudo tar -C /opt/xsa-relay -xf -
+sudo tar --no-same-owner -C /opt/xsa-relay -xf -
 sudo chown root:root /opt/xsa-relay/Dockerfile /opt/xsa-relay/server.py /opt/xsa-relay/relay.env
 sudo chmod 644 /opt/xsa-relay/Dockerfile /opt/xsa-relay/server.py
 sudo chmod 600 /opt/xsa-relay/relay.env

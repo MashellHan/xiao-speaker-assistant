@@ -71,12 +71,17 @@ def _client_ip(conn: ServerConnection, trusted_proxies: frozenset[str]) -> str:
     peer = _peer_ip(conn)
     if peer not in trusted_proxies or conn.request is None:
         return peer
-    raw_xff = conn.request.headers.get("X-Forwarded-For", "")
-    if not raw_xff:
+    header_values = conn.request.headers.get_all("X-Forwarded-For")
+    if not header_values:
         return peer
     # Walk right-to-left: a trusted reverse proxy appends the real peer on the right,
     # so the rightmost hop not in trusted_proxies cannot be forged by the client.
-    hops = [part.strip() for part in raw_xff.split(",") if part.strip()]
+    hops = [
+        part.strip()
+        for raw_xff in header_values
+        for part in raw_xff.split(",")
+        if part.strip()
+    ]
     for hop in reversed(hops):
         if hop not in trusted_proxies:
             return hop
@@ -225,7 +230,10 @@ class RelayServer:
             return self._allow_insecure_no_auth
         if conn.request is None:
             return False
-        raw_header = conn.request.headers.get("Authorization", "")
+        auth_values = conn.request.headers.get_all("Authorization")
+        if len(auth_values) > 1:
+            return False
+        raw_header = auth_values[0] if auth_values else ""
         presented = _extract_bearer_token(raw_header)
         if presented is not None:
             return hmac.compare_digest(presented, expected)
