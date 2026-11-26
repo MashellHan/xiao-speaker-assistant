@@ -114,19 +114,47 @@ class PlaybackController:
         try:
             # Wait for open-xiaoai-client to spawn `aplay` and initialize its `AudioPlayer.sender`
             # channel before sending binary `tag="play"` frames (prevents silent initial drops).
-            resp = await self._send_rpc(
-                "start_play",
-                {
-                    "pcm": "default",
-                    "channels": 1,
-                    "bits_per_sample": 16,
-                    "sample_rate": self._config.tts_sample_rate,
-                    "period_size": period_size,
-                    "buffer_size": buffer_size,  # 400ms WAN jitter buffer / 200ms LAN buffer at 24kHz
-                },
-                wait_response=True,
-                timeout=5.0,
+            rpc_task = asyncio.create_task(
+                self._send_rpc(
+                    "start_play",
+                    {
+                        "pcm": "default",
+                        "channels": 1,
+                        "bits_per_sample": 16,
+                        "sample_rate": self._config.tts_sample_rate,
+                        "period_size": period_size,
+                        "buffer_size": buffer_size,  # 400ms WAN jitter buffer / 200ms LAN buffer at 24kHz
+                    },
+                    wait_response=True,
+                    timeout=5.0,
+                )
             )
+            cancel_task = asyncio.create_task(self._cancel_event.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {rpc_task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_task in done or (epoch is not None and epoch != self._cancel_epoch):
+                    if not rpc_task.done():
+                        rpc_task.cancel()
+                    await asyncio.gather(rpc_task, return_exceptions=True)
+                    self._stream_open = False
+                    return False
+                resp = await rpc_task
+            except asyncio.CancelledError:
+                if not rpc_task.done():
+                    rpc_task.cancel()
+                await asyncio.gather(rpc_task, return_exceptions=True)
+                self._stream_open = False
+                if self._cancel_event.is_set():
+                    return False
+                raise
+            finally:
+                if not cancel_task.done():
+                    cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+
             if self._send_rpc_fn is not None and resp is None:
                 self._stream_open = False
                 return False
@@ -136,6 +164,12 @@ class PlaybackController:
                 return False
             raise
         if epoch is not None and (epoch != self._cancel_epoch or self._cancel_event.is_set()):
+            # If barge-in fired right as start_play succeeded, tear down the remote aplay.
+            self._stream_open = False
+            try:
+                await self._send_rpc("stop_play", None, wait_response=False, timeout=1.0)
+            except Exception:
+                pass
             return False
         return True
 
@@ -344,40 +378,74 @@ class PlaybackController:
                     else synthesize_tts_pcm_stream(text, self._config)
                 )
 
-                # Pipeline start_play RPC with Edge-TTS first-chunk synthesis so the WAN RTT
-                # for `start_play` overlaps with TTS startup instead of adding serially.
-                if not self._stream_open:
-                    start_task = asyncio.create_task(self.ensure_stream_started(epoch=epoch))
-                    first_chunk: bytes | None = None
-                    try:
-                        first_chunk = await anext(tts_stream, None)
-                    except BaseException:
-                        if not start_task.done():
-                            start_task.cancel()
-                        await asyncio.gather(start_task, return_exceptions=True)
-                        raise
-                    if not await start_task:
-                        return
-                    if first_chunk is None:
-                        return
+                try:
+                    # Pipeline start_play RPC with Edge-TTS first-chunk synthesis so the WAN RTT
+                    # for `start_play` overlaps with TTS startup instead of adding serially.
+                    if not self._stream_open:
+                        start_task = asyncio.create_task(self.ensure_stream_started(epoch=epoch))
+                        first_task = asyncio.create_task(anext(tts_stream, None))
+                        cancel_task = asyncio.create_task(self._cancel_event.wait())
+                        try:
+                            done, _ = await asyncio.wait(
+                                {first_task, cancel_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if (
+                                cancel_task in done
+                                or epoch != self._cancel_epoch
+                                or self._cancel_event.is_set()
+                            ):
+                                if not first_task.done():
+                                    first_task.cancel()
+                                if not start_task.done():
+                                    start_task.cancel()
+                                await asyncio.gather(
+                                    first_task, start_task, return_exceptions=True
+                                )
+                                return
+                            first_chunk = await first_task
+                        except BaseException:
+                            if not first_task.done():
+                                first_task.cancel()
+                            if not start_task.done():
+                                start_task.cancel()
+                            await asyncio.gather(first_task, start_task, return_exceptions=True)
+                            raise
+                        finally:
+                            if not cancel_task.done():
+                                cancel_task.cancel()
+                            await asyncio.gather(cancel_task, return_exceptions=True)
 
-                    async def _prefetched_stream() -> AsyncIterator[bytes]:
-                        yield first_chunk
-                        async for rest_chunk in tts_stream:
-                            yield rest_chunk
+                        if not await start_task:
+                            return
+                        if first_chunk is None:
+                            await self._close_stream(wait_ack=False)
+                            return
 
-                    active_stream: AsyncIterator[bytes] = _prefetched_stream()
-                else:
-                    if not await self.ensure_stream_started(epoch=epoch):
-                        return
-                    active_stream = tts_stream
+                        async def _prefetched_stream() -> AsyncIterator[bytes]:
+                            yield first_chunk
+                            async for rest_chunk in tts_stream:
+                                yield rest_chunk
 
-                await self._stream_chunks(
-                    active_stream,
-                    epoch,
-                    pad_tail_sec=0.35 if self._wan_relay else 0.22,
-                    keep_open=keep_stream_open,
-                )
+                        active_stream: AsyncIterator[bytes] = _prefetched_stream()
+                    else:
+                        if not await self.ensure_stream_started(epoch=epoch):
+                            return
+                        active_stream = tts_stream
+
+                    await self._stream_chunks(
+                        active_stream,
+                        epoch,
+                        pad_tail_sec=0.35 if self._wan_relay else 0.22,
+                        keep_open=keep_stream_open,
+                    )
+                finally:
+                    aclose = getattr(tts_stream, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
             finally:
                 aborted = epoch != self._cancel_epoch or self._cancel_event.is_set()
                 if self._config.tts_provider != "xiaoai" and (not keep_stream_open or aborted):

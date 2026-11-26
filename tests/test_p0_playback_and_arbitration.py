@@ -395,6 +395,106 @@ def test_stop_playback_does_not_block_on_missing_stop_play_ack() -> None:
     assert ("stop_play", False) in rpcs
 
 
+def test_pipelined_tts_stream_closes_cleanly_on_start_play_failure_and_barge_in() -> None:
+    import time
+
+    closed_count = 0
+    sent_binary: list[dict] = []
+
+    async def fake_send_text(t: str) -> None:
+        pass
+
+    async def fake_send_binary(b: bytes) -> None:
+        sent_binary.append(json.loads(b.decode("utf-8")))
+
+    async def fake_run_shell(script: str, wait: bool, timeout: float):
+        return {"code": 0}
+
+    # Case 1: start_play fails (returns None) -> tts_stream MUST be closed via aclose()
+    async def failing_rpc(cmd: str, payload, wait: bool, timeout: float):
+        return None
+
+    async def tracked_stream(text: str, cfg: SpeakerConfig, **kwargs):
+        nonlocal closed_count
+        try:
+            yield b""
+            yield b"\x04\x00" * 4800
+        finally:
+            closed_count += 1
+
+    pb1 = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=failing_rpc,
+        wan_relay=True,
+    )
+
+    async def run_fail() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", tracked_stream):
+            await pb1.speak("测试关闭", interrupt_native=True)
+
+    asyncio.run(run_fail())
+    assert closed_count == 1
+    assert sent_binary == []
+
+    # Case 2: stop_playback() while anext(tts_stream) is blocked on slow Edge-TTS unblocks immediately
+    slow_started = asyncio.Event()
+
+    async def ok_rpc(cmd: str, payload, wait: bool, timeout: float):
+        return {"code": 0}
+
+    async def slow_tts_stream(text: str, cfg: SpeakerConfig, **kwargs):
+        nonlocal closed_count
+        slow_started.set()
+        try:
+            await asyncio.sleep(10.0)
+            yield b"\x01\x00" * 4800
+        finally:
+            closed_count += 1
+
+    pb2 = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=ok_rpc,
+        wan_relay=True,
+    )
+
+    async def run_barge_in() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", slow_tts_stream):
+            speak_task = asyncio.create_task(pb2.speak("慢速TTS", interrupt_native=True))
+            await slow_started.wait()
+            await asyncio.sleep(0.02)
+            t0 = time.monotonic()
+            await pb2.stop_playback(stop_native=True)
+            await asyncio.wait_for(speak_task, timeout=1.0)
+            assert (time.monotonic() - t0) < 0.4
+
+    asyncio.run(run_barge_in())
+    assert closed_count == 2
+
+    # Case 3: leading empty b"" chunk followed by real PCM still streams cleanly
+    pb3 = PlaybackController(
+        SpeakerConfig(tts_provider="edge"),
+        send_text=fake_send_text,
+        send_binary=fake_send_binary,
+        run_shell=fake_run_shell,
+        send_rpc=ok_rpc,
+        wan_relay=True,
+    )
+
+    async def run_empty_first() -> None:
+        with patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", tracked_stream):
+            await pb3.speak("空首块测试", interrupt_native=True)
+
+    asyncio.run(run_empty_first())
+    assert sum(len(f["bytes"]) for f in sent_binary) >= 9600 * 2
+    assert closed_count == 3
+
+
 def test_barge_in_during_continuous_stream_does_not_drain_or_close_new_chime() -> None:
     import time
 
