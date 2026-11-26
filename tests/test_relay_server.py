@@ -277,6 +277,14 @@ def test_relay_refuses_to_start_without_token_by_default(monkeypatch: pytest.Mon
         relay_mod.RelayServer(host="127.0.0.1", port=0)
 
 
+def test_relay_refuses_half_configured_split_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XSA_RELAY_TOKEN", "legacy-should-not-mix")
+    monkeypatch.setenv("XSA_RELAY_HOST_TOKEN", "only-host-set")
+    monkeypatch.delenv("XSA_RELAY_SPEAKER_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="Both XSA_RELAY_HOST_TOKEN and XSA_RELAY_SPEAKER_TOKEN"):
+        relay_mod.RelayServer(host="127.0.0.1", port=0)
+
+
 def test_split_host_and_speaker_tokens_enforce_role_separation() -> None:
     host_tok = "host-secret-only"
     spk_tok = "speaker-secret-only"
@@ -322,7 +330,7 @@ def test_split_host_and_speaker_tokens_enforce_role_separation() -> None:
     asyncio.run(scenario())
 
 
-def test_relay_rate_limits_repeated_auth_failures() -> None:
+def test_relay_rate_limits_repeated_auth_failures_and_ignores_spoofed_xff() -> None:
     async def scenario() -> None:
         async with relay_mod.RelayServer(
             host="127.0.0.1",
@@ -334,12 +342,62 @@ def test_relay_rate_limits_repeated_auth_failures() -> None:
             auth_ban_sec=30.0,
         ) as relay:
             base = f"ws://127.0.0.1:{relay.bound_port}"
-            await _expect_close_code(f"{base}/ws/host", 4401, headers={"Authorization": "Bearer bad1"})
-            await _expect_close_code(f"{base}/ws/host", 4401, headers={"Authorization": "Bearer bad2"})
-            # 3rd failure hits ban threshold -> 4429
-            await _expect_close_code(f"{base}/ws/host", 4429, headers={"Authorization": "Bearer bad3"})
+            # Spoofing different X-Forwarded-For values MUST NOT bypass rate limiting when untrusted.
+            await _expect_close_code(
+                f"{base}/ws/host",
+                4401,
+                headers={"Authorization": "Bearer bad1", "X-Forwarded-For": "1.1.1.1"},
+            )
+            await _expect_close_code(
+                f"{base}/ws/unknown",
+                4401,
+                headers={"Authorization": "Bearer bad2", "X-Forwarded-For": "2.2.2.2"},
+            )
+            # 3rd failure hits ban threshold -> 4429 despite another spoofed XFF
+            await _expect_close_code(
+                f"{base}/ws/host",
+                4429,
+                headers={"Authorization": "Bearer bad3", "X-Forwarded-For": "3.3.3.3"},
+            )
             # Subsequent attempt (even with valid token) from banned IP is still rejected with 4429
             await _expect_close_code(f"{base}/ws/host", 4429, headers={"Authorization": "Bearer good-host"})
+
+    asyncio.run(scenario())
+
+
+def test_relay_trusted_proxy_uses_rightmost_untrusted_xff_hop() -> None:
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            host_token="good-host",
+            speaker_token="good-spk",
+            auth_fail_limit=2,
+            auth_fail_window_sec=60.0,
+            auth_ban_sec=30.0,
+            trusted_proxies={"127.0.0.1"},
+        ) as relay:
+            base = f"ws://127.0.0.1:{relay.bound_port}"
+            # Attacker sends spoofed leftmost XFF, trusted proxy appends real IP (203.0.113.9) on the right.
+            await _expect_close_code(
+                f"{base}/ws/host",
+                4401,
+                headers={"Authorization": "Bearer bad1", "X-Forwarded-For": "10.0.0.1, 203.0.113.9"},
+            )
+            await _expect_close_code(
+                f"{base}/ws/host",
+                4429,
+                headers={"Authorization": "Bearer bad2", "X-Forwarded-For": "10.0.0.2, 203.0.113.9"},
+            )
+            # A different real client IP (203.0.113.55) behind the same proxy is NOT banned.
+            async with websockets.connect(
+                f"{base}/ws/host",
+                additional_headers={
+                    "Authorization": "Bearer good-host",
+                    "X-Forwarded-For": "203.0.113.55",
+                },
+            ):
+                pass
 
     asyncio.run(scenario())
 
@@ -354,8 +412,8 @@ def test_relay_host_client_prefers_host_token_env(monkeypatch: pytest.MonkeyPatc
         return q
 
     gw = SpeakerGateway(cfg, on_query=dummy)
-    client = RelayHostClient(gw, "wss://relay.mxhan.com/xsa/ws/host")
-    assert client.relay_url == "wss://relay.mxhan.com/xsa/ws/host"
+    client = RelayHostClient(gw, "wss://relay.example.com/xsa/ws/host")
+    assert client.relay_url == "wss://relay.example.com/xsa/ws/host"
     assert client._build_headers() == {"Authorization": "Bearer dedicated-host-tok"}
 
 

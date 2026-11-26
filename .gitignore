@@ -9,6 +9,7 @@ models/
 *.key
 token_cache*.json
 cookies.json
+.playwright-mcp/
 
 # Local config and secrets
 .env

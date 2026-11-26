@@ -54,15 +54,33 @@ async def _safe_close(conn: ServerConnection, code: int, reason: str) -> None:
         pass
 
 
-def _client_ip(conn: ServerConnection) -> str:
-    if conn.request is not None:
-        xff = conn.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        if xff:
-            return xff
+def _parse_trusted_proxies(raw: str | None) -> frozenset[str]:
+    if not raw:
+        return frozenset()
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _peer_ip(conn: ServerConnection) -> str:
     remote = conn.remote_address
     if isinstance(remote, tuple) and remote:
         return str(remote[0])
     return str(remote or "unknown")
+
+
+def _client_ip(conn: ServerConnection, trusted_proxies: frozenset[str]) -> str:
+    peer = _peer_ip(conn)
+    if peer not in trusted_proxies or conn.request is None:
+        return peer
+    raw_xff = conn.request.headers.get("X-Forwarded-For", "")
+    if not raw_xff:
+        return peer
+    # Walk right-to-left: a trusted reverse proxy appends the real peer on the right,
+    # so the rightmost hop not in trusted_proxies cannot be forged by the client.
+    hops = [part.strip() for part in raw_xff.split(",") if part.strip()]
+    for hop in reversed(hops):
+        if hop not in trusted_proxies:
+            return hop
+    return peer
 
 
 class RelayServer:
@@ -81,6 +99,7 @@ class RelayServer:
         auth_fail_limit: int = 10,
         auth_fail_window_sec: float = 60.0,
         auth_ban_sec: float = 300.0,
+        trusted_proxies: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -95,6 +114,12 @@ class RelayServer:
             if speaker_token is None
             else (speaker_token.strip() or None)
         )
+        # Fail closed on half-configured split tokens instead of silently mixing with legacy token.
+        if bool(resolved_host_token) ^ bool(resolved_speaker_token):
+            raise ValueError(
+                "Both XSA_RELAY_HOST_TOKEN and XSA_RELAY_SPEAKER_TOKEN must be set together "
+                "when using split role tokens."
+            )
         self._host_token = resolved_host_token or legacy_token
         self._speaker_token = resolved_speaker_token or legacy_token
         self._allow_insecure_no_auth = allow_insecure_no_auth
@@ -107,6 +132,12 @@ class RelayServer:
         self._auth_fail_limit = max(1, int(auth_fail_limit))
         self._auth_fail_window_sec = max(1.0, float(auth_fail_window_sec))
         self._auth_ban_sec = max(1.0, float(auth_ban_sec))
+        self._max_tracked_ips = 4096
+        self._trusted_proxies = (
+            _parse_trusted_proxies(os.environ.get("XSA_RELAY_TRUSTED_PROXIES"))
+            if trusted_proxies is None
+            else frozenset(p.strip() for p in trusted_proxies if p.strip())
+        )
         self._auth_failures: dict[str, deque[float]] = {}
         self._banned_until: dict[str, float] = {}
         self._speaker: ServerConnection | None = None
@@ -127,6 +158,29 @@ class RelayServer:
             and not hmac.compare_digest(self._host_token, self._speaker_token)
         )
 
+    def _prune_rate_tables(self, now: float) -> None:
+        cutoff = now - self._auth_fail_window_sec
+        expired_bans = [ip for ip, until in self._banned_until.items() if now >= until]
+        for ip in expired_bans:
+            self._banned_until.pop(ip, None)
+        if len(self._banned_until) >= self._max_tracked_ips:
+            # Evict the soonest-to-expire entries to bound memory without dropping fresh bans.
+            overflow = len(self._banned_until) - self._max_tracked_ips + 1
+            for ip, _ in sorted(self._banned_until.items(), key=lambda kv: kv[1])[:overflow]:
+                self._banned_until.pop(ip, None)
+
+        stale_failures = [
+            ip for ip, q in self._auth_failures.items() if not q or q[-1] < cutoff
+        ]
+        for ip in stale_failures:
+            self._auth_failures.pop(ip, None)
+        if len(self._auth_failures) >= self._max_tracked_ips:
+            overflow = len(self._auth_failures) - self._max_tracked_ips + 1
+            for ip, _ in sorted(
+                self._auth_failures.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
+            )[:overflow]:
+                self._auth_failures.pop(ip, None)
+
     def _is_banned(self, ip: str, now: float) -> bool:
         until = self._banned_until.get(ip)
         if until is None:
@@ -137,10 +191,10 @@ class RelayServer:
         return True
 
     def _record_auth_failure(self, ip: str, now: float) -> bool:
+        if len(self._auth_failures) >= self._max_tracked_ips or len(self._banned_until) >= self._max_tracked_ips:
+            self._prune_rate_tables(now)
         q = self._auth_failures.get(ip)
         if q is None:
-            if len(self._auth_failures) > 4096:
-                self._auth_failures.clear()
             q = deque()
             self._auth_failures[ip] = q
         cutoff = now - self._auth_fail_window_sec
@@ -206,7 +260,7 @@ class RelayServer:
         return None
 
     async def _handle_connection(self, conn: ServerConnection) -> None:
-        ip = _client_ip(conn)
+        ip = _client_ip(conn, self._trusted_proxies)
         now = time.monotonic()
         if self._is_banned(ip, now):
             logger.warning("Rejected rate-limited connection from %s", ip)
@@ -219,11 +273,21 @@ class RelayServer:
         elif path in {"/ws/host", "/xsa/ws/host"}:
             role = "host"
         else:
-            # Verify host token before revealing 404 so unauthenticated scanners always see 4401.
-            if not self._is_authorized(conn, role="host", allow_query_token=False):
-                self._record_auth_failure(ip, now)
-                logger.warning("Rejected unauthorized connection from %s", ip)
-                await conn.close(code=CLOSE_UNAUTHORIZED, reason="Unauthorized")
+            # Verify Bearer auth (either role) before revealing 404 so unauthenticated scanners always see 4401.
+            authed = self._is_authorized(conn, role="host", allow_query_token=False) or self._is_authorized(
+                conn, role="speaker", allow_query_token=False
+            )
+            if not authed:
+                banned = self._record_auth_failure(ip, now)
+                logger.warning(
+                    "Rejected unauthorized connection from %s%s",
+                    ip,
+                    " (IP rate-limited)" if banned else "",
+                )
+                await conn.close(
+                    code=CLOSE_RATE_LIMITED if banned else CLOSE_UNAUTHORIZED,
+                    reason="Too Many Requests" if banned else "Unauthorized",
+                )
                 return
             logger.warning("Rejected unknown endpoint %r from %s", path, ip)
             await conn.close(code=CLOSE_NOT_FOUND, reason="Not Found")

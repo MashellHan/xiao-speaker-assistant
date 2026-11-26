@@ -90,7 +90,7 @@ while true; do
         continue
     fi
 
-    echo "$(date): starting {binary_name} -> $(printf '%s' "$SERVER_URL" | sed 's/token=[^&]*/token=REDACTED/g')" >> "$LOG_FILE"
+    echo "$(date): starting {binary_name} -> $(printf '%s' "$SERVER_URL" | sed 's/token=[^&#]*/token=REDACTED/g')" >> "$LOG_FILE"
     if [ -f "$AGENT_DIR/asound_xsa.conf" ]; then
         export ALSA_CONFIG_PATH="$AGENT_DIR/asound_xsa.conf"
     else
@@ -158,7 +158,7 @@ def build_update_server_url_command(
     q_url = shlex.quote(valid_url)
     return (
         f"mkdir -p {q_dir} && "
-        f"printf '%s\\n' {q_url} > {q_file} && "
+        f"(umask 077 && printf '%s\\n' {q_url} > {q_file}) && "
         f"chmod 600 {q_file}"
     )
 
@@ -244,11 +244,11 @@ def build_status_command(
     q_log = shlex.quote(log_path)
     return (
         'echo "=== Processes ===" && '
-        '(ps w 2>/dev/null || ps) | grep -E "xiaoai-agent|client|boot\\.sh" | grep -v grep || true; '
+        '(ps w 2>/dev/null || ps) | grep -E "xiaoai-agent|client|boot\\.sh" | grep -v grep | sed "s/token=[^&# ]*/token=REDACTED/g" || true; '
         'echo "=== /data Free Space ===" && '
         'df -h /data && '
         'echo "=== server.txt ===" && '
-        f'(sed "s/token=[^&]*/token=REDACTED/g" {q_server} 2>/dev/null || echo "(missing in {q_dir})") && '
+        f'(sed "s/token=[^&#]*/token=REDACTED/g" {q_server} 2>/dev/null || echo "(missing in {q_dir})") && '
         f'echo "=== {log_path} ===" && '
         f'(tail -n {tail_lines} {q_log} 2>/dev/null || echo "(no log)")'
     )

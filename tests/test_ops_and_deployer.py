@@ -241,6 +241,7 @@ def test_server_url_validation_and_remote_commands() -> None:
     assert "ps" in status_cmd
     assert "df -h /data" in status_cmd
     assert "/tmp/xiaoai-agent.log" in status_cmd
+    assert status_cmd.count("token=REDACTED") >= 2
 
     restart_cmd = build_restart_command()
     assert "start-stop-daemon -S -b" in restart_cmd

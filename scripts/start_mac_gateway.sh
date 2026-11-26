@@ -51,11 +51,11 @@ if [ "$LOCAL_BRIDGE" = "1" ]; then
   trap cleanup EXIT INT TERM
   /usr/bin/python3 scripts/tcp_bridge.py --listen-port 4399 --target-port 4398
 else
+  uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
+  SRV_PID=$!
   cleanup() {
-    if [ -n "$MCP_PID" ]; then
-      kill "$MCP_PID" >/dev/null 2>&1 || true
-    fi
+    kill "$SRV_PID" ${MCP_PID:+"$MCP_PID"} >/dev/null 2>&1 || true
   }
   trap cleanup EXIT INT TERM
-  uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+  wait "$SRV_PID"
 fi
