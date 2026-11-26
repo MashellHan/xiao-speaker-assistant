@@ -32,7 +32,7 @@ SAMPLE_RATE = 16000
 VAD_WINDOW_SAMPLES = 512
 
 HI_NOMI_REGEX = re.compile(
-    r"^\s*(?:hi|hey|hello|can|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
+    r"^\s*(?:hi|hey|hello|can|ni|h|i|嗨|哈喽|你好)?\s*[,，.。!！?\s]*"
     r"(?:nomi|nuomi|normi|nami|hnomi|hno\s*米|h\s*no\s*米|know\s*mi|know\s*me|no\s*mi|no\s*me|naomi|noumi|诺米|糯米|闹米|老米|纳米)"
     r"(?:[,，.。!！?\s:]*(.*))?$",
     re.IGNORECASE | re.DOTALL,
@@ -209,7 +209,7 @@ class LocalSpeechPipeline:
     def __init__(self, config: SpeechConfig) -> None:
         import sherpa_onnx
 
-        self._config = config
+        self._config = config.model_copy(deep=True)
         self._lock = threading.RLock()
         models_dir = Path(config.models_dir).expanduser()
 
@@ -394,6 +394,7 @@ class LocalSpeechPipeline:
 
         with self._lock:
             old_cfg = self._config
+            new_config = new_config.model_copy(deep=True)
             self._config = new_config
             models_dir = Path(new_config.models_dir).expanduser()
 

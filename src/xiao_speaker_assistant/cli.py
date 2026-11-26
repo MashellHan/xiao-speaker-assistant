@@ -285,6 +285,21 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             router.reload_runtime_config(active_config)
             router.opencode_session_id = None
 
+    def on_wakewords_changed(
+        local_kw: list[str], en_kw: list[str], en_enabled: bool
+    ) -> None:
+        active_config.speech.local_keywords = list(local_kw)
+        active_config.speech.en_keywords = list(en_kw)
+        active_config.speech.en_kws_enabled = bool(en_enabled)
+        if gateway is not None:
+            snapshot = active_config.model_copy(deep=True)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                gateway.reload_config(snapshot)
+            else:
+                loop.create_task(asyncio.to_thread(gateway.reload_config, snapshot))
+
     def on_reminders_config_changed(enabled: bool, quiet_start: str, quiet_end: str) -> None:
         nonlocal scheduler
         active_config.reminders.enabled = enabled
@@ -327,6 +342,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         on_memory_changed=lambda: router.sync_agent_home() if router is not None else None,
         on_voice_changed=on_voice_changed,
         on_model_changed=on_model_changed,
+        on_wakewords_changed=on_wakewords_changed,
         on_reminders_config_changed=on_reminders_config_changed,
         on_capabilities_changed=on_capabilities_changed,
         config_path=effective_config_path,

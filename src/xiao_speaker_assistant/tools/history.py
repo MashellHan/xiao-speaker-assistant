@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import math
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -193,3 +194,180 @@ class ConversationHistoryStore:
                 "speaker_breakdown": speaker_breakdown,
                 "model_breakdown": model_breakdown,
             }
+
+    def daily_turns(self, *, days: int = 14) -> list[dict[str, Any]]:
+        """Return per-day turn counts and average latency for the last `days` local dates."""
+        n_days = max(1, min(90, int(days)))
+        today = datetime.now().date()
+        date_keys = [(today - timedelta(days=i)).isoformat() for i in range(n_days - 1, -1, -1)]
+        buckets: dict[str, dict[str, Any]] = {
+            d: {"date": d, "turns": 0, "latency_sum": 0.0} for d in date_keys
+        }
+        with self._lock:
+            for entry in self._entries:
+                if entry.timestamp <= 0:
+                    continue
+                try:
+                    ts_sec = entry.timestamp / 1000.0 if entry.timestamp > 1e11 else entry.timestamp
+                    d_str = datetime.fromtimestamp(ts_sec).date().isoformat()
+                except (OverflowError, OSError, ValueError):
+                    continue
+                if d_str in buckets:
+                    buckets[d_str]["turns"] += 1
+                    buckets[d_str]["latency_sum"] += entry.latency_ms
+        return [
+            {
+                "date": d,
+                "turns": buckets[d]["turns"],
+                "avg_latency_ms": round(buckets[d]["latency_sum"] / buckets[d]["turns"], 1)
+                if buckets[d]["turns"] > 0
+                else 0.0,
+            }
+            for d in date_keys
+        ]
+
+
+def read_local_opencode_usage(agent_home: str | Path, *, days: int = 14) -> dict[str, Any]:
+    """Read token counts and cost totals + daily trend from isolated OpenCode SQLite DB (read-only)."""
+    n_days = max(1, min(90, int(days)))
+    today = datetime.now().date()
+    date_keys = [(today - timedelta(days=i)).isoformat() for i in range(n_days - 1, -1, -1)]
+    daily_map: dict[str, dict[str, Any]] = {
+        d: {
+            "date": d,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        }
+        for d in date_keys
+    }
+    empty_result: dict[str, Any] = {
+        "available": False,
+        "total_calls": 0,
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_cost_usd": 0.0,
+        "today_tokens": 0,
+        "today_cost_usd": 0.0,
+        "daily": list(daily_map.values()),
+    }
+
+    db_path = Path(agent_home).expanduser() / "opencode.db"
+    if not db_path.is_file():
+        return empty_result
+
+    def _safe_int(val: Any) -> int:
+        if isinstance(val, bool) or val is None:
+            return 0
+        try:
+            return max(0, int(val))
+        except (TypeError, ValueError):
+            return 0
+
+    def _safe_float(val: Any) -> float:
+        if isinstance(val, bool) or val is None:
+            return 0.0
+        try:
+            out = float(val)
+            return out if math.isfinite(out) and out >= 0.0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    conn: sqlite3.Connection | None = None
+    try:
+        ro_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=1.5)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='session_message'"
+        )
+        if cur.fetchone() is None:
+            return empty_result
+
+        cur.execute(
+            "SELECT time_created, data FROM session_message WHERE type = 'assistant'"
+        )
+        total_calls = 0
+        total_in = 0
+        total_out = 0
+        total_reason = 0
+        total_cache = 0
+        total_cost = 0.0
+
+        for ts_ms, raw_data in cur:
+            if not raw_data:
+                continue
+            try:
+                obj = json.loads(raw_data)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            tokens_obj = obj.get("tokens")
+            cost_val = obj.get("cost")
+            tokens_dict = tokens_obj if isinstance(tokens_obj, dict) else {}
+            if not tokens_dict and cost_val is None:
+                continue
+
+            t_in = _safe_int(tokens_dict.get("input"))
+            t_out = _safe_int(tokens_dict.get("output"))
+            t_reason = _safe_int(tokens_dict.get("reasoning"))
+            cache_obj = tokens_dict.get("cache")
+            t_cache = _safe_int(cache_obj.get("read")) if isinstance(cache_obj, dict) else 0
+            c_usd = _safe_float(cost_val)
+            t_sum = t_in + t_out + t_reason + t_cache
+
+            total_calls += 1
+            total_in += t_in
+            total_out += t_out
+            total_reason += t_reason
+            total_cache += t_cache
+            total_cost += c_usd
+
+            if isinstance(ts_ms, (int, float)) and not isinstance(ts_ms, bool) and ts_ms > 0:
+                try:
+                    ts_sec = ts_ms / 1000.0 if ts_ms > 1e11 else float(ts_ms)
+                    d_str = datetime.fromtimestamp(ts_sec).date().isoformat()
+                except (OverflowError, OSError, ValueError):
+                    continue
+                if d_str in daily_map:
+                    bucket = daily_map[d_str]
+                    bucket["calls"] += 1
+                    bucket["input_tokens"] += t_in
+                    bucket["output_tokens"] += t_out
+                    bucket["reasoning_tokens"] += t_reason
+                    bucket["cache_read_tokens"] += t_cache
+                    bucket["total_tokens"] += t_sum
+                    bucket["cost_usd"] += c_usd
+
+        daily_list = []
+        for d in date_keys:
+            b = daily_map[d]
+            daily_list.append({**b, "cost_usd": round(b["cost_usd"], 6)})
+
+        today_bucket = daily_map[today.isoformat()]
+        return {
+            "available": True,
+            "total_calls": total_calls,
+            "total_tokens": total_in + total_out + total_reason + total_cache,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "reasoning_tokens": total_reason,
+            "cache_read_tokens": total_cache,
+            "total_cost_usd": round(total_cost, 6),
+            "today_tokens": today_bucket["total_tokens"],
+            "today_cost_usd": round(today_bucket["cost_usd"], 6),
+            "daily": daily_list,
+        }
+    except sqlite3.Error:
+        return empty_result
+    finally:
+        if conn is not None:
+            conn.close()

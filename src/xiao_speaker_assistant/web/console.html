@@ -88,53 +88,55 @@
       --shadow-toast: 0 8px 24px rgba(16, 24, 40, 0.16);
       --focus-ring: 0 0 0 3px rgba(29, 95, 214, 0.24);
 
-      --sidebar-width: 256px;
-      --content-max: 1200px;
+      --sidebar-width: 248px;
+      --content-max: 1480px;
       --z-header: 200;
       --z-toast: 500;
     }
 
-    :root[data-theme="dark"] {
-      color-scheme: dark;
-      --color-paper: #101218;
-      --color-surface: #171a22;
-      --color-surface-muted: #1e222d;
-      --color-surface-hover: #252a37;
-      --color-surface-selected: #1b2a44;
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --color-paper: #101218;
+        --color-surface: #171a22;
+        --color-surface-muted: #1e222d;
+        --color-surface-hover: #252a37;
+        --color-surface-selected: #1b2a44;
 
-      --color-text-primary: #f1f3f8;
-      --color-text-secondary: #a8b1c4;
-      --color-text-tertiary: #8d97ad;
+        --color-text-primary: #f1f3f8;
+        --color-text-secondary: #a8b1c4;
+        --color-text-tertiary: #8d97ad;
 
-      --color-border: #282d3b;
-      --color-border-strong: #3c4356;
+        --color-border: #282d3b;
+        --color-border-strong: #3c4356;
 
-      --color-accent: #5b93ff;
-      --color-accent-hover: #74a4ff;
-      --color-accent-soft: #1b2b4a;
-      --color-accent-text: #9bc0ff;
-      --color-accent-ink: #0c1220;
-      --color-on-accent: var(--color-accent-ink);
+        --color-accent: #5b93ff;
+        --color-accent-hover: #74a4ff;
+        --color-accent-soft: #1b2b4a;
+        --color-accent-text: #9bc0ff;
+        --color-accent-ink: #0c1220;
+        --color-on-accent: var(--color-accent-ink);
 
-      --color-success-bg: #173022;
-      --color-success-border: #254d37;
-      --color-success-text: #84d9a0;
+        --color-success-bg: #173022;
+        --color-success-border: #254d37;
+        --color-success-text: #84d9a0;
 
-      --color-warn-bg: #352914;
-      --color-warn-border: #554220;
-      --color-warn-text: #f3c66f;
+        --color-warn-bg: #352914;
+        --color-warn-border: #554220;
+        --color-warn-text: #f3c66f;
 
-      --color-error: #ef6b6b;
-      --color-error-bg: #3a1c1e;
-      --color-error-border: #5c2a2e;
-      --color-error-text: #f9a8a8;
+        --color-error: #ef6b6b;
+        --color-error-bg: #3a1c1e;
+        --color-error-border: #5c2a2e;
+        --color-error-text: #f9a8a8;
 
-      --color-badge-bg: #252a36;
-      --color-badge-text: #c4ccdc;
+        --color-badge-bg: #252a36;
+        --color-badge-text: #c4ccdc;
 
-      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28);
-      --shadow-toast: 0 10px 28px rgba(0, 0, 0, 0.45);
-      --focus-ring: 0 0 0 3px rgba(91, 147, 255, 0.32);
+        --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28);
+        --shadow-toast: 0 10px 28px rgba(0, 0, 0, 0.45);
+        --focus-ring: 0 0 0 3px rgba(91, 147, 255, 0.32);
+      }
     }
 
     *, *::before, *::after { box-sizing: border-box; }
@@ -517,10 +519,10 @@
       border-top: 1px solid var(--color-border);
     }
 
-    /* Metric Strip (4 crisp Astryx stat tiles) */
+    /* Metric Strip (6 crisp Astryx stat tiles: 3x2 on desktop, 2x3 on tablet/phone) */
     .metrics-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: var(--spacing-3);
     }
 
@@ -558,6 +560,135 @@
       font-size: var(--text-xs);
       font-weight: 500;
       color: var(--color-text-tertiary);
+    }
+
+    .stat-sub {
+      font-size: var(--text-xs);
+      color: var(--color-text-tertiary);
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+
+    /* Daily Trend Chart */
+    .trend-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--spacing-1);
+      padding: var(--spacing-0-5);
+      border-radius: var(--radius-element);
+      background: var(--color-surface-muted);
+      border: 1px solid var(--color-border);
+    }
+
+    .trend-seg {
+      min-height: 28px;
+      padding: 0 var(--spacing-3);
+      border: 0;
+      border-radius: var(--radius-inner);
+      background: transparent;
+      color: var(--color-text-secondary);
+      font-size: var(--text-xs);
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+    }
+
+    .trend-seg:hover {
+      color: var(--color-text-primary);
+    }
+
+    .trend-seg[aria-pressed="true"] {
+      background: var(--color-surface);
+      color: var(--color-text-primary);
+      font-weight: 600;
+      box-shadow: var(--shadow-card);
+    }
+
+    .trend-chart-wrap {
+      padding: var(--spacing-4) var(--spacing-5) var(--spacing-5);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-3);
+    }
+
+    .trend-bars {
+      display: grid;
+      grid-template-columns: repeat(14, minmax(0, 1fr));
+      gap: var(--spacing-2);
+      align-items: end;
+      min-height: 156px;
+      padding-top: var(--spacing-4);
+    }
+
+    .trend-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-1);
+      min-width: 0;
+      height: 100%;
+      justify-content: flex-end;
+    }
+
+    .trend-val {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 0.6875rem;
+      color: var(--color-text-secondary);
+      white-space: nowrap;
+    }
+
+    .trend-bar-area {
+      width: 100%;
+      height: 104px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+    }
+
+    .trend-bar {
+      width: 100%;
+      max-width: 28px;
+      min-height: 4px;
+      border-radius: var(--radius-inner) var(--radius-inner) 2px 2px;
+      background: var(--color-accent-soft);
+      border: 1px solid var(--color-border);
+      transition: opacity var(--dur-fast) var(--ease-out);
+    }
+
+    .trend-bar.has-val {
+      background: var(--color-accent);
+      border-color: var(--color-accent);
+    }
+
+    .trend-date {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 0.6875rem;
+      color: var(--color-text-tertiary);
+      white-space: nowrap;
+    }
+
+    .trend-summary-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-3);
+      flex-wrap: wrap;
+      font-size: var(--text-xs);
+      color: var(--color-text-secondary);
+      padding-top: var(--spacing-3);
+      border-top: 1px solid var(--color-border);
+    }
+
+    .wake-inline-check {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--spacing-2);
+      font-size: var(--text-xs);
+      color: var(--color-text-secondary);
+      cursor: pointer;
     }
 
     /* Two-column Workspace */
@@ -1156,6 +1287,18 @@
       .search-input {
         width: 100%;
       }
+      .trend-bars {
+        gap: var(--spacing-1);
+      }
+      .trend-date {
+        font-size: 0.625rem;
+      }
+      .trend-col:nth-child(odd) .trend-date {
+        visibility: hidden;
+      }
+      .trend-val {
+        display: none;
+      }
     }
 
     @media (max-width: 560px) {
@@ -1203,7 +1346,6 @@
         <span class="badge badge--success" id="serverStatus" role="status">
           <span id="serverStatusText">已连接</span>
         </span>
-        <button type="button" class="btn btn--sm" id="themeToggleBtn" aria-label="切换浅色或深色主题">深色</button>
         <button type="button" class="btn btn--sm" id="refreshBtn">刷新</button>
         <button type="button" class="btn btn--sm btn--danger" id="logoutBtn" hidden>退出</button>
       </div>
@@ -1297,20 +1439,54 @@
           <div class="stat-card">
             <span class="stat-label">总对话轮次</span>
             <div class="stat-value"><span class="num" id="statTotalTurns">0</span><span class="stat-unit">轮</span></div>
+            <span class="stat-sub">今日 <span class="num" id="statTurnsTodayInline">0</span> 轮</span>
           </div>
           <div class="stat-card">
             <span class="stat-label">今日对话</span>
             <div class="stat-value"><span class="num" id="statTurnsToday">0</span><span class="stat-unit">轮</span></div>
+            <span class="stat-sub">近 14 日实时记录</span>
           </div>
           <div class="stat-card">
-            <span class="stat-label">平均响应延迟</span>
+            <span class="stat-label">平均 / P95 延迟</span>
             <div class="stat-value"><span class="num" id="statAvgLatency">0</span><span class="stat-unit">ms</span></div>
+            <span class="stat-sub">P95 <span class="num" id="statP95Latency">0</span> ms</span>
           </div>
           <div class="stat-card">
-            <span class="stat-label">P95 响应延迟</span>
-            <div class="stat-value"><span class="num" id="statP95Latency">0</span><span class="stat-unit">ms</span></div>
+            <span class="stat-label">本地模型总 Token</span>
+            <div class="stat-value"><span class="num" id="statTotalTokens">0</span></div>
+            <span class="stat-sub" id="statTokensSub">今日 0 · 输入 0 / 输出 0</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">本地模型估算花费</span>
+            <div class="stat-value"><span class="num" id="statTotalCost">$0.00</span></div>
+            <span class="stat-sub" id="statCostSub">今日 $0.0000 · 共 0 次调用</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">缓存命中 Token</span>
+            <div class="stat-value"><span class="num" id="statCacheTokens">0</span></div>
+            <span class="stat-sub" id="statReasoningSub">思考 Token 0</span>
           </div>
         </div>
+
+        <section class="card" aria-labelledby="heading-trends">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-trends">近 14 日用量与趋势</h2>
+                <span class="card-meta">按日统计本地对话轮次、OpenCode 模型 Token 消耗与估算花费</span>
+              </div>
+            </div>
+            <div class="trend-controls" role="group" aria-label="趋势指标切换">
+              <button type="button" class="trend-seg" data-trend-metric="tokens" aria-pressed="true">Token 趋势</button>
+              <button type="button" class="trend-seg" data-trend-metric="cost" aria-pressed="false">花费趋势</button>
+              <button type="button" class="trend-seg" data-trend-metric="turns" aria-pressed="false">对话轮次</button>
+            </div>
+          </div>
+          <div class="trend-chart-wrap" id="trendChartContainer"></div>
+        </section>
 
         <div class="two-col">
           <div class="stack">
@@ -1320,7 +1496,7 @@
                   <div class="icon-box" aria-hidden="true">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                   </div>
-                  <h2 id="heading-settings">模型与播报热更新</h2>
+                  <h2 id="heading-settings">模型、播报与唤醒词热更新</h2>
                 </div>
                 <span class="card-meta num" id="configPathLabel">config.yaml</span>
               </div>
@@ -1336,12 +1512,32 @@
                       <select id="voiceSelect" name="edge_voice"></select>
                     </div>
                     <div class="field">
-                      <label for="rateInput">播报语速</label>
-                      <input id="rateInput" name="edge_rate" type="text" placeholder="+8%" autocomplete="off">
+                      <label for="rateSelect">播报语速（5 档）</label>
+                      <select id="rateSelect" name="edge_rate">
+                        <option value="-15%">较慢 (-15%)</option>
+                        <option value="-5%">略慢 (-5%)</option>
+                        <option value="+0%">标准 (0%)</option>
+                        <option value="+8%">轻快 (+8% · 默认)</option>
+                        <option value="+20%">快速 (+20%)</option>
+                      </select>
+                    </div>
+                    <div class="field field--full">
+                      <label for="localKeywordsInput">中文唤醒词（逗号分隔）</label>
+                      <input id="localKeywordsInput" name="local_keywords" type="text" placeholder="糯米糯米, 诺米诺米" autocomplete="off">
+                    </div>
+                    <div class="field field--full">
+                      <div style="display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-2); flex-wrap: wrap;">
+                        <label for="enKeywordsInput">英文唤醒词（逗号分隔，自动大写）</label>
+                        <label class="wake-inline-check">
+                          <input id="enKwsEnabledCheck" type="checkbox" checked>
+                          <span>启用英文 KWS</span>
+                        </label>
+                      </div>
+                      <input id="enKeywordsInput" name="en_keywords" type="text" placeholder="HEY NUOMI, HEY NOMI, HI NOMI, HI NUOMI, HI NAOMI, NI NAOMI" autocomplete="off">
                     </div>
                   </div>
                   <div class="form-footer">
-                    <span class="card-meta">保存后原子写入配置文件，也可以对音箱说“切到 GPT 6.2”或“换晓伊声音”</span>
+                    <span class="card-meta">保存后原子写入配置文件并热重载本地 KWS，也可以直接语音切换模型和音色</span>
                     <button type="submit" class="btn btn--primary" id="saveSettingsBtn">保存并热更新</button>
                   </div>
                 </form>
@@ -1631,27 +1827,25 @@
         voiceprints: [],
         reminders: [],
         activeTab: "overview",
+        trendMetric: "tokens",
         authRequired: false,
         openGroups: new Set(["memories", "voiceprints", "reminders"]),
       };
 
       const $ = (id) => document.getElementById(id);
 
-      function applyTheme(theme) {
-        const next = theme === "dark" ? "dark" : "light";
-        document.documentElement.setAttribute("data-theme", next);
-        $("themeToggleBtn").textContent = next === "dark" ? "浅色" : "深色";
-        try { localStorage.setItem("xsa_console_theme", next); } catch {}
+      function formatCompactNum(val) {
+        const n = Number(val) || 0;
+        if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+        if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+        if (n >= 1_000) return `${(n / 1_000).toFixed(2)}k`;
+        return String(Math.round(n));
       }
-      try {
-        applyTheme(localStorage.getItem("xsa_console_theme") || "light");
-      } catch {
-        applyTheme("light");
+
+      function formatUsd(val, digits = 2) {
+        const n = Number(val) || 0;
+        return `$${n.toFixed(digits)}`;
       }
-      $("themeToggleBtn").addEventListener("click", () => {
-        const cur = document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
-        applyTheme(cur === "dark" ? "light" : "dark");
-      });
 
       function escapeHtml(raw) {
         const s = String(raw ?? "");
@@ -1772,18 +1966,107 @@
         syncGroupsUI();
       });
 
+      function renderTrendChart(data) {
+        const metric = state.trendMetric;
+        document.querySelectorAll("[data-trend-metric]").forEach((btn) => {
+          btn.setAttribute("aria-pressed", btn.getAttribute("data-trend-metric") === metric ? "true" : "false");
+        });
+        const usageDaily = (data.usage && Array.isArray(data.usage.daily)) ? data.usage.daily : [];
+        const turnDaily = Array.isArray(data.daily_turns) ? data.daily_turns : [];
+        const rows = metric === "turns" ? turnDaily : usageDaily;
+        if (!rows.length) {
+          $("trendChartContainer").innerHTML = `<div class="empty-state">暂无近 14 日趋势数据。</div>`;
+          return;
+        }
+        const values = rows.map((r) => {
+          if (metric === "turns") return Number(r.turns) || 0;
+          if (metric === "cost") return Number(r.cost_usd) || 0;
+          return Number(r.total_tokens) || 0;
+        });
+        const maxVal = Math.max(...values, 0);
+        const totalVal = values.reduce((a, b) => a + b, 0);
+        const activeDays = values.filter((v) => v > 0).length;
+
+        const fmtVal = (v) => {
+          if (v <= 0) return "";
+          if (metric === "cost") return v >= 0.01 ? `$${v.toFixed(2)}` : `$${v.toFixed(3)}`;
+          if (metric === "tokens") return formatCompactNum(v);
+          return String(v);
+        };
+
+        const summaryLabel =
+          metric === "cost"
+            ? (!data.usage?.available
+                ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
+                : `近 14 日累计估算花费 ${formatUsd(totalVal, 4)} · 活跃 ${activeDays} 天`)
+            : metric === "tokens"
+              ? (!data.usage?.available
+                  ? "暂未检测到本机 OpenCode 用量数据库，对话后自动记录"
+                  : `近 14 日累计消耗 ${formatCompactNum(totalVal)} Token · 活跃 ${activeDays} 天`)
+              : `近 14 日累计对话 ${totalVal} 轮 · 活跃 ${activeDays} 天`;
+
+        $("trendChartContainer").innerHTML = `
+          <div class="trend-bars">
+            ${rows
+              .map((r, idx) => {
+                const v = values[idx];
+                const hPct = maxVal > 0 && v > 0 ? Math.max(8, Math.round((v / maxVal) * 100)) : 4;
+                const shortDate = String(r.date || "").slice(5);
+                const tip =
+                  metric === "cost"
+                    ? `${r.date}: ${formatUsd(v, 4)} (${r.calls || 0} 次调用)`
+                    : metric === "tokens"
+                      ? `${r.date}: ${v.toLocaleString()} tokens (${r.calls || 0} 次调用)`
+                      : `${r.date}: ${v} 轮对话`;
+                return `
+                  <div class="trend-col" title="${escapeHtml(tip)}">
+                    <span class="trend-val">${escapeHtml(fmtVal(v))}</span>
+                    <div class="trend-bar-area">
+                      <div class="trend-bar ${v > 0 ? "has-val" : ""}" style="height: ${hPct}%"></div>
+                    </div>
+                    <span class="trend-date">${escapeHtml(shortDate)}</span>
+                  </div>
+                `;
+              })
+              .join("")}
+          </div>
+          <div class="trend-summary-row">
+            <span class="num">${escapeHtml(summaryLabel)}</span>
+            <span>数据来源：本机 history.json 与隔离 OpenCode SQLite</span>
+          </div>
+        `;
+      }
+
+      document.querySelectorAll("[data-trend-metric]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.trendMetric = btn.getAttribute("data-trend-metric") || "tokens";
+          if (state.overview) renderTrendChart(state.overview);
+        });
+      });
+
       function renderOverview(data) {
         state.overview = data;
         $("assistantTitle").textContent = `${data.assistant_name || "Nomi"} 控制台`;
         const stats = data.stats || {};
+        const usage = data.usage || {};
         $("statTotalTurns").textContent = String(stats.total_turns ?? 0);
         $("statTurnsToday").textContent = String(stats.turns_today ?? 0);
+        $("statTurnsTodayInline").textContent = String(stats.turns_today ?? 0);
         $("statAvgLatency").textContent = String(stats.avg_latency_ms ?? 0);
         $("statP95Latency").textContent = String(stats.p95_latency_ms ?? 0);
+        $("statTotalTokens").textContent = formatCompactNum(usage.total_tokens || 0);
+        $("statTokensSub").textContent = `今日 ${formatCompactNum(usage.today_tokens || 0)} · 输入 ${formatCompactNum(usage.input_tokens || 0)} / 输出 ${formatCompactNum(usage.output_tokens || 0)}`;
+        $("statTotalCost").textContent = formatUsd(usage.total_cost_usd || 0, (usage.total_cost_usd || 0) >= 1 ? 2 : 4);
+        $("statCostSub").textContent = `今日 ${formatUsd(usage.today_cost_usd || 0, 4)} · 共 ${usage.total_calls || 0} 次调用`;
+        $("statCacheTokens").textContent = formatCompactNum(usage.cache_read_tokens || 0);
+        $("statReasoningSub").textContent = `思考 Token ${formatCompactNum(usage.reasoning_tokens || 0)}`;
+
         $("configPathLabel").textContent = data.config_path || "config.yaml";
         $("ttsProviderBadge").textContent = `${data.tts_provider || "edge"} · ${data.speaker_model || "OH2P"}`;
         $("sidebarModelLabel").textContent = data.model || "—";
         $("sidebarVoiceLabel").textContent = `${data.voice_name || data.voice || "—"} (${data.rate || "+8%"})`;
+
+        renderTrendChart(data);
 
         const modelSel = $("modelSelect");
         const models = data.available_models || [];
@@ -1798,11 +2081,28 @@
           .map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)} · ${escapeHtml(v.style)}</option>`)
           .join("");
         if (data.voice) voiceSel.value = data.voice;
-        $("rateInput").value = data.rate || "+8%";
 
-        const wakeLocal = (data.wakewords?.local || []).join(" / ") || "—";
+        const rateSel = $("rateSelect");
+        rateSel.querySelectorAll("option[data-custom-rate]").forEach((el) => el.remove());
+        const currentRate = data.rate || "+8%";
+        if (![...rateSel.options].some((o) => o.value === currentRate)) {
+          const opt = document.createElement("option");
+          opt.value = currentRate;
+          opt.setAttribute("data-custom-rate", "1");
+          opt.textContent = `自定义 (${currentRate})`;
+          rateSel.appendChild(opt);
+        }
+        rateSel.value = currentRate;
+
+        const localKws = data.wakewords?.local || [];
+        const enKws = data.wakewords?.english || [];
+        $("localKeywordsInput").value = localKws.join(", ");
+        $("enKeywordsInput").value = enKws.join(", ");
+        $("enKwsEnabledCheck").checked = Boolean(data.wakewords?.en_kws_enabled ?? true);
+
+        const wakeLocal = localKws.join(" / ") || "—";
         const wakeEn = data.wakewords?.en_kws_enabled
-          ? ((data.wakewords?.english || []).join(" / ") || "已启用")
+          ? (enKws.join(" / ") || "已启用")
           : "已关闭";
         const rows = [
           ["当前模型", `<span class="num">${escapeHtml(data.model)}</span>`],
@@ -2109,7 +2409,10 @@
         const payload = {
           model: $("modelSelect").value,
           edge_voice: $("voiceSelect").value,
-          edge_rate: $("rateInput").value.trim(),
+          edge_rate: $("rateSelect").value,
+          local_keywords: $("localKeywordsInput").value.trim(),
+          en_keywords: $("enKeywordsInput").value.trim(),
+          en_kws_enabled: $("enKwsEnabledCheck").checked,
         };
         try {
           const res = await apiFetch("/api/settings", {

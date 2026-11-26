@@ -794,3 +794,167 @@ def test_web_console_reminders_crud_and_capability_toggles(tmp_path: Path) -> No
             await runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_web_console_daily_trends_opencode_usage_and_wakewords_update(tmp_path: Path) -> None:
+    import sqlite3
+
+    agent_home = tmp_path / "agent-home"
+    agent_home.mkdir(parents=True)
+    db_path = agent_home / "opencode.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE session_message (seq INTEGER, type TEXT, time_created INTEGER, data TEXT)"
+    )
+    now_ms = int(time.time() * 1000)
+    yesterday_ms = now_ms - 86400 * 1000
+    conn.execute(
+        "INSERT INTO session_message VALUES (1, 'assistant', ?, ?)",
+        (
+            now_ms,
+            json.dumps(
+                {
+                    "cost": 0.0125,
+                    "tokens": {"input": 1200, "output": 80, "reasoning": 20, "cache": {"read": 500}},
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES (2, 'assistant', ?, ?)",
+        (
+            yesterday_ms,
+            json.dumps(
+                {
+                    "cost": 0.0050,
+                    "tokens": {"input": 600, "output": 40, "reasoning": 10, "cache": {"read": 200}},
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {"llm": {"providers": {"opencode": {"agent_home": str(agent_home)}}}},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    # Verify expanded English default wakewords include HI NOMI, HI NUOMI, HI NAOMI, NI NAOMI
+    for phrase in ("HI NOMI", "HI NUOMI", "HI NAOMI", "NI NAOMI"):
+        assert phrase in cfg.speech.en_keywords
+
+    wake_updates: list[tuple[list[str], list[str], bool]] = []
+    hist_store = ConversationHistoryStore(tmp_path / "history.json")
+    hist_store.record("你好", "在呢", latency_ms=150.0, model="raven/gemini-4-hydrogen#low")
+
+    srv = McpServer(
+        cfg,
+        history_store=hist_store,
+        config_path=cfg_path,
+        on_wakewords_changed=lambda loc, en, en_on: wake_updates.append((loc, en, en_on)),
+        include_local_tools=True,
+    )
+
+    async def run() -> None:
+        runner, port = await srv.start_http_server(host="127.0.0.1", port=0, auth_token="tok")
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                ov = (await client.get(f"{base}/api/overview")).json()
+                assert len(ov["daily_turns"]) == 14
+                assert ov["daily_turns"][-1]["turns"] == 1
+                usage = ov["usage"]
+                assert usage["available"] is True
+                assert usage["total_calls"] == 2
+                assert usage["total_tokens"] == (1200 + 80 + 20 + 500) + (600 + 40 + 10 + 200)
+                assert usage["today_tokens"] == 1800
+                assert abs(usage["total_cost_usd"] - 0.0175) < 1e-6
+                assert len(usage["daily"]) == 14
+
+                # Update wakewords + rate via POST /api/settings
+                upd = await client.post(
+                    f"{base}/api/settings",
+                    json={
+                        "edge_rate": "+20%",
+                        "local_keywords": "糯米糯米, 小糯米",
+                        "en_keywords": "hi nomi, hi nuomi, ni naomi",
+                        "en_kws_enabled": True,
+                    },
+                )
+                assert upd.status_code == 200
+                body = upd.json()
+                assert body["edge_rate"] == "+20%"
+                assert body["wakewords"] == {
+                    "local": ["糯米糯米", "小糯米"],
+                    "english": ["HI NOMI", "HI NUOMI", "NI NAOMI"],
+                    "en_kws_enabled": True,
+                }
+                assert wake_updates == [
+                    (["糯米糯米", "小糯米"], ["HI NOMI", "HI NUOMI", "NI NAOMI"], True)
+                ]
+                reloaded = load_config(cfg_path)
+                assert reloaded.speech.local_keywords == ["糯米糯米", "小糯米"]
+                assert reloaded.speech.en_keywords == ["HI NOMI", "HI NUOMI", "NI NAOMI"]
+
+                # Empty local_keywords rejected cleanly
+                bad = await client.post(f"{base}/api/settings", json={"local_keywords": " , "})
+                assert bad.status_code == 400
+
+                # Empty en_keywords rejected when en_kws_enabled=True, allowed when disabled
+                bad_en = await client.post(
+                    f"{base}/api/settings",
+                    json={"en_keywords": "", "en_kws_enabled": True},
+                )
+                assert bad_en.status_code == 400
+                ok_en_off = await client.post(
+                    f"{base}/api/settings",
+                    json={"en_keywords": "", "en_kws_enabled": False},
+                )
+                assert ok_en_off.status_code == 200
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_read_local_opencode_usage_handles_malformed_rows_and_missing_db(tmp_path: Path) -> None:
+    import sqlite3
+    from xiao_speaker_assistant.tools.history import read_local_opencode_usage
+
+    # Missing DB returns available=False cleanly
+    missing = read_local_opencode_usage(tmp_path / "does-not-exist")
+    assert missing["available"] is False
+    assert len(missing["daily"]) == 14
+
+    # Malformed rows (bad JSON, non-dict tokens, non-numeric cost, huge timestamp) never crash
+    ah = tmp_path / "weird#dir?1"
+    ah.mkdir(parents=True)
+    conn = sqlite3.connect(ah / "opencode.db")
+    conn.execute("CREATE TABLE session_message (seq INTEGER, type TEXT, time_created INTEGER, data TEXT)")
+    now_sec = int(time.time())
+    conn.execute("INSERT INTO session_message VALUES (1, 'assistant', ?, ?)", (now_sec, "{not json"))
+    conn.execute(
+        "INSERT INTO session_message VALUES (2, 'assistant', ?, ?)",
+        (now_sec, json.dumps({"cost": "N/A", "tokens": ["not", "a", "dict"]})),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES (3, 'assistant', ?, ?)",
+        (99999999999999999, json.dumps({"cost": 0.01, "tokens": {"input": 100, "output": 20}})),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES (4, 'assistant', ?, ?)",
+        (now_sec, json.dumps({"cost": 0.02, "tokens": {"input": 300, "output": 50}})),
+    )
+    conn.commit()
+    conn.close()
+
+    usage = read_local_opencode_usage(ah, days=7)
+    assert usage["available"] is True
+    assert usage["total_tokens"] == 470
+    assert usage["today_tokens"] == 350
+    assert len(usage["daily"]) == 7
