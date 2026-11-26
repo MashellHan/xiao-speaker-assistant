@@ -12,7 +12,14 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from xiao_speaker_assistant.config import AppConfig
-from xiao_speaker_assistant.voice.relay_client import RelayHostClient, normalize_host_ws_url
+from xiao_speaker_assistant.tools.history import ConversationHistoryStore
+from xiao_speaker_assistant.tools.mcp_server import McpServer
+from xiao_speaker_assistant.voice.relay_client import (
+    RelayConsoleClient,
+    RelayHostClient,
+    normalize_console_ws_url,
+    normalize_host_ws_url,
+)
 from xiao_speaker_assistant.voice.ws_server import SpeakerGateway
 
 
@@ -485,5 +492,333 @@ def test_relay_host_client_reconnects_with_backoff() -> None:
             await asyncio.wait_for(task, timeout=3.0)
             if relay is not None:
                 await relay.close()
+
+    asyncio.run(scenario())
+
+
+def test_normalize_console_ws_url() -> None:
+    assert normalize_console_ws_url("wss://relay.example.com") == "wss://relay.example.com/ws/console"
+    assert (
+        normalize_console_ws_url("wss://relay.example.com/ws/host")
+        == "wss://relay.example.com/ws/console"
+    )
+    assert (
+        normalize_console_ws_url("wss://relay.example.com/xsa/ws/host")
+        == "wss://relay.example.com/xsa/ws/console"
+    )
+    assert (
+        normalize_console_ws_url("wss://relay.example.com/xsa")
+        == "wss://relay.example.com/xsa/ws/console"
+    )
+    assert (
+        normalize_console_ws_url("wss://relay.example.com/xsa/ws/console")
+        == "wss://relay.example.com/xsa/ws/console"
+    )
+    with pytest.raises(ValueError):
+        normalize_console_ws_url("https://relay.example.com")
+
+
+def test_console_ws_auth_requires_host_token_only() -> None:
+    host_tok = "host-console-secret"
+    spk_tok = "speaker-only-secret"
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            console_port=0,
+            host_token=host_tok,
+            speaker_token=spk_tok,
+        ) as relay:
+            base = f"ws://127.0.0.1:{relay.bound_port}"
+            # Speaker token and query-param token MUST NOT authenticate /ws/console
+            await _expect_close_code(
+                f"{base}/xsa/ws/console",
+                4401,
+                headers={"Authorization": f"Bearer {spk_tok}"},
+            )
+            await _expect_close_code(
+                f"{base}/xsa/ws/console?token={host_tok}",
+                4401,
+            )
+            async with websockets.connect(
+                f"{base}/xsa/ws/console",
+                additional_headers={"Authorization": f"Bearer {host_tok}"},
+            ):
+                pass
+
+    asyncio.run(scenario())
+
+
+def test_console_relay_e2e_auth_cookie_mcp_block_and_xff_rate_limit(tmp_path: Path) -> None:
+    import httpx
+
+    host_tok = "host-secret-console"
+    spk_tok = "speaker-secret-console"
+    console_pwd = "super-secret-console-password"
+
+    async def scenario() -> None:
+        cfg = AppConfig()
+        cfg.memory.file_path = str(tmp_path / "memories.json")
+        cfg.reminders.file_path = str(tmp_path / "reminders.json")
+        cfg.speech.speaker_profiles_file = str(tmp_path / "speakers.json")
+        mcp = McpServer(
+            cfg,
+            history_store=ConversationHistoryStore(tmp_path / "history.jsonl"),
+            reminders_path=tmp_path / "reminders.json",
+            console_password=console_pwd,
+        )
+        runner, mcp_port = await mcp.start_http_server(
+            host="127.0.0.1",
+            port=0,
+            auth_token="internal-mcp-token",
+            console_password=console_pwd,
+        )
+        try:
+            async with relay_mod.RelayServer(
+                host="127.0.0.1",
+                port=0,
+                console_port=0,
+                host_token=host_tok,
+                speaker_token=spk_tok,
+                trusted_proxies={"127.0.0.1"},
+            ) as relay:
+                assert relay.bound_console_port is not None
+                console_base = f"http://127.0.0.1:{relay.bound_console_port}"
+
+                async with httpx.AsyncClient() as client:
+                    # Before Mac connects: /healthz reports offline, console returns 503
+                    hz = await client.get(f"{console_base}/healthz")
+                    assert hz.status_code == 200
+                    assert hz.json()["console_connected"] is False
+                    offline = await client.get(f"{console_base}/")
+                    assert offline.status_code == 503
+
+                console_client = RelayConsoleClient(
+                    relay_url=f"ws://127.0.0.1:{relay.bound_port}/xsa/ws/host",
+                    local_console_url=f"http://127.0.0.1:{mcp_port}",
+                    auth_token=host_tok,
+                    initial_backoff=0.05,
+                    max_backoff=0.2,
+                )
+                task = asyncio.create_task(console_client.serve_forever())
+                try:
+                    await console_client.wait_connected(timeout=3.0)
+                    async with httpx.AsyncClient() as client:
+                        # 1. Healthz reports connected
+                        hz2 = await client.get(f"{console_base}/healthz")
+                        assert hz2.status_code == 200
+                        assert hz2.json()["console_connected"] is True
+
+                        # 2. Console HTML loads (200)
+                        idx = await client.get(
+                            f"{console_base}/",
+                            headers={"Host": "nomi.mxhan.com", "X-Forwarded-Proto": "https"},
+                        )
+                        assert idx.status_code == 200
+                        assert "text/html" in idx.headers.get("content-type", "")
+
+                        # 3. /api/auth/status MUST treat tunneled traffic as remote (is_local=False)
+                        st = await client.get(
+                            f"{console_base}/api/auth/status",
+                            headers={"Host": "nomi.mxhan.com", "X-Forwarded-Proto": "https"},
+                        )
+                        assert st.status_code == 200
+                        assert st.json() == {
+                            "authenticated": False,
+                            "auth_required": True,
+                            "is_local": False,
+                        }
+
+                        # 4. Unauthenticated /api/overview -> 401
+                        ov_unauth = await client.get(
+                            f"{console_base}/api/overview",
+                            headers={"Host": "nomi.mxhan.com", "X-Forwarded-Proto": "https"},
+                        )
+                        assert ov_unauth.status_code == 401
+
+                        # 5. /mcp and traversal variants -> 403
+                        for blocked in ("/mcp", "/api/../mcp", "/api/%2e%2e/mcp", "/admin"):
+                            r_blk = await client.post(
+                                f"{console_base}{blocked}",
+                                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                                headers={"Host": "nomi.mxhan.com"},
+                            )
+                            assert r_blk.status_code == 403, f"expected 403 for {blocked}, got {r_blk.status_code}"
+
+                        # 6. Spoofed leftmost X-Forwarded-For MUST NOT bypass login rate limit (5/min)
+                        for idx_fail in range(5):
+                            r_fail = await client.post(
+                                f"{console_base}/api/login",
+                                json={"password": f"wrong-{idx_fail}"},
+                                headers={
+                                    "Host": "nomi.mxhan.com",
+                                    "Origin": "https://nomi.mxhan.com",
+                                    "X-Forwarded-Proto": "https",
+                                    "X-Forwarded-For": f"10.0.0.{idx_fail}, 198.51.100.77",
+                                },
+                            )
+                            assert r_fail.status_code == 401
+                        r_limited = await client.post(
+                            f"{console_base}/api/login",
+                            json={"password": console_pwd},
+                            headers={
+                                "Host": "nomi.mxhan.com",
+                                "Origin": "https://nomi.mxhan.com",
+                                "X-Forwarded-Proto": "https",
+                                "X-Forwarded-For": "10.0.0.99, 198.51.100.77",
+                            },
+                        )
+                        assert r_limited.status_code == 429
+
+                        # 7. Real client IP logs in with console_password, receives HttpOnly+Secure cookie,
+                        #    and can fetch /api/overview (200)
+                        r_login = await client.post(
+                            f"{console_base}/api/login",
+                            json={"password": console_pwd},
+                            headers={
+                                "Host": "nomi.mxhan.com",
+                                "Origin": "https://nomi.mxhan.com",
+                                "X-Forwarded-Proto": "https",
+                                "X-Forwarded-For": "203.0.113.42",
+                            },
+                        )
+                        assert r_login.status_code == 200
+                        set_cookie = r_login.headers.get("set-cookie", "")
+                        assert "xsa_console_session=" in set_cookie
+                        assert "HttpOnly" in set_cookie
+                        assert "Secure" in set_cookie
+                        cookie_pair = set_cookie.split(";", 1)[0]
+
+                        r_ov = await client.get(
+                            f"{console_base}/api/overview",
+                            headers={
+                                "Host": "nomi.mxhan.com",
+                                "X-Forwarded-Proto": "https",
+                                "Cookie": cookie_pair,
+                            },
+                        )
+                        assert r_ov.status_code == 200
+                        assert "capabilities" in r_ov.json()
+                finally:
+                    await console_client.stop()
+                    await asyncio.wait_for(task, timeout=3.0)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_console_client_defense_in_depth_path_filter() -> None:
+    assert RelayConsoleClient._is_path_allowed("/") is True
+    assert RelayConsoleClient._is_path_allowed("/health") is True
+    assert RelayConsoleClient._is_path_allowed("/api/overview?foo=1") is True
+    assert RelayConsoleClient._is_path_allowed("/mcp") is False
+    assert RelayConsoleClient._is_path_allowed("/api/../mcp") is False
+    assert RelayConsoleClient._is_path_allowed("/api/%2e%2e/mcp") is False
+    assert RelayConsoleClient._is_path_allowed("/api/%252e%252e/mcp") is False
+    assert RelayConsoleClient._is_path_allowed("/api/overview#frag") is False
+    assert RelayConsoleClient._is_path_allowed("/api/overview\r\nX-Injected: 1") is False
+    assert RelayConsoleClient._is_path_allowed("http://127.0.0.1:4397/api/overview") is False
+    assert RelayConsoleClient._is_path_allowed("//evil.example/api/overview") is False
+
+
+def test_console_client_canonicalizes_mixed_case_xff_preventing_local_bypass(
+    tmp_path: Path,
+) -> None:
+    import httpx
+
+    console_pwd = "pwd-test-123"
+
+    async def scenario() -> None:
+        cfg = AppConfig()
+        cfg.memory.file_path = str(tmp_path / "memories.json")
+        cfg.reminders.file_path = str(tmp_path / "reminders.json")
+        cfg.speech.speaker_profiles_file = str(tmp_path / "speakers.json")
+        mcp = McpServer(
+            cfg,
+            history_store=ConversationHistoryStore(tmp_path / "history.jsonl"),
+            reminders_path=tmp_path / "reminders.json",
+            console_password=console_pwd,
+        )
+        runner, mcp_port = await mcp.start_http_server(
+            host="127.0.0.1",
+            port=0,
+            auth_token="internal-mcp-token",
+            console_password=console_pwd,
+        )
+        try:
+            sent: list[dict[str, object]] = []
+
+            class DummyWS:
+                async def send(self, msg: str) -> None:
+                    sent.append(json.loads(msg))
+
+            console_client = RelayConsoleClient(
+                relay_url="ws://127.0.0.1:8765/xsa/ws/host",
+                local_console_url=f"http://127.0.0.1:{mcp_port}",
+                auth_token="tok",
+            )
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as http_client:
+                # Simulated misbehaving relay sending empty lowercase x-forwarded-for + loopback Host
+                await console_client._handle_http_request(
+                    DummyWS(),  # type: ignore[arg-type]
+                    http_client,
+                    {
+                        "type": "http_request",
+                        "id": "r-mixed-xff",
+                        "method": "GET",
+                        "path_qs": "/api/auth/status",
+                        "headers": {"Host": "127.0.0.1:4397", "x-forwarded-for": ""},
+                    },
+                )
+            assert len(sent) == 1
+            assert sent[0]["status"] == 200
+            import base64
+
+            body = json.loads(base64.b64decode(str(sent[0]["body_b64"])).decode("utf-8"))
+            assert body == {"authenticated": False, "auth_required": True, "is_local": False}
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_console_connection_replacement_fails_pending_requests_fast() -> None:
+    import httpx
+
+    host_tok = "host-replace-tok"
+
+    async def scenario() -> None:
+        async with relay_mod.RelayServer(
+            host="127.0.0.1",
+            port=0,
+            console_port=0,
+            host_token=host_tok,
+            speaker_token="spk-tok",
+        ) as relay:
+            assert relay.bound_console_port is not None
+            ws_base = f"ws://127.0.0.1:{relay.bound_port}"
+            console_base = f"http://127.0.0.1:{relay.bound_console_port}"
+            headers = {"Authorization": f"Bearer {host_tok}"}
+
+            c1 = await websockets.connect(f"{ws_base}/xsa/ws/console", additional_headers=headers)
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    req_task = asyncio.create_task(client.get(f"{console_base}/api/auth/status"))
+                    # Wait until c1 receives the forwarded http_request, then replace c1 with c2
+                    raw_req = await asyncio.wait_for(c1.recv(), timeout=2.0)
+                    assert '"http_request"' in str(raw_req)
+
+                    c2 = await websockets.connect(
+                        f"{ws_base}/xsa/ws/console", additional_headers=headers
+                    )
+                    try:
+                        resp = await asyncio.wait_for(req_task, timeout=3.0)
+                        assert resp.status_code == 502
+                    finally:
+                        await c2.close()
+            finally:
+                await c1.close()
 
     asyncio.run(scenario())
