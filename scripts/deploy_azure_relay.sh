@@ -24,6 +24,7 @@ VM_TARGET=""
 SSH_KEY=""
 RELAY_BIND="127.0.0.1"
 RELAY_PORT="8765"
+CONSOLE_PORT="8766"
 TRUSTED_PROXIES=""
 PRINT_ACA="false"
 RG="xsa-relay-rg"
@@ -36,6 +37,7 @@ while [ $# -gt 0 ]; do
     --ssh-key) SSH_KEY="$2"; shift 2 ;;
     --bind) RELAY_BIND="$2"; shift 2 ;;
     --port) RELAY_PORT="$2"; shift 2 ;;
+    --console-port) CONSOLE_PORT="$2"; shift 2 ;;
     --trusted-proxies) TRUSTED_PROXIES="$2"; shift 2 ;;
     --print-aca) PRINT_ACA="true"; shift ;;
     --rg) RG="$2"; shift 2 ;;
@@ -95,6 +97,10 @@ if ! [[ "$RELAY_PORT" =~ ^[0-9]+$ ]] || [ "$RELAY_PORT" -lt 1 ] || [ "$RELAY_POR
   echo "ERROR: Invalid --port: $RELAY_PORT" >&2
   exit 2
 fi
+if ! [[ "$CONSOLE_PORT" =~ ^[0-9]+$ ]] || [ "$CONSOLE_PORT" -lt 1 ] || [ "$CONSOLE_PORT" -gt 65535 ]; then
+  echo "ERROR: Invalid --console-port: $CONSOLE_PORT" >&2
+  exit 2
+fi
 if [ -n "$TRUSTED_PROXIES" ] && ! [[ "$TRUSTED_PROXIES" =~ ^[A-Za-z0-9.,:_-]+$ ]]; then
   echo "ERROR: Invalid --trusted-proxies list: $TRUSTED_PROXIES" >&2
   exit 2
@@ -120,6 +126,7 @@ cp "$REPO_ROOT/relay/Dockerfile" "$REPO_ROOT/relay/server.py" "$STAGE_DIR/"
   {
     printf 'RELAY_HOST=0.0.0.0\n'
     printf 'RELAY_PORT=8765\n'
+    printf 'RELAY_CONSOLE_PORT=8766\n'
     printf 'XSA_RELAY_HOST_TOKEN=%s\n' "$HOST_TOK"
     printf 'XSA_RELAY_SPEAKER_TOKEN=%s\n' "$SPK_TOK"
     if [ -n "$TRUSTED_PROXIES" ]; then
@@ -130,8 +137,9 @@ cp "$REPO_ROOT/relay/Dockerfile" "$REPO_ROOT/relay/server.py" "$STAGE_DIR/"
 chmod 600 "$STAGE_DIR/relay.env"
 
 REMOTE_PUBLISH="$(printf '%s:%s:8765' "$RELAY_BIND" "$RELAY_PORT")"
+REMOTE_CONSOLE_PUBLISH="$(printf '127.0.0.1:%s:8766' "$CONSOLE_PORT")"
 # Remote command contains no secrets (relay.env rides inside the tar stream on stdin);
-# REMOTE_PUBLISH is already regex-validated above.
+# REMOTE_PUBLISH / REMOTE_CONSOLE_PUBLISH are already regex-validated above.
 REMOTE_CMD="set -euo pipefail
 sudo mkdir -p /opt/xsa-relay
 sudo rm -f /opt/xsa-relay/._Dockerfile /opt/xsa-relay/._server.py /opt/xsa-relay/._relay.env
@@ -152,8 +160,9 @@ sudo docker run -d \\
   --pids-limit=128 \\
   --env-file /opt/xsa-relay/relay.env \\
   -p '${REMOTE_PUBLISH}' \\
+  -p '${REMOTE_CONSOLE_PUBLISH}' \\
   xsa-relay:latest
-echo 'Relay container running (publish=${REMOTE_PUBLISH}, uid=65532, read-only).'"
+echo 'Relay container running (ws=${REMOTE_PUBLISH}, console=${REMOTE_CONSOLE_PUBLISH}, uid=65532, read-only).'"
 
 COPYFILE_DISABLE=1 tar -C "$STAGE_DIR" -cf - Dockerfile server.py relay.env | \
   ssh "${SSH_ARGS[@]}" "$VM_TARGET" "$REMOTE_CMD"

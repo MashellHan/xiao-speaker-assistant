@@ -4,27 +4,55 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hmac
+import json
 import logging
 import os
+import posixpath
 import sys
 import time
+import uuid
 from collections import deque
 from http import HTTPStatus
 from typing import Any, Literal
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import websockets
 from websockets.asyncio.server import Request, Response, Server, ServerConnection
 
+try:
+    from aiohttp import web as aiohttp_web
+except ImportError:  # pragma: no cover - optional only if console HTTP proxy disabled
+    aiohttp_web = None  # type: ignore[assignment]
+
 logger = logging.getLogger("xsa.relay")
 
-Role = Literal["speaker", "host"]
+Role = Literal["speaker", "host", "console"]
 
 CLOSE_REPLACED = 4000
 CLOSE_UNAUTHORIZED = 4401
 CLOSE_NOT_FOUND = 4404
 CLOSE_RATE_LIMITED = 4429
+
+_ALLOWED_CONSOLE_METHODS = frozenset({"GET", "POST", "DELETE", "HEAD", "OPTIONS"})
+_MAX_CONSOLE_REQ_BYTES = 1 * 1024 * 1024
+# Keep base64-encoded JSON frames safely below the 4 MiB WebSocket max_size limit.
+_MAX_CONSOLE_RESP_BYTES = 2 * 1024 * 1024
+_MAX_PENDING_CONSOLE_REQS = 64
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    }
+)
 
 
 def _read_token_from_env(env_name: str = "XSA_RELAY_TOKEN") -> str | None:
@@ -72,7 +100,13 @@ def _client_ip_from_headers(
 ) -> str:
     if peer not in trusted_proxies or headers is None:
         return peer
-    header_values = headers.get_all("X-Forwarded-For")
+    if hasattr(headers, "get_all"):
+        header_values = headers.get_all("X-Forwarded-For")
+    elif hasattr(headers, "getall"):
+        header_values = headers.getall("X-Forwarded-For", [])
+    else:
+        raw = headers.get("X-Forwarded-For")
+        header_values = [raw] if raw else []
     if not header_values:
         return peer
     # Walk right-to-left: a trusted reverse proxy appends the real peer on the right,
@@ -103,11 +137,12 @@ class RelayServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         *,
+        console_port: int | None = None,
         token: str | None = None,
         host_token: str | None = None,
         speaker_token: str | None = None,
         allow_insecure_no_auth: bool = False,
-        max_size: int | None = 1048576,
+        max_size: int | None = 4 * 1024 * 1024,
         auth_fail_limit: int = 10,
         auth_fail_window_sec: float = 60.0,
         auth_ban_sec: float = 300.0,
@@ -115,6 +150,7 @@ class RelayServer:
     ) -> None:
         self.host = host
         self.port = port
+        self.console_port = console_port
         legacy_token = _read_token_from_env("XSA_RELAY_TOKEN") if token is None else (token.strip() or None)
         resolved_host_token = (
             _read_token_from_env("XSA_RELAY_HOST_TOKEN")
@@ -154,13 +190,21 @@ class RelayServer:
         self._banned_until: dict[str, float] = {}
         self._speaker: ServerConnection | None = None
         self._host_conn: ServerConnection | None = None
+        self._console_conn: ServerConnection | None = None
+        self._pending_console_reqs: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._server: Server | None = None
+        self._console_runner: Any = None
+        self._bound_console_port: int | None = None
 
     @property
     def bound_port(self) -> int:
         if self._server is None or not self._server.sockets:
             return self.port
         return int(self._server.sockets[0].getsockname()[1])
+
+    @property
+    def bound_console_port(self) -> int | None:
+        return self._bound_console_port
 
     @property
     def separate_role_tokens(self) -> bool:
@@ -263,15 +307,23 @@ class RelayServer:
         )
 
     def _get_conn(self, role: Role) -> ServerConnection | None:
-        return self._speaker if role == "speaker" else self._host_conn
+        if role == "speaker":
+            return self._speaker
+        if role == "console":
+            return self._console_conn
+        return self._host_conn
 
     def _set_conn(self, role: Role, conn: ServerConnection | None) -> None:
         if role == "speaker":
             self._speaker = conn
+        elif role == "console":
+            self._console_conn = conn
         else:
             self._host_conn = conn
 
     def _get_peer(self, role: Role) -> ServerConnection | None:
+        if role == "console":
+            return None
         return self._host_conn if role == "speaker" else self._speaker
 
     @staticmethod
@@ -280,6 +332,8 @@ class RelayServer:
             return "speaker"
         if path in {"/ws/host", "/xsa/ws/host"}:
             return "host"
+        if path in {"/ws/console", "/xsa/ws/console"}:
+            return "console"
         return None
 
     def _process_request(
@@ -405,22 +459,188 @@ class RelayServer:
 
         logger.info("Connected %s from %s", role, ip)
         try:
-            async for message in conn:
-                if self._get_conn(role) is not conn:
-                    break
-                peer = self._get_peer(role)
-                if peer is None:
-                    continue
-                try:
-                    await peer.send(message)
-                except websockets.ConnectionClosed:
-                    logger.debug("Peer dropped while forwarding %s message", role)
+            if role == "console":
+                async for message in conn:
+                    if self._get_conn("console") is not conn:
+                        break
+                    if not isinstance(message, str):
+                        continue
+                    try:
+                        payload = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict) or payload.get("type") != "http_response":
+                        continue
+                    req_id = payload.get("id")
+                    fut = (
+                        self._pending_console_reqs.get(req_id)
+                        if isinstance(req_id, str)
+                        else None
+                    )
+                    if fut is not None and not fut.done():
+                        fut.set_result(payload)
+            else:
+                async for message in conn:
+                    if self._get_conn(role) is not conn:
+                        break
+                    peer = self._get_peer(role)
+                    if peer is None:
+                        continue
+                    try:
+                        await peer.send(message)
+                    except websockets.ConnectionClosed:
+                        logger.debug("Peer dropped while forwarding %s message", role)
         except websockets.ConnectionClosed:
             pass
         finally:
             if self._get_conn(role) is conn:
                 self._set_conn(role, None)
+                if role == "console":
+                    for fut in list(self._pending_console_reqs.values()):
+                        if not fut.done():
+                            fut.set_exception(ConnectionError("Console host disconnected"))
             logger.info("Disconnected %s", role)
+
+    @staticmethod
+    def _is_console_path_allowed(raw_path_or_qs: str) -> bool:
+        # Never proxy internal /mcp endpoint or traversal variants over the public console tunnel.
+        parts = urlsplit(raw_path_or_qs)
+        if parts.scheme or parts.netloc:
+            return False
+        raw_path = parts.path
+        if not raw_path.startswith("/") or "\\" in raw_path or "\x00" in raw_path:
+            return False
+        decoded = unquote(raw_path)
+        if "\\" in decoded or "\x00" in decoded:
+            return False
+        if any(seg == ".." for seg in raw_path.split("/")) or any(
+            seg == ".." for seg in decoded.split("/")
+        ):
+            return False
+        normalized = posixpath.normpath(decoded)
+        if not normalized.startswith("/"):
+            return False
+        return normalized == "/" or normalized == "/health" or normalized.startswith("/api/")
+
+    async def _handle_console_http(self, request: Any) -> Any:
+        assert aiohttp_web is not None
+        path = request.path
+        if path == "/healthz":
+            return aiohttp_web.json_response(
+                {"ok": True, "console_connected": self._console_conn is not None}
+            )
+        if not (
+            self._is_console_path_allowed(path)
+            and self._is_console_path_allowed(request.raw_path)
+        ):
+            return aiohttp_web.json_response(
+                {"error": "forbidden", "message": "Path is not exposed via remote console"},
+                status=403,
+            )
+        if request.method not in _ALLOWED_CONSOLE_METHODS:
+            return aiohttp_web.json_response(
+                {"error": "method_not_allowed", "message": "Method not allowed"},
+                status=405,
+            )
+
+        conn = self._console_conn
+        if conn is None:
+            return aiohttp_web.json_response(
+                {"error": "host_offline", "message": "Mac 控制台主机当前未在线，请稍后再试"},
+                status=503,
+            )
+        if len(self._pending_console_reqs) >= _MAX_PENDING_CONSOLE_REQS:
+            return aiohttp_web.json_response(
+                {"error": "service_busy", "message": "控制台并发请求过多，请稍后再试"},
+                status=503,
+            )
+
+        raw_body = await request.read()
+        if len(raw_body) > _MAX_CONSOLE_REQ_BYTES:
+            return aiohttp_web.json_response(
+                {"error": "payload_too_large", "message": "Request body too large"},
+                status=413,
+            )
+
+        peer = str(request.remote or "unknown")
+        from_trusted_proxy = peer in self._trusted_proxies
+        client_ip = _client_ip_from_headers(peer, request.headers, self._trusted_proxies)
+
+        fwd_headers: dict[str, str] = {}
+        for k in ("Host", "Origin", "Content-Type", "Accept", "Authorization"):
+            val = request.headers.get(k)
+            if val is not None:
+                fwd_headers[k] = val
+        cookie_vals = request.headers.getall("Cookie", [])
+        if cookie_vals:
+            fwd_headers["Cookie"] = "; ".join(cookie_vals)
+
+        # Always inject X-Forwarded-For & X-Forwarded-Proto so Mac McpServer treats
+        # tunneled traffic as remote (enforcing console.token login & Secure cookies).
+        # Derive client IP right-to-left via trusted_proxies so spoofed XFF cannot bypass login rate limits.
+        fwd_headers["X-Forwarded-For"] = client_ip or "remote"
+        raw_proto = request.headers.get("X-Forwarded-Proto", "").strip().lower()
+        if from_trusted_proxy and raw_proto in {"http", "https"}:
+            fwd_headers["X-Forwarded-Proto"] = raw_proto
+        else:
+            fwd_headers["X-Forwarded-Proto"] = "https"
+        if from_trusted_proxy and request.headers.get("X-Forwarded-Host"):
+            fwd_headers["X-Forwarded-Host"] = request.headers["X-Forwarded-Host"]
+        elif "Host" in fwd_headers:
+            fwd_headers["X-Forwarded-Host"] = fwd_headers["Host"]
+
+        req_id = uuid.uuid4().hex
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending_console_reqs[req_id] = fut
+        try:
+            frame = {
+                "type": "http_request",
+                "id": req_id,
+                "method": request.method,
+                "path_qs": request.raw_path,
+                "headers": fwd_headers,
+                "body_b64": base64.b64encode(raw_body).decode("ascii") if raw_body else "",
+            }
+            await conn.send(json.dumps(frame, ensure_ascii=False))
+            resp_payload = await asyncio.wait_for(fut, timeout=25.0)
+        except TimeoutError:
+            return aiohttp_web.json_response(
+                {"error": "gateway_timeout", "message": "Mac 控制台响应超时"},
+                status=504,
+            )
+        except Exception:
+            return aiohttp_web.json_response(
+                {"error": "bad_gateway", "message": "Mac 控制台连接中断"},
+                status=502,
+            )
+        finally:
+            self._pending_console_reqs.pop(req_id, None)
+
+        try:
+            status = int(resp_payload.get("status", 502))
+            if not (100 <= status <= 599):
+                raise ValueError("invalid status")
+            body_b64 = str(resp_payload.get("body_b64") or "")
+            body = base64.b64decode(body_b64, validate=True) if body_b64 else b""
+        except Exception:
+            return aiohttp_web.json_response(
+                {"error": "bad_gateway", "message": "Invalid response from console host"},
+                status=502,
+            )
+        if len(body) > _MAX_CONSOLE_RESP_BYTES:
+            return aiohttp_web.json_response(
+                {"error": "bad_gateway", "message": "Response too large"},
+                status=502,
+            )
+        out_headers: list[tuple[str, str]] = []
+        for pair in resp_payload.get("headers") or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            hk, hv = str(pair[0]), str(pair[1])
+            if hk.lower() in _HOP_BY_HOP_HEADERS:
+                continue
+            out_headers.append((hk, hv))
+        return aiohttp_web.Response(status=status, body=body, headers=out_headers)
 
     async def start(self) -> RelayServer:
         if self._server is not None:
@@ -432,6 +652,25 @@ class RelayServer:
             process_request=self._process_request,
             max_size=self._max_size,
         )
+        if self.console_port is not None:
+            if aiohttp_web is None:
+                raise RuntimeError("aiohttp is required when console_port is enabled")
+            app = aiohttp_web.Application(client_max_size=_MAX_CONSOLE_REQ_BYTES + 4096)
+            app.router.add_route("*", "/{tail:.*}", self._handle_console_http)
+            runner = aiohttp_web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = aiohttp_web.TCPSite(runner, self.host, self.console_port)
+            await site.start()
+            self._console_runner = runner
+            if site._server and site._server.sockets:  # type: ignore[attr-defined]
+                self._bound_console_port = int(site._server.sockets[0].getsockname()[1])  # type: ignore[attr-defined]
+            else:
+                self._bound_console_port = self.console_port
+            logger.info(
+                "Console HTTP relay listening on http://%s:%d",
+                self.host,
+                self._bound_console_port,
+            )
         auth_mode = (
             "split-role-tokens"
             if self.separate_role_tokens
@@ -446,7 +685,15 @@ class RelayServer:
         return self
 
     async def close(self) -> None:
-        for role in ("speaker", "host"):
+        for fut in list(self._pending_console_reqs.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("Relay server shutting down"))
+        self._pending_console_reqs.clear()
+        if self._console_runner is not None:
+            await self._console_runner.cleanup()
+            self._console_runner = None
+            self._bound_console_port = None
+        for role in ("speaker", "host", "console"):
             conn = self._get_conn(role)  # type: ignore[arg-type]
             self._set_conn(role, None)  # type: ignore[arg-type]
             if conn is not None:
@@ -474,6 +721,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Xiao Speaker Assistant stateless WebSocket relay")
     parser.add_argument("--host", default=os.environ.get("RELAY_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("RELAY_PORT", "8765")))
+    raw_console_port = os.environ.get("RELAY_CONSOLE_PORT", "").strip()
+    default_console_port = (
+        int(raw_console_port) if raw_console_port.isdigit() and int(raw_console_port) > 0 else None
+    )
+    parser.add_argument(
+        "--console-port",
+        type=int,
+        default=default_console_port,
+        help="Optional HTTP port proxying remote Web Console traffic to `/ws/console` (0 disables)",
+    )
     parser.add_argument(
         "--log-level",
         default=os.environ.get("RELAY_LOG_LEVEL", "INFO"),
@@ -491,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     relay = RelayServer(
         host=args.host,
         port=args.port,
+        console_port=args.console_port if args.console_port and args.console_port > 0 else None,
         allow_insecure_no_auth=_read_bool_env("XSA_RELAY_ALLOW_INSECURE_NO_AUTH", default=False),
     )
     try:

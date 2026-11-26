@@ -616,6 +616,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 on_session_reset=reset_all,
                 token_env=args.relay_token_env,
                 also_serve_local=True,
+                console_local_url=f"http://127.0.0.1:{mcp_port}",
             )
         else:
             await gateway.serve_forever()
