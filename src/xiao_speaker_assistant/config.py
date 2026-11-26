@@ -164,6 +164,7 @@ class ToolsConfig(BaseModel):
         )
     )
     mcp_http_port: int = 4397
+    require_host_voiceprint_for_sensitive_tools: bool = False
 
 
 class PersonaConfig(BaseModel):
@@ -220,6 +221,7 @@ def persist_runtime_settings(
     xiaohongshu_enabled: bool | None = None,
     browser_enabled: bool | None = None,
     outlook_enabled: bool | None = None,
+    require_host_voiceprint: bool | None = None,
 ) -> Path:
     """Atomically update selected runtime fields in `config.yaml` while preserving other sections."""
     target = Path(config_path) if config_path else Path("config.yaml")
@@ -272,7 +274,12 @@ def persist_runtime_settings(
             memory = _ensure_dict(data, "memory")
             memory["enabled"] = bool(memory_enabled)
 
-        if xiaohongshu_enabled is not None or browser_enabled is not None or outlook_enabled is not None:
+        if (
+            xiaohongshu_enabled is not None
+            or browser_enabled is not None
+            or outlook_enabled is not None
+            or require_host_voiceprint is not None
+        ):
             tools = _ensure_dict(data, "tools")
             if xiaohongshu_enabled is not None:
                 xhs = _ensure_dict(tools, "xiaohongshu")
@@ -285,6 +292,8 @@ def persist_runtime_settings(
                 br["enabled"] = bool(browser_enabled)
             if outlook_enabled is not None:
                 _ensure_dict(tools, "outlook")["enabled"] = bool(outlook_enabled)
+            if require_host_voiceprint is not None:
+                tools["require_host_voiceprint_for_sensitive_tools"] = bool(require_host_voiceprint)
 
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)

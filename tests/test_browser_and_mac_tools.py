@@ -527,3 +527,69 @@ def test_mcp_server_registers_and_dispatches_edge_and_mac_tools(
     assert home_blocked is not None
     assert home_blocked["result"]["isError"] is True
     assert json.loads(home_blocked["result"]["content"][0]["text"])["error"] == "access_denied"
+
+
+def test_host_voiceprint_guard_blocks_non_host_and_allows_host(tmp_path: Path) -> None:
+    from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch
+
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    note = desktop / "plan.txt"
+    note.write_text("秘密计划", encoding="utf-8")
+
+    cfg = AppConfig()
+    cfg.tools.require_host_voiceprint_for_sensitive_tools = True
+    server = McpServer(cfg, include_local_tools=True, mac_allowed_roots=[desktop])
+
+    def call_read() -> dict:
+        resp = asyncio.run(
+            server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "mac_read_text_file",
+                        "arguments": {"path": str(note)},
+                    },
+                }
+            )
+        )
+        assert resp is not None
+        return resp["result"]
+
+    # 1. Unknown speaker -> blocked
+    r_unknown = call_read()
+    assert r_unknown["isError"] is True
+    assert json.loads(r_unknown["content"][0]["text"])["error"] == "host_voiceprint_required"
+
+    # 2. Child/guest speaker -> blocked
+    server.set_active_voice_speaker(
+        SpeakerMatch(id="c1", name="拳拳", role="child", style_hint="", score=0.88)
+    )
+    r_child = call_read()
+    assert r_child["isError"] is True
+    assert json.loads(r_child["content"][0]["text"])["error"] == "host_voiceprint_required"
+
+    # 3. Host speaker -> allowed
+    server.set_active_voice_speaker(
+        SpeakerMatch(id="h1", name="大雄", role="host", style_hint="", score=0.91)
+    )
+    r_host = call_read()
+    assert r_host["isError"] is False
+    assert "秘密计划" in r_host["content"][0]["text"]
+
+    # 4. Non-sensitive tool (e.g. speaker_list_voices) remains allowed for child/unknown
+    server.set_active_voice_speaker(None)
+    voices_resp = asyncio.run(
+        server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "tools/call",
+                "params": {"name": "speaker_list_voices", "arguments": {}},
+            }
+        )
+    )
+    assert voices_resp is not None
+    assert voices_resp["result"]["isError"] is False

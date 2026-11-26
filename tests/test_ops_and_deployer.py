@@ -236,6 +236,22 @@ def test_server_url_validation_and_remote_commands() -> None:
     boot_cmd = build_deploy_boot_script_command()
     assert "/data/xiaoai-agent/boot.sh" in boot_cmd
     assert "chmod 755" in boot_cmd
+    assert "start_tunnel_if_configured" in boot_cmd
+    assert "tunnel.conf" in boot_cmd
+
+    from xiao_speaker_assistant.voice.speaker_deployer import (
+        build_deploy_tunnel_config_command,
+        build_upload_tunnel_key_command,
+    )
+
+    tun_cmd = build_deploy_tunnel_config_command("relay.example.com", tunnel_port=2222)
+    assert "TUNNEL_HOST=relay.example.com" in tun_cmd
+    assert "TUNNEL_PORT=2222" in tun_cmd
+    assert "chmod 600" in tun_cmd
+
+    tun_key_cmd = build_upload_tunnel_key_command()
+    assert "tunnel_id_dropbear" in tun_key_cmd
+    assert "chmod 600" in tun_key_cmd
 
     status_cmd = build_status_command()
     assert "ps" in status_cmd

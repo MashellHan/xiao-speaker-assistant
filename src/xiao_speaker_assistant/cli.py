@@ -428,8 +428,15 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     async def handle_query(query: str) -> str:
         t0 = time.monotonic()
+        spk = CURRENT_SPEAKER.get()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
+                if active_config.tools.require_host_voiceprint_for_sensitive_tools and (
+                    spk is None or spk.role.strip().lower() not in {"host", "主人", "owner"}
+                ):
+                    reply = "已开启主人声纹鉴权，需要主人本人语音确认才能发送邮件。"
+                    _record_turn(query, reply, t0)
+                    return reply
                 draft = confirmations.confirm_and_pop()
                 if draft is not None:
                     await outlook_client.send_email(draft)
@@ -442,21 +449,32 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 _record_turn(query, reply, t0)
                 return reply
 
-        spk = CURRENT_SPEAKER.get()
-        reply = await router.ask(
-            query,
-            provider=args.provider,
-            tools=tools,
-            executor=lambda name, t_args: execute_tool(clients, name, t_args),
-            speaker_context=spk.format_context_prefix() if spk is not None else None,
-        )
+        mcp_server.set_active_voice_speaker(spk)
+        try:
+            reply = await router.ask(
+                query,
+                provider=args.provider,
+                tools=tools,
+                executor=lambda name, t_args: execute_tool(clients, name, t_args),
+                speaker_context=spk.format_context_prefix() if spk is not None else None,
+            )
+        finally:
+            mcp_server.set_active_voice_speaker(None)
         _record_turn(query, reply, t0)
         return reply
 
     async def stream_query(query: str):
         t0 = time.monotonic()
+        spk = CURRENT_SPEAKER.get()
         if confirmations.peek() is not None:
             if is_confirm_utterance(query):
+                if active_config.tools.require_host_voiceprint_for_sensitive_tools and (
+                    spk is None or spk.role.strip().lower() not in {"host", "主人", "owner"}
+                ):
+                    reply = "已开启主人声纹鉴权，需要主人本人语音确认才能发送邮件。"
+                    _record_turn(query, reply, t0)
+                    yield reply
+                    return
                 draft = confirmations.confirm_and_pop()
                 if draft is not None:
                     await outlook_client.send_email(draft)
@@ -471,9 +489,9 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 yield reply
                 return
 
-        spk = CURRENT_SPEAKER.get()
         chunks: list[str] = []
         completed = False
+        mcp_server.set_active_voice_speaker(spk)
         try:
             async for sentence in router.stream_ask(
                 query,
@@ -486,6 +504,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 yield sentence
             completed = True
         finally:
+            mcp_server.set_active_voice_speaker(None)
             if completed and chunks:
                 _record_turn(query, "".join(chunks), t0)
 

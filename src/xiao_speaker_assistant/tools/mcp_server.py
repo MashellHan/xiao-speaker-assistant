@@ -55,7 +55,7 @@ from xiao_speaker_assistant.tools.mcp_client import HttpMcpClient
 from xiao_speaker_assistant.tools.memory import MemorySecurityError, MemoryStore
 from xiao_speaker_assistant.tools.outlook import OutlookClient, PendingEmailDraft
 from xiao_speaker_assistant.tools.reminders import ReminderStore
-from xiao_speaker_assistant.voice.speaker_id import SpeakerProfileStore
+from xiao_speaker_assistant.voice.speaker_id import SpeakerMatch, SpeakerProfileStore
 from xiao_speaker_assistant.voice.voice_catalog import (
     EDGE_ZH_VOICES,
     list_voice_profiles_dicts,
@@ -568,6 +568,49 @@ class McpServer:
         self._mac_allowed_roots = mac_allowed_roots
         self._edge_dry_run = edge_dry_run
         self._http_sessions: set[str] = set()
+        self._active_voice_speaker: SpeakerMatch | None = None
+        self._active_voice_speaker_set_at: float = 0.0
+
+    def set_active_voice_speaker(self, speaker: SpeakerMatch | None) -> None:
+        """Record the voiceprint match of the active spoken turn (or None on turn end)."""
+        self._active_voice_speaker = speaker
+        self._active_voice_speaker_set_at = time.monotonic() if speaker is not None else 0.0
+
+    _SENSITIVE_VOICEPRINT_TOOLS: frozenset[str] = frozenset(
+        {
+            "mac_read_text_file",
+            "mac_list_recent_files",
+            "codex_analyze",
+            "outlook_list_emails",
+            "outlook_prepare_email",
+            "outlook_send_email",
+        }
+    )
+
+    def _check_host_voiceprint_guard(self, tool_name: str) -> dict[str, Any] | None:
+        if not self._config.tools.require_host_voiceprint_for_sensitive_tools:
+            return None
+        if tool_name not in self._SENSITIVE_VOICEPRINT_TOOLS:
+            return None
+        spk = self._active_voice_speaker
+        # Expire stale match after 120s so a long-past host turn cannot authorize later calls.
+        if spk is not None and (time.monotonic() - self._active_voice_speaker_set_at) > 120.0:
+            spk = None
+        if spk is not None and spk.role.strip().lower() in {"host", "主人", "owner"}:
+            return None
+        who = f"{spk.name} ({spk.role})" if spk is not None else "未识别声纹"
+        return self._tool_result(
+            {
+                "error": "host_voiceprint_required",
+                "tool": tool_name,
+                "speaker": who,
+                "message": (
+                    f"已开启敏感工具主人声纹鉴权，当前说话人（{who}）无权调用 {tool_name}。"
+                    "请由已注册为 host 角色的主人亲自语音触发。"
+                ),
+            },
+            is_error=True,
+        )
 
     def reload_config(self, new_config: AppConfig) -> None:
         self._config = new_config
@@ -656,6 +699,9 @@ class McpServer:
     async def _dispatch_tool_call(
         self, req_id: Any, name: str, args: dict[str, Any]
     ) -> dict[str, Any]:
+        vp_denied = self._check_host_voiceprint_guard(name)
+        if vp_denied is not None:
+            return self._ok(req_id, vp_denied)
         if name == "outlook_list_emails":
             return self._ok(req_id, await self._call_outlook_list_emails(args))
         if name in {"outlook_prepare_email", "outlook_send_email"}:
@@ -1753,6 +1799,7 @@ class McpServer:
                 "xiaohongshu": bool(cfg.tools.xiaohongshu.enabled),
                 "browser": bool(cfg.tools.browser.enabled),
                 "outlook": bool(cfg.tools.outlook.enabled),
+                "require_host_voiceprint": bool(cfg.tools.require_host_voiceprint_for_sensitive_tools),
             },
             "config_path": str(self._config_path) if self._config_path else "config.yaml",
             "stats": self.history_store.stats(),
@@ -2476,6 +2523,7 @@ class McpServer:
                 "xiaohongshu_enabled",
                 "browser_enabled",
                 "outlook_enabled",
+                "require_host_voiceprint",
             ):
                 if bool_field in body and body[bool_field] is not None:
                     if not isinstance(body[bool_field], bool):
@@ -2530,6 +2578,10 @@ class McpServer:
                 self._config.tools.browser.enabled = updates["browser_enabled"]
             if "outlook_enabled" in updates:
                 self._config.tools.outlook.enabled = updates["outlook_enabled"]
+            if "require_host_voiceprint" in updates:
+                self._config.tools.require_host_voiceprint_for_sensitive_tools = updates[
+                    "require_host_voiceprint"
+                ]
 
             if (
                 any(k in updates for k in ("reminders_enabled", "quiet_start_hhmm", "quiet_end_hhmm"))
@@ -2558,6 +2610,9 @@ class McpServer:
                         "xiaohongshu": bool(self._config.tools.xiaohongshu.enabled),
                         "browser": bool(self._config.tools.browser.enabled),
                         "outlook": bool(self._config.tools.outlook.enabled),
+                        "require_host_voiceprint": bool(
+                            self._config.tools.require_host_voiceprint_for_sensitive_tools
+                        ),
                     },
                     "capabilities": self._build_capabilities(),
                 }
