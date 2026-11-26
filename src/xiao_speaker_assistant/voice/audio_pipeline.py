@@ -317,6 +317,7 @@ class LocalSpeechPipeline:
         self._hp_prev_y: float = 0.0
         self._hp_ref_prev_x: float = 0.0
         self._hp_ref_prev_y: float = 0.0
+        self._last_asr_metrics: dict[str, float] = {}
         self._aec = (
             LinearEchoCanceller()
             if (config.aec_enabled and config.capture_channels >= 2)
@@ -661,18 +662,29 @@ class LocalSpeechPipeline:
         while not self._vad.empty():
             segment = self._vad.front.samples
             self._vad.pop()
+            t_seg_end = time.monotonic()
             text = self._transcribe(segment)
+            asr_ms = round((time.monotonic() - t_seg_end) * 1000.0, 1)
             if not text:
                 continue
 
             emb_list: list[float] | None = None
+            speaker_id_ms: float | None = None
             if self._speaker_id is not None:
+                t_spk = time.monotonic()
                 try:
                     emb = self._speaker_id.extract_embedding(segment)
                     if emb is not None:
                         emb_list = [round(float(x), 6) for x in emb.tolist()]
                 except Exception as exc:
                     logger.debug("Voiceprint extraction failed: %s", exc)
+                speaker_id_ms = round((time.monotonic() - t_spk) * 1000.0, 1)
+
+            self._last_asr_metrics = {
+                "vad_end_mono": t_seg_end,
+                "asr_ms": asr_ms,
+                **({"speaker_id_ms": speaker_id_ms} if speaker_id_ms is not None else {}),
+            }
 
             def _emit_utterance(utterance_text: str) -> None:
                 if on_utterance_embedding is not None:

@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from xiao_speaker_assistant.config import SpeakerConfig
+from xiao_speaker_assistant.tools.history import CURRENT_TURN_TRACE
 from xiao_speaker_assistant.voice.tts_stream import generate_chime_pcm, synthesize_tts_pcm_stream
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,7 @@ class PlaybackController:
         sample_rate = self._effective_sample_rate()
         period_size = int(sample_rate * 0.10) if self._wan_relay else 1200
         buffer_size = self._alsa_buffer_frames()
+        t_start_play = time.monotonic()
         try:
             # Wait for open-xiaoai-client to spawn `aplay` and initialize its `AudioPlayer.sender`
             # channel before sending binary `tag="play"` frames (prevents silent initial drops).
@@ -196,6 +198,9 @@ class PlaybackController:
             except Exception:
                 pass
             return False
+        trace = CURRENT_TURN_TRACE.get()
+        if trace is not None:
+            trace.mark_start_play((time.monotonic() - t_start_play) * 1000.0)
         return True
 
     async def _close_stream(self, *, wait_ack: bool = True) -> None:
@@ -256,6 +261,9 @@ class PlaybackController:
             separators=(",", ":"),
         ).encode("utf-8")
         await self._send_binary(frame)
+        trace = CURRENT_TURN_TRACE.get()
+        if trace is not None:
+            trace.mark_first_audio_sent()
         chunk_dur = len(chunk) / bytes_per_sec
         self._stream_sent_sec += chunk_dur
         self._play_drain_until = max(now, self._play_drain_until) + chunk_dur
@@ -431,6 +439,7 @@ class PlaybackController:
                     # Pipeline start_play RPC with Edge-TTS first-chunk synthesis so the WAN RTT
                     # for `start_play` overlaps with TTS startup instead of adding serially.
                     if not self._stream_open:
+                        t_tts_first = time.monotonic()
                         start_task = asyncio.create_task(self.ensure_stream_started(epoch=epoch))
                         first_task = asyncio.create_task(anext(tts_stream, None))
                         cancel_task = asyncio.create_task(self._cancel_event.wait())
@@ -453,6 +462,9 @@ class PlaybackController:
                                 )
                                 return
                             first_chunk = await first_task
+                            trace = CURRENT_TURN_TRACE.get()
+                            if trace is not None and first_chunk is not None:
+                                trace.mark_tts_first_chunk((time.monotonic() - t_tts_first) * 1000.0)
                         except BaseException:
                             if not first_task.done():
                                 first_task.cancel()

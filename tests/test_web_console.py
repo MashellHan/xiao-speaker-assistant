@@ -958,3 +958,177 @@ def test_read_local_opencode_usage_handles_malformed_rows_and_missing_db(tmp_pat
     assert usage["total_tokens"] == 470
     assert usage["today_tokens"] == 350
     assert len(usage["daily"]) == 7
+
+
+def test_turn_trace_store_strict_ten_cap_permissions_and_console_api(tmp_path: Path) -> None:
+    from xiao_speaker_assistant.tools import TurnTraceStore
+
+    trace_path = tmp_path / "data" / "traces.json"
+    # Even if caller passes max_entries=50, TurnTraceStore strictly caps retention at 10.
+    store = TurnTraceStore(trace_path, max_entries=50)
+    for i in range(15):
+        store.record(
+            query=f"第 {i} 个问题",
+            reply=f"第 {i} 个回答",
+            breakdown_ms={
+                "asr_ms": 48.0 + i,
+                "speaker_id_ms": 14.0,
+                "llm_ttft_ms": 920.0 + i * 10,
+                "llm_total_ms": 1350.0 + i * 10,
+                "start_play_ms": 125.0,
+                "tts_first_chunk_ms": 840.0,
+                "tts_total_ms": 2100.0,
+                "ttfa_ms": 1822.0 + i * 10,
+                "total_ms": 3450.0 + i * 10,
+                "ignored_extra_field": 999.0,
+            },
+            model="raven/gemini-4-hydrogen#low",
+            voice="zh-CN-XiaoyiNeural",
+            speaker_name="大雄",
+            speaker_role="host",
+            transport="wan_relay",
+            sample_rate=16000,
+            sentence_count=2,
+            barge_in=(i == 14),
+            status="ok",
+        )
+
+    assert stat.S_IMODE(trace_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(trace_path.parent.stat().st_mode) == 0o700
+
+    reloaded = TurnTraceStore(trace_path)
+    items = reloaded.list(limit=20)
+    assert len(items) == 10
+    assert items[0].query == "第 14 个问题"
+    assert items[0].barge_in is True
+    assert items[-1].query == "第 5 个问题"
+    assert "ignored_extra_field" not in items[0].breakdown_ms
+    assert items[0].breakdown_ms["ttfa_ms"] == 1962.0
+
+    hist_store = ConversationHistoryStore(tmp_path / "data" / "history.json")
+    now = time.time()
+    hist_store.record("你好", "你好呀", latency_ms=1100.0, timestamp=now)
+    hist_store.record("天气", "晴朗", latency_ms=2600.0, timestamp=now)
+    daily = hist_store.daily_turns(days=14)
+    assert daily[-1]["avg_latency_ms"] == 1850.0
+    assert daily[-1]["p95_latency_ms"] == 2600.0
+
+    cfg = AppConfig()
+    server = McpServer(
+        cfg,
+        history_store=hist_store,
+        trace_store=reloaded,
+        memory_store=MemoryStore(tmp_path / "memory.json"),
+        console_password="remote-secret-password",
+    )
+
+    async def run() -> None:
+        runner, port = await server.start_http_server(host="127.0.0.1", port=0)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                html_resp = await client.get(f"{base}/")
+                assert html_resp.status_code == 200
+                assert 'data-trend-metric="latency"' in html_resp.text
+                assert "recentTracesContainer" in html_resp.text
+                assert "最近 10 次对话 Trace" in html_resp.text
+
+                ov = await client.get(f"{base}/api/overview")
+                assert ov.status_code == 200
+                ov_data = ov.json()
+                assert len(ov_data["recent_traces"]) == 10
+                assert ov_data["recent_traces"][0]["query"] == "第 14 个问题"
+                assert ov_data["daily_turns"][-1]["p95_latency_ms"] == 2600.0
+
+                # Remote forwarded request without auth must get 401 on /api/traces
+                unauth = await client.get(
+                    f"{base}/api/traces",
+                    headers={"X-Forwarded-For": "203.0.113.9"},
+                )
+                assert unauth.status_code == 401
+
+                tr = await client.get(f"{base}/api/traces?limit=5")
+                assert tr.status_code == 200
+                tr_data = tr.json()
+                assert tr_data["count"] == 5
+                assert tr_data["max_traces"] == 10
+
+                del_resp = await client.delete(f"{base}/api/traces")
+                assert del_resp.status_code == 200
+                assert del_resp.json()["cleared"] == 10
+                assert (await client.get(f"{base}/api/traces")).json()["count"] == 0
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_speaker_gateway_records_turn_trace_with_stage_breakdown(tmp_path: Path) -> None:
+    from xiao_speaker_assistant.config import SpeakerConfig
+    from xiao_speaker_assistant.tools import TurnTraceStore
+    from xiao_speaker_assistant.voice.ws_server import SpeakerGateway
+
+    trace_store = TurnTraceStore(tmp_path / "traces.json")
+
+    class FakeConn:
+        remote_address = ("127.0.0.1", 9999)
+
+        async def send(self, raw) -> None:
+            if isinstance(raw, (bytes, bytearray)):
+                return
+            msg = json.loads(raw)
+            req = msg.get("Request") or {}
+            cmd = str(req.get("command") or "")
+            if cmd in {"start_play", "stop_play"} and isinstance(req.get("id"), str):
+                rid = req["id"]
+                asyncio.get_running_loop().call_soon(
+                    lambda r=rid: asyncio.create_task(
+                        gw._handle_text_message(
+                            self,
+                            json.dumps({"Response": {"id": r, "code": 0}}),
+                        )
+                    )
+                )
+
+    async def fake_tts(text: str, cfg: SpeakerConfig, **kwargs):
+        await asyncio.sleep(0.02)
+        yield b"\x02\x00" * 3200
+
+    async def fake_stream_query(query: str):
+        await asyncio.sleep(0.02)
+        yield "今天北京天气晴朗，微风舒适。"
+
+    cfg = AppConfig()
+    cfg.speaker.tts_provider = "edge"
+    gw = SpeakerGateway(cfg, on_stream_query=fake_stream_query, trace_store=trace_store)
+
+    async def run() -> None:
+        conn = FakeConn()
+        gw._relay_connections.add(conn)
+        with (
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw._run_query_and_speak(
+                conn,
+                "今天天气怎么样",
+                asr_metrics={"vad_end_mono": time.monotonic() - 0.08, "asr_ms": 52.3, "speaker_id_ms": 14.1},
+            )
+
+    asyncio.run(run())
+    traces = trace_store.list()
+    assert len(traces) == 1
+    tr = traces[0]
+    assert tr.query == "今天天气怎么样"
+    assert tr.reply == "今天北京天气晴朗，微风舒适。"
+    assert tr.transport == "wan_relay"
+    assert tr.sample_rate == 16000
+    assert tr.sentence_count == 1
+    assert tr.status == "ok"
+    assert tr.breakdown_ms["asr_ms"] == 52.3
+    assert tr.breakdown_ms["speaker_id_ms"] == 14.1
+    assert tr.breakdown_ms["llm_ttft_ms"] >= 15.0
+    assert tr.breakdown_ms["start_play_ms"] >= 0.0
+    assert tr.breakdown_ms["tts_first_chunk_ms"] >= 15.0
+    assert tr.breakdown_ms["ttfa_ms"] >= 80.0
+    assert tr.breakdown_ms["total_ms"] >= tr.breakdown_ms["ttfa_ms"]

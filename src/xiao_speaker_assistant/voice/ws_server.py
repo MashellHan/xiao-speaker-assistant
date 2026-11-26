@@ -21,6 +21,11 @@ from websockets.exceptions import ConnectionClosed
 
 from xiao_speaker_assistant.config import AppConfig, read_env_secret
 from xiao_speaker_assistant.tools.confirmation import is_cancel_utterance, is_confirm_utterance
+from xiao_speaker_assistant.tools.history import (
+    CURRENT_TURN_TRACE,
+    TurnTraceBuilder,
+    TurnTraceStore,
+)
 from xiao_speaker_assistant.voice.audio_pipeline import (
     LocalSpeechPipeline,
     extract_record_pcm_from_binary,
@@ -116,6 +121,7 @@ class SpeakerGateway:
         on_session_reset: Callable[[], None] | None = None,
         *,
         speaker_store: SpeakerProfileStore | None = None,
+        trace_store: TurnTraceStore | None = None,
         audio_watchdog_interval: float = 3.0,
         audio_stall_timeout: float = 4.0,
     ) -> None:
@@ -126,6 +132,7 @@ class SpeakerGateway:
         self._on_stream_query = on_stream_query
         self._on_session_reset = on_session_reset
         self._speaker_store = speaker_store
+        self._trace_store = trace_store
         self._audio_watchdog_interval = audio_watchdog_interval
         self._audio_stall_timeout = audio_stall_timeout
         self._connections: set[ServerConnection] = set()
@@ -489,9 +496,10 @@ class SpeakerGateway:
 
         def on_utterance(text: str, embedding: list[float] | None = None) -> None:
             logger.info("Local ASR recognized: %s", text)
+            metrics = dict(getattr(self._pipeline, "_last_asr_metrics", None) or {})
             loop.call_soon_threadsafe(
-                lambda t=text, emb=embedding: loop.create_task(
-                    self._process_local_utterance(conn, t, embedding=emb)
+                lambda t=text, emb=embedding, m=metrics: loop.create_task(
+                    self._process_local_utterance(conn, t, embedding=emb, asr_metrics=m)
                 )
             )
 
@@ -598,6 +606,7 @@ class SpeakerGateway:
         text: str,
         *,
         embedding: list[float] | None = None,
+        asr_metrics: dict[str, float] | None = None,
     ) -> None:
         sess = self._get_session(conn)
         if self.is_exit_command(text):
@@ -678,7 +687,13 @@ class SpeakerGateway:
                     pass
 
         sess.mute_native_until = time.monotonic() + 10.0
-        await self._run_query_and_speak(conn, text, speaker_match=speaker_match)
+        await self._run_query_and_speak(
+            conn,
+            text,
+            speaker_match=speaker_match,
+            asr_metrics=asr_metrics,
+            barge_in=is_speaking_now,
+        )
 
     async def _handle_text_message(self, conn: Any, raw: str) -> None:
         try:
@@ -849,6 +864,8 @@ class SpeakerGateway:
         query: str,
         *,
         speaker_match: SpeakerMatch | None = None,
+        asr_metrics: dict[str, float] | None = None,
+        barge_in: bool = False,
     ) -> None:
         sess = self._get_session(conn)
         async with sess.query_lock:
@@ -856,23 +873,70 @@ class SpeakerGateway:
             task = asyncio.current_task()
             sess.active_reply_task = task
             token = CURRENT_SPEAKER.set(speaker_match)
+            pb = self._get_playback(conn)
+            now_mono = time.monotonic()
+            vad_end_mono = float(asr_metrics["vad_end_mono"]) if (asr_metrics and "vad_end_mono" in asr_metrics) else now_mono
+            if vad_end_mono > now_mono:
+                vad_end_mono = now_mono
+            active_voice = self._resolve_active_voice_override(conn) or self._config.speaker.edge_voice
+            trace = TurnTraceBuilder(
+                turn_started_mono=vad_end_mono,
+                query_started_mono=now_mono,
+                asr_ms=asr_metrics.get("asr_ms") if asr_metrics else None,
+                speaker_id_ms=asr_metrics.get("speaker_id_ms") if asr_metrics else None,
+                model=self._config.llm.providers.opencode.model,
+                voice=active_voice,
+                transport="wan_relay" if conn in self._relay_connections else "lan",
+                sample_rate=pb.effective_sample_rate,
+                barge_in=barge_in,
+            )
+            trace_token = CURRENT_TURN_TRACE.set(trace)
             try:
                 if self._on_stream_query is not None:
                     await self._run_streaming_reply(conn, query)
+                    if sess.interrupted:
+                        trace.status = "interrupted"
                     return
                 assert self._on_query is not None
                 reply = await self._on_query(query)
+                trace.mark_llm_first_sentence()
+                trace.mark_llm_done()
+                trace.reply_parts.append(reply)
+                trace.sentence_count = 1
                 logger.info("LLM reply: %s", reply)
                 self._record_spoken(sess, reply)
                 sess.mute_native_until = time.monotonic() + 8.0
+                trace.tts_started_mono = time.monotonic()
                 await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
+                trace.tts_done_mono = time.monotonic()
             except asyncio.CancelledError:
+                trace.status = "interrupted"
                 logger.info("Reply task cancelled due to interrupt")
                 raise
             except Exception as exc:
+                trace.status = "error"
                 logger.exception("Error handling query %r", query)
                 await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
             finally:
+                if self._trace_store is not None:
+                    try:
+                        self._trace_store.record(
+                            query=query,
+                            reply="".join(trace.reply_parts),
+                            breakdown_ms=trace.build_breakdown(),
+                            model=trace.model,
+                            voice=trace.voice,
+                            speaker_name=speaker_match.name if speaker_match is not None else "未知",
+                            speaker_role=speaker_match.role if speaker_match is not None else "",
+                            transport=trace.transport,
+                            sample_rate=trace.sample_rate,
+                            sentence_count=trace.sentence_count,
+                            barge_in=trace.barge_in,
+                            status=trace.status,
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed persisting turn trace: %s", exc)
+                CURRENT_TURN_TRACE.reset(trace_token)
                 CURRENT_SPEAKER.reset(token)
                 if self._pipeline is not None and not sess.interrupted:
                     self._pipeline.refresh_activity()
@@ -917,11 +981,16 @@ class SpeakerGateway:
 
         async def producer() -> None:
             emitted = 0
+            trace = CURRENT_TURN_TRACE.get()
             try:
                 async for sentence in self._on_stream_query(query):
                     if not sentence:
                         continue
                     emitted += 1
+                    if trace is not None:
+                        trace.mark_llm_first_sentence()
+                        trace.sentence_count = emitted
+                        trace.reply_parts.append(sentence)
                     pf_task: asyncio.Task[bytes] | None = None
                     # First sentence streams chunk-by-chunk for minimum TTFA; subsequent
                     # sentences prefetch in parallel so there is zero pause between sentences.
@@ -929,7 +998,12 @@ class SpeakerGateway:
                         pf_task = asyncio.create_task(_prefetch_sentence_pcm(sentence))
                         all_prefetch_tasks.append(pf_task)
                     await queue.put((sentence, pf_task))
+                if trace is not None:
+                    trace.mark_llm_done()
             except Exception as exc:
+                if trace is not None:
+                    trace.status = "error"
+                    trace.mark_llm_done()
                 logger.exception("Streaming error for %r", query)
                 await queue.put((f"处理出错了：{exc}", None))
             finally:
@@ -938,6 +1012,7 @@ class SpeakerGateway:
         prod_task = asyncio.create_task(producer())
         first_spoken = True
         completed_normally = False
+        trace = CURRENT_TURN_TRACE.get()
         try:
             while True:
                 if sess.interrupted:
@@ -960,6 +1035,8 @@ class SpeakerGateway:
                 logger.info("Streaming TTS sentence: %s", sentence)
                 self._record_spoken(sess, sentence)
                 sess.mute_native_until = time.monotonic() + 8.0
+                if first_spoken and trace is not None and trace.tts_started_mono is None:
+                    trace.tts_started_mono = time.monotonic()
                 await self.speak_sentence(
                     conn,
                     sentence,
@@ -971,9 +1048,15 @@ class SpeakerGateway:
                 first_spoken = False
             if use_continuous_stream and not first_spoken and not sess.interrupted:
                 await pb.finish_stream()
+            if trace is not None and trace.tts_started_mono is not None:
+                trace.tts_done_mono = time.monotonic()
             completed_normally = True
             await prod_task
         except asyncio.CancelledError:
+            if trace is not None:
+                trace.status = "interrupted"
+                if trace.tts_started_mono is not None and trace.tts_done_mono is None:
+                    trace.tts_done_mono = time.monotonic()
             logger.info("Streaming reply cancelled due to barge-in")
         finally:
             if use_continuous_stream and not completed_normally and not sess.interrupted:

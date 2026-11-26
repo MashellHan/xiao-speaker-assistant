@@ -42,6 +42,7 @@ from xiao_speaker_assistant.tools.browser import (
 from xiao_speaker_assistant.tools.confirmation import ConfirmationStore
 from xiao_speaker_assistant.tools.history import (
     ConversationHistoryStore,
+    TurnTraceStore,
     read_local_opencode_usage,
 )
 from xiao_speaker_assistant.tools.mac_local import (
@@ -520,6 +521,7 @@ class McpServer:
         reminder_store: ReminderStore | None = None,
         speaker_store: SpeakerProfileStore | None = None,
         history_store: ConversationHistoryStore | None = None,
+        trace_store: TurnTraceStore | None = None,
         console_password: str | None = None,
         on_memory_changed: Callable[[], None] | None = None,
         on_voice_changed: Callable[[str, str], None] | None = None,
@@ -554,6 +556,7 @@ class McpServer:
             self._config.speech.speaker_profiles_file
         )
         self.history_store = history_store or ConversationHistoryStore()
+        self.trace_store = trace_store or TurnTraceStore()
         self._console_password = console_password
         self._on_memory_changed = on_memory_changed
         self._on_voice_changed = on_voice_changed
@@ -1844,6 +1847,7 @@ class McpServer:
             "config_path": str(self._config_path) if self._config_path else "config.yaml",
             "stats": self.history_store.stats(),
             "daily_turns": self.history_store.daily_turns(days=14),
+            "recent_traces": [asdict(t) for t in self.trace_store.list(limit=10)],
             "usage": read_local_opencode_usage(cfg.llm.providers.opencode.agent_home, days=14),
             "capabilities": self._build_capabilities(),
         }
@@ -2270,6 +2274,25 @@ class McpServer:
             cleared = self.history_store.clear()
             return web.json_response({"cleared": cleared, "stats": self.history_store.stats()})
 
+        async def handle_api_traces_get(request: web.Request) -> web.Response:
+            denied = _check_console_read_security(request)
+            if denied is not None:
+                return denied
+            raw_limit = request.query.get("limit", "10")
+            try:
+                limit = max(1, min(10, int(raw_limit)))
+            except ValueError:
+                return web.json_response({"error": "invalid_limit", "message": "Invalid limit parameter"}, status=400)
+            items = self.trace_store.list(limit=limit)
+            return web.json_response({"traces": [asdict(t) for t in items], "count": len(items), "max_traces": 10})
+
+        async def handle_api_traces_delete(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            cleared = self.trace_store.clear()
+            return web.json_response({"cleared": cleared, "count": 0})
+
         async def handle_api_memories_get(request: web.Request) -> web.Response:
             denied = _check_console_read_security(request)
             if denied is not None:
@@ -2687,6 +2710,8 @@ class McpServer:
         app.router.add_get("/api/overview", handle_api_overview)
         app.router.add_get("/api/history", handle_api_history_get)
         app.router.add_delete("/api/history", handle_api_history_delete)
+        app.router.add_get("/api/traces", handle_api_traces_get)
+        app.router.add_delete("/api/traces", handle_api_traces_delete)
         app.router.add_get("/api/memories", handle_api_memories_get)
         app.router.add_post("/api/memories", handle_api_memories_post)
         app.router.add_delete("/api/memories/{id}", handle_api_memories_delete)
