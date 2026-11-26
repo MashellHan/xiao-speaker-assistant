@@ -356,7 +356,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
 
     async def apply_hot_reload(new_cfg: AppConfig) -> None:
-        nonlocal active_config, tools, clients, outlook_client
+        nonlocal active_config, tools, clients, outlook_client, scheduler
         prev_model = active_config.llm.providers.opencode.model
         if getattr(args, "host", None):
             new_cfg.speaker.ws_host = args.host
