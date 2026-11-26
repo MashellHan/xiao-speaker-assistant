@@ -2297,23 +2297,32 @@
         container.innerHTML = `<div class="trace-list">${list
           .map((t, idx) => {
             const bd = t.breakdown_ms || {};
-            const asrMs = Number(bd.asr_ms) || 0;
-            const spkMs = Number(bd.speaker_id_ms) || 0;
-            const asrTotal = asrMs + spkMs;
-            const llmTtft = Number(bd.llm_ttft_ms) || 0;
-            const llmTotal = Number(bd.llm_total_ms) || 0;
-            const startPlay = Number(bd.start_play_ms) || 0;
-            const ttsFirst = Number(bd.tts_first_chunk_ms) || 0;
+            const asrMs = bd.asr_ms != null ? Number(bd.asr_ms) : 0;
+            const spkMs = bd.speaker_id_ms != null ? Number(bd.speaker_id_ms) : 0;
+            const queueMs = bd.queue_ms != null ? Number(bd.queue_ms) : 0;
+            const preLlmTotal = asrMs + spkMs + queueMs;
+            const hasLlmTtft = bd.llm_ttft_ms != null;
+            const llmTtft = hasLlmTtft ? Number(bd.llm_ttft_ms) : 0;
+            const llmTotal = bd.llm_total_ms != null ? Number(bd.llm_total_ms) : 0;
+            const llmBarMs = hasLlmTtft ? llmTtft : llmTotal;
+            const startPlay = bd.start_play_ms != null ? Number(bd.start_play_ms) : 0;
+            const ttsFirst = bd.tts_first_chunk_ms != null ? Number(bd.tts_first_chunk_ms) : 0;
             const ttsHead = Math.max(startPlay, ttsFirst);
-            const ttfa = bd.ttfa_ms !== undefined ? Number(bd.ttfa_ms) : (asrTotal + llmTtft + ttsHead);
-            const total = Math.max(Number(bd.total_ms) || 0, ttfa, 1);
-            const tailMs = Math.max(0, total - (asrTotal + llmTtft + ttsHead));
+            const ttfaVal = bd.ttfa_ms != null ? Number(bd.ttfa_ms) : null;
+            const totalRaw = bd.total_ms != null ? Number(bd.total_ms) : 0;
+            const total = Math.max(totalRaw, ttfaVal ?? 0, preLlmTotal + llmBarMs + ttsHead);
+            const tailMs =
+              totalRaw > 0
+                ? (ttfaVal != null
+                    ? Math.max(0, totalRaw - Math.max(ttfaVal, preLlmTotal + llmBarMs + ttsHead))
+                    : Math.max(0, totalRaw - (preLlmTotal + llmBarMs + ttsHead)))
+                : 0;
 
-            const denom = Math.max(asrTotal + llmTtft + ttsHead + tailMs, 1);
-            const pAsr = asrTotal > 0 ? (asrTotal / denom) * 100 : 0;
-            const pLlm = llmTtft > 0 ? (llmTtft / denom) * 100 : 0;
-            const pTts = ttsHead > 0 ? (ttsHead / denom) * 100 : 0;
-            const pRest = tailMs > 0 ? (tailMs / denom) * 100 : 0;
+            const denom = preLlmTotal + llmBarMs + ttsHead + tailMs;
+            const pAsr = denom > 0 && preLlmTotal > 0 ? (preLlmTotal / denom) * 100 : 0;
+            const pLlm = denom > 0 && llmBarMs > 0 ? (llmBarMs / denom) * 100 : 0;
+            const pTts = denom > 0 && ttsHead > 0 ? (ttsHead / denom) * 100 : 0;
+            const pRest = denom > 0 && tailMs > 0 ? (tailMs / denom) * 100 : 0;
 
             const statusCls =
               t.status === "error"
@@ -2331,12 +2340,13 @@
                   : String(t.transport || "voice").toUpperCase();
 
             const pills = [];
-            if (bd.asr_ms !== undefined) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>ASR <span class="num">${formatMs(bd.asr_ms)}</span></span>`);
-            if (bd.speaker_id_ms !== undefined) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>声纹 <span class="num">${formatMs(bd.speaker_id_ms)}</span></span>`);
-            if (bd.llm_ttft_ms !== undefined) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM首句 <span class="num">${formatMs(bd.llm_ttft_ms)}</span></span>`);
-            if (bd.start_play_ms !== undefined) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>start_play <span class="num">${formatMs(bd.start_play_ms)}</span></span>`);
-            if (bd.tts_first_chunk_ms !== undefined) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>TTS首块 <span class="num">${formatMs(bd.tts_first_chunk_ms)}</span></span>`);
-            if (bd.tts_total_ms !== undefined) pills.push(`<span class="trace-pill">播报总计 <span class="num">${formatMs(bd.tts_total_ms)}</span></span>`);
+            if (bd.asr_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>ASR <span class="num">${escapeHtml(formatMs(bd.asr_ms))}</span></span>`);
+            if (bd.speaker_id_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--asr"></span>声纹 <span class="num">${escapeHtml(formatMs(bd.speaker_id_ms))}</span></span>`);
+            if (bd.queue_ms != null) pills.push(`<span class="trace-pill">排队/打断清理 <span class="num">${escapeHtml(formatMs(bd.queue_ms))}</span></span>`);
+            if (bd.llm_ttft_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM首句 <span class="num">${escapeHtml(formatMs(bd.llm_ttft_ms))}</span></span>`);
+            if (bd.start_play_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>start_play <span class="num">${escapeHtml(formatMs(bd.start_play_ms))}</span></span>`);
+            if (bd.tts_first_chunk_ms != null) pills.push(`<span class="trace-pill"><span class="trace-dot trace-dot--tts"></span>TTS首块 <span class="num">${escapeHtml(formatMs(bd.tts_first_chunk_ms))}</span></span>`);
+            if (bd.tts_total_ms != null) pills.push(`<span class="trace-pill">播报总计 <span class="num">${escapeHtml(formatMs(bd.tts_total_ms))}</span></span>`);
 
             return `
               <details class="trace-item" ${idx === 0 ? "open" : ""}>
@@ -2350,18 +2360,18 @@
                     <div class="trace-head-right">
                       <span class="badge">${escapeHtml(transportLabel)}</span>
                       ${t.barge_in ? `<span class="badge badge--warn">插话打断</span>` : ""}
-                      <span class="trace-kpi">首音 <strong class="num">${escapeHtml(formatMs(ttfa))}</strong></span>
+                      <span class="trace-kpi">首音 <strong class="num">${escapeHtml(formatMs(ttfaVal))}</strong></span>
                       <span class="trace-kpi">总计 <strong class="num">${escapeHtml(formatMs(bd.total_ms))}</strong></span>
                       <span class="card-meta num">${escapeHtml(formatTime(t.timestamp))}</span>
                     </div>
                   </div>
                   <div class="trace-bar-track" aria-label="阶段延迟占比">
-                    ${pAsr > 0 ? `<div class="trace-seg trace-seg--asr" style="width: ${pAsr.toFixed(2)}%" title="ASR + 声纹: ${escapeHtml(formatMs(asrTotal))}"></div>` : ""}
-                    ${pLlm > 0 ? `<div class="trace-seg trace-seg--llm" style="width: ${pLlm.toFixed(2)}%" title="LLM 首句: ${escapeHtml(formatMs(llmTtft))}"></div>` : ""}
+                    ${pAsr > 0 ? `<div class="trace-seg trace-seg--asr" style="width: ${pAsr.toFixed(2)}%" title="ASR / 声纹 / 排队: ${escapeHtml(formatMs(preLlmTotal))}"></div>` : ""}
+                    ${pLlm > 0 ? `<div class="trace-seg trace-seg--llm" style="width: ${pLlm.toFixed(2)}%" title="${hasLlmTtft ? "LLM 首句" : "LLM 总计"}: ${escapeHtml(formatMs(llmBarMs))}"></div>` : ""}
                     ${pTts > 0 ? `<div class="trace-seg trace-seg--tts" style="width: ${pTts.toFixed(2)}%" title="TTS 首块 / start_play: ${escapeHtml(formatMs(ttsHead))}"></div>` : ""}
                     ${pRest > 0 ? `<div class="trace-seg trace-seg--rest" style="width: ${pRest.toFixed(2)}%" title="后续流式播报: ${escapeHtml(formatMs(tailMs))}"></div>` : ""}
                   </div>
-                  <div class="trace-pills">${pills.join("") || `<span class="trace-pill">LLM总计 <span class="num">${formatMs(llmTotal)}</span></span>`}</div>
+                  <div class="trace-pills">${pills.join("") || `<span class="trace-pill"><span class="trace-dot trace-dot--llm"></span>LLM总计 <span class="num">${escapeHtml(formatMs(bd.llm_total_ms))}</span></span>`}</div>
                 </summary>
                 <div class="trace-detail">
                   <div class="trace-detail-grid">

@@ -1040,12 +1040,25 @@ def test_turn_trace_store_strict_ten_cap_permissions_and_console_api(tmp_path: P
                 assert ov_data["recent_traces"][0]["query"] == "第 14 个问题"
                 assert ov_data["daily_turns"][-1]["p95_latency_ms"] == 2600.0
 
-                # Remote forwarded request without auth must get 401 on /api/traces
+                # Remote forwarded request without auth must get 401 on GET/DELETE /api/traces,
+                # cross-origin DELETE gets 403, and bad limit gets 400.
                 unauth = await client.get(
                     f"{base}/api/traces",
                     headers={"X-Forwarded-For": "203.0.113.9"},
                 )
                 assert unauth.status_code == 401
+                unauth_del = await client.delete(
+                    f"{base}/api/traces",
+                    headers={"X-Forwarded-For": "203.0.113.9"},
+                )
+                assert unauth_del.status_code == 401
+                csrf_del = await client.delete(
+                    f"{base}/api/traces",
+                    headers={"Origin": "https://evil.example"},
+                )
+                assert csrf_del.status_code == 403
+                bad_limit = await client.get(f"{base}/api/traces?limit=abc")
+                assert bad_limit.status_code == 400
 
                 tr = await client.get(f"{base}/api/traces?limit=5")
                 assert tr.status_code == 200
@@ -1132,3 +1145,28 @@ def test_speaker_gateway_records_turn_trace_with_stage_breakdown(tmp_path: Path)
     assert tr.breakdown_ms["tts_first_chunk_ms"] >= 15.0
     assert tr.breakdown_ms["ttfa_ms"] >= 80.0
     assert tr.breakdown_ms["total_ms"] >= tr.breakdown_ms["ttfa_ms"]
+
+    # Error during streaming must record status="error" without polluting TTS/TTFA metrics from error notice.
+    async def failing_stream_query(query: str):
+        if False:
+            yield ""
+        raise RuntimeError("upstream timeout")
+
+    gw_err = SpeakerGateway(cfg, on_stream_query=failing_stream_query, trace_store=trace_store)
+
+    async def run_err() -> None:
+        conn = FakeConn()
+        gw_err._relay_connections.add(conn)
+        with (
+            patch("xiao_speaker_assistant.voice.playback.synthesize_tts_pcm_stream", fake_tts),
+            patch("xiao_speaker_assistant.voice.ws_server.synthesize_tts_pcm_stream", fake_tts),
+        ):
+            await gw_err._run_query_and_speak(conn, "出错测试")
+
+    asyncio.run(run_err())
+    err_tr = trace_store.list()[0]
+    assert err_tr.query == "出错测试"
+    assert err_tr.status == "error"
+    assert "tts_first_chunk_ms" not in err_tr.breakdown_ms
+    assert "start_play_ms" not in err_tr.breakdown_ms
+    assert "ttfa_ms" not in err_tr.breakdown_ms

@@ -894,7 +894,7 @@ class SpeakerGateway:
             try:
                 if self._on_stream_query is not None:
                     await self._run_streaming_reply(conn, query)
-                    if sess.interrupted:
+                    if sess.interrupted and trace.status == "ok":
                         trace.status = "interrupted"
                     return
                 assert self._on_query is not None
@@ -902,7 +902,7 @@ class SpeakerGateway:
                 trace.mark_llm_first_sentence()
                 trace.mark_llm_done()
                 trace.reply_parts.append(reply)
-                trace.sentence_count = 1
+                trace.sentence_count = 1 if reply.strip() else 0
                 logger.info("LLM reply: %s", reply)
                 self._record_spoken(sess, reply)
                 sess.mute_native_until = time.monotonic() + 8.0
@@ -910,13 +910,19 @@ class SpeakerGateway:
                 await self.speak_sentence(conn, reply, interrupt=True, wait_response=True)
                 trace.tts_done_mono = time.monotonic()
             except asyncio.CancelledError:
-                trace.status = "interrupted"
+                if trace.status == "ok":
+                    trace.status = "interrupted"
                 logger.info("Reply task cancelled due to interrupt")
                 raise
             except Exception as exc:
                 trace.status = "error"
                 logger.exception("Error handling query %r", query)
-                await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+                # Detach trace context so the spoken error notice never pollutes turn TTS/TTFA metrics.
+                err_tok = CURRENT_TURN_TRACE.set(None)
+                try:
+                    await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+                finally:
+                    CURRENT_TURN_TRACE.reset(err_tok)
             finally:
                 if self._trace_store is not None:
                     try:
@@ -950,9 +956,9 @@ class SpeakerGateway:
         use_continuous_stream = self._config.speaker.tts_provider != "xiaoai"
         voice_override = self._resolve_active_voice_override(conn)
 
-        # Queue items are `(sentence, optional_prefetch_task)` so sentences 2+ begin
+        # Queue items are `(sentence, optional_prefetch_task, is_error_notice)` so sentences 2+ begin
         # Edge-TTS synthesis in the background while sentence 1 is still streaming to ALSA.
-        queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None] | None] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[str, asyncio.Task[bytes] | None, bool] | None] = asyncio.Queue()
         all_prefetch_tasks: list[asyncio.Task[bytes]] = []
         prefetch_sem = asyncio.Semaphore(2)
 
@@ -997,7 +1003,7 @@ class SpeakerGateway:
                     if use_continuous_stream and emitted >= 2 and self._config.speaker.tts_provider == "edge":
                         pf_task = asyncio.create_task(_prefetch_sentence_pcm(sentence))
                         all_prefetch_tasks.append(pf_task)
-                    await queue.put((sentence, pf_task))
+                    await queue.put((sentence, pf_task, False))
                 if trace is not None:
                     trace.mark_llm_done()
             except Exception as exc:
@@ -1005,7 +1011,7 @@ class SpeakerGateway:
                     trace.status = "error"
                     trace.mark_llm_done()
                 logger.exception("Streaming error for %r", query)
-                await queue.put((f"处理出错了：{exc}", None))
+                await queue.put((f"处理出错了：{exc}", None, True))
             finally:
                 await queue.put(None)
 
@@ -1020,7 +1026,7 @@ class SpeakerGateway:
                 item = await queue.get()
                 if item is None or sess.interrupted:
                     break
-                sentence, pf_task = item
+                sentence, pf_task, is_error_notice = item
                 prefetched_pcm: bytes | None = None
                 if pf_task is not None:
                     try:
@@ -1035,16 +1041,31 @@ class SpeakerGateway:
                 logger.info("Streaming TTS sentence: %s", sentence)
                 self._record_spoken(sess, sentence)
                 sess.mute_native_until = time.monotonic() + 8.0
-                if first_spoken and trace is not None and trace.tts_started_mono is None:
-                    trace.tts_started_mono = time.monotonic()
-                await self.speak_sentence(
-                    conn,
-                    sentence,
-                    interrupt=first_spoken,
-                    wait_response=True,
-                    keep_stream_open=use_continuous_stream,
-                    prefetched_pcm=prefetched_pcm,
-                )
+                if is_error_notice:
+                    # Detach trace context so speaking the error notice never pollutes turn TTS/TTFA metrics.
+                    err_tok = CURRENT_TURN_TRACE.set(None)
+                    try:
+                        await self.speak_sentence(
+                            conn,
+                            sentence,
+                            interrupt=first_spoken,
+                            wait_response=True,
+                            keep_stream_open=use_continuous_stream,
+                            prefetched_pcm=None,
+                        )
+                    finally:
+                        CURRENT_TURN_TRACE.reset(err_tok)
+                else:
+                    if first_spoken and trace is not None and trace.tts_started_mono is None:
+                        trace.tts_started_mono = time.monotonic()
+                    await self.speak_sentence(
+                        conn,
+                        sentence,
+                        interrupt=first_spoken,
+                        wait_response=True,
+                        keep_stream_open=use_continuous_stream,
+                        prefetched_pcm=prefetched_pcm,
+                    )
                 first_spoken = False
             if use_continuous_stream and not first_spoken and not sess.interrupted:
                 await pb.finish_stream()
@@ -1054,7 +1075,8 @@ class SpeakerGateway:
             await prod_task
         except asyncio.CancelledError:
             if trace is not None:
-                trace.status = "interrupted"
+                if trace.status == "ok":
+                    trace.status = "interrupted"
                 if trace.tts_started_mono is not None and trace.tts_done_mono is None:
                     trace.tts_done_mono = time.monotonic()
             logger.info("Streaming reply cancelled due to barge-in")

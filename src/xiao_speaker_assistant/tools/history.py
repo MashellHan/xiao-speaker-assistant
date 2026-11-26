@@ -72,6 +72,11 @@ class TurnTraceBuilder:
             out["asr_ms"] = round(max(0.0, self.asr_ms), 1)
         if self.speaker_id_ms is not None:
             out["speaker_id_ms"] = round(max(0.0, self.speaker_id_ms), 1)
+        pre_query_ms = max(0.0, (q_start - self.turn_started_mono) * 1000.0)
+        known_pre_ms = (out.get("asr_ms") or 0.0) + (out.get("speaker_id_ms") or 0.0)
+        queue_gap_ms = pre_query_ms - known_pre_ms
+        if queue_gap_ms >= 10.0:
+            out["queue_ms"] = round(queue_gap_ms, 1)
         if self.llm_first_sentence_mono is not None:
             out["llm_ttft_ms"] = round(max(0.0, (self.llm_first_sentence_mono - q_start) * 1000.0), 1)
         if self.llm_done_mono is not None:
@@ -134,6 +139,7 @@ class TurnTraceStore:
         allowed = (
             "asr_ms",
             "speaker_id_ms",
+            "queue_ms",
             "llm_ttft_ms",
             "llm_total_ms",
             "start_play_ms",
@@ -213,13 +219,11 @@ class TurnTraceStore:
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
-        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
         payload = json.dumps([asdict(e) for e in self._entries], ensure_ascii=False, indent=2) + "\n"
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, payload.encode("utf-8"))
-        finally:
-            os.close(fd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload.encode("utf-8"))
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, self.path)
         os.chmod(self.path, 0o600)
@@ -355,13 +359,11 @@ class ConversationHistoryStore:
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
-        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
         payload = json.dumps([asdict(e) for e in self._entries], ensure_ascii=False, indent=2) + "\n"
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, payload.encode("utf-8"))
-        finally:
-            os.close(fd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload.encode("utf-8"))
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, self.path)
         os.chmod(self.path, 0o600)
