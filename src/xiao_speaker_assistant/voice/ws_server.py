@@ -419,12 +419,29 @@ class SpeakerGateway:
         return any(self._is_conn_idle(conn) for conn in list(self._connections))
 
     def get_runtime_status(self) -> dict[str, Any]:
-        """Return live speaker connectivity and pipeline state for Web Console telemetry."""
+        """Return live speaker connectivity and pipeline state for Web Console telemetry.
+
+        Over WAN relay, the host socket connects to the relay server even when the speaker
+        is powered off; therefore relay speaker presence requires recent audio frames (<15s)
+        when the local speech pipeline is active.
+        """
         conns = list(self._connections)
+        now = time.monotonic()
         relay_count = sum(1 for c in conns if c in self._relay_connections)
         lan_count = len(conns) - relay_count
+        relay_audio_active = False
+        for c in conns:
+            if c in self._relay_connections:
+                sess = self._sessions.get(c)
+                if sess is not None and sess.last_audio_at > 0 and (now - sess.last_audio_at) < 15.0:
+                    relay_audio_active = True
+                    break
+        speaker_connected = lan_count > 0 or (
+            relay_audio_active if self._pipeline is not None else relay_count > 0
+        )
         return {
-            "speaker_connected": len(conns) > 0,
+            "speaker_connected": speaker_connected,
+            "relay_connected": relay_count > 0,
             "active_connections": len(conns),
             "relay_connections": relay_count,
             "lan_connections": lan_count,

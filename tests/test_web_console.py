@@ -1252,8 +1252,56 @@ def test_p0_oss_readiness_init_doctor_openai_tools_and_speaker_status(tmp_path: 
 
     asyncio.run(run())
 
-    # 5. LLMRouter logger is defined and never raises NameError on startup prewarm failure
+    # 5. LLMRouter logger is defined, Gemini schema sanitizer strips unsupported keys,
+    #    model validation is provider-aware, and relay speaker_status distinguishes audio presence
     import xiao_speaker_assistant.llm.router as router_mod
+    from xiao_speaker_assistant.llm.router import _sanitize_gemini_schema
+    from xiao_speaker_assistant.voice.ws_server import SpeakerGateway
 
     assert hasattr(router_mod, "logger")
     assert isinstance(LLMRouter(cfg.llm)._build_system_prompt(), str)
+
+    sanitized = _sanitize_gemini_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+            },
+        }
+    )
+    assert "additionalProperties" not in sanitized
+    assert sanitized["properties"]["limit"] == {"type": "integer"}
+
+    # Provider-aware model validation & default model list
+    with pytest.raises(ValueError):
+        McpServer._validate_model_ref("gpt-4o-mini", provider="opencode")
+    assert McpServer._validate_model_ref("gpt", provider="opencode") == "raven/gpt-6.2-sol#low"
+    assert McpServer._validate_model_ref("qwen2.5:7b", provider="openai_compatible") == "qwen2.5:7b"
+    assert McpServer._validate_model_ref("gpt", provider="openai_compatible") == "gpt"
+
+    cfg_oai = AppConfig()
+    cfg_oai.llm.default_provider = "openai_compatible"
+    cfg_oai.llm.providers.codex_api.model = "gpt-4o-mini"
+    srv_oai = McpServer(
+        cfg_oai,
+        memory_store=MemoryStore(tmp_path / "mem2.json"),
+        history_store=ConversationHistoryStore(tmp_path / "hist2.json"),
+        trace_store=TurnTraceStore(tmp_path / "traces2.json"),
+    )
+    oai_ids = [m["id"] for m in srv_oai._available_models_list()]
+    assert "gpt-4o-mini" in oai_ids
+    assert all(not mid.startswith("raven/") for mid in oai_ids)
+
+    # Relay speaker_connected requires recent audio when pipeline is active
+    gw = SpeakerGateway(AppConfig(), on_query=lambda q: asyncio.sleep(0, result=q))
+    gw._pipeline = type("FakePipeline", (), {"awake": False})()  # type: ignore[assignment]
+    fake_conn = object()
+    gw._connections.add(fake_conn)
+    gw._relay_connections.add(fake_conn)
+    st_waiting = gw.get_runtime_status()
+    assert st_waiting["relay_connected"] is True
+    assert st_waiting["speaker_connected"] is False
+    gw._get_session(fake_conn).last_audio_at = time.monotonic()
+    st_live = gw.get_runtime_status()
+    assert st_live["speaker_connected"] is True

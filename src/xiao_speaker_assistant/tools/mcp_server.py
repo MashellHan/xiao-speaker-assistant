@@ -61,7 +61,6 @@ from xiao_speaker_assistant.voice.voice_catalog import (
     EDGE_ZH_VOICES,
     list_voice_profiles_dicts,
     normalize_edge_rate,
-    persist_speaker_voice_config,
     resolve_edge_voice,
 )
 from xiao_speaker_assistant.web import load_console_html
@@ -106,7 +105,19 @@ MODEL_ALIASES: dict[str, str] = {
     "nano": "raven/gpt-5.4-nano",
     "极速": "raven/gpt-5.4-nano",
 }
-_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?(?:#[A-Za-z0-9._-]+)?$")
+_OPENCODE_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:#[A-Za-z0-9._-]+)?$")
+_GENERIC_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._:/-]+(?:#[A-Za-z0-9._-]+)?$")
+
+OPENAI_COMPAT_DEFAULT_MODELS: tuple[dict[str, str], ...] = (
+    {"id": "gpt-4o-mini", "label": "GPT-4o Mini"},
+    {"id": "gpt-4o", "label": "GPT-4o"},
+    {"id": "deepseek-chat", "label": "DeepSeek Chat"},
+    {"id": "qwen2.5:7b", "label": "Qwen 2.5 7B (Ollama)"},
+)
+GEMINI_API_DEFAULT_MODELS: tuple[dict[str, str], ...] = (
+    {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+    {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 _PROXY_HEADER_NAMES = (
@@ -1681,17 +1692,30 @@ class McpServer:
         return self._tool_result({"removed": removed, "name_or_id": target})
 
     @classmethod
-    def _validate_model_ref(cls, raw_model: str) -> str:
+    def _validate_model_ref(cls, raw_model: str, *, provider: str = "opencode") -> str:
         cleaned = raw_model.strip()
-        lowered = re.sub(r"\s+", " ", cleaned.lower())
-        if lowered in MODEL_ALIASES:
-            return MODEL_ALIASES[lowered]
-        compact = lowered.replace(" ", "")
-        if compact in MODEL_ALIASES:
-            return MODEL_ALIASES[compact]
-        if not cleaned or len(cleaned) > 120 or not _MODEL_REF_RE.fullmatch(cleaned):
+        if provider == "opencode":
+            lowered = re.sub(r"\s+", " ", cleaned.lower())
+            if lowered in MODEL_ALIASES:
+                return MODEL_ALIASES[lowered]
+            compact = lowered.replace(" ", "")
+            if compact in MODEL_ALIASES:
+                return MODEL_ALIASES[compact]
+            if not cleaned or len(cleaned) > 120 or not _OPENCODE_MODEL_REF_RE.fullmatch(cleaned):
+                raise ValueError(
+                    f"Invalid model {raw_model!r}; expected 'provider/model[#variant]' or alias like 'gpt', 'gpt 6.2', 'hydrogen', 'nano'."
+                )
+            return cleaned
+        if (
+            not cleaned
+            or len(cleaned) > 120
+            or cleaned.startswith("/")
+            or cleaned.endswith("/")
+            or "//" in cleaned
+            or not _GENERIC_MODEL_REF_RE.fullmatch(cleaned)
+        ):
             raise ValueError(
-                f"Invalid model {raw_model!r}; expected 'provider/model[#variant]' or alias like 'gpt', 'gpt 6.2', 'hydrogen', 'nano'."
+                f"Invalid model {raw_model!r}; expected model identifier such as 'gpt-4o-mini', 'deepseek-chat', or 'qwen2.5:7b'."
             )
         return cleaned
 
@@ -1708,7 +1732,7 @@ class McpServer:
         raw_model = str(args.get("model") or "").strip()
         persist = bool(args.get("persist", True))
         try:
-            new_model = self._validate_model_ref(raw_model)
+            new_model = self._validate_model_ref(raw_model, provider=self._config.llm.default_provider)
         except ValueError as exc:
             return self._tool_result(
                 {"error": "invalid_model", "message": str(exc)},
@@ -1903,7 +1927,15 @@ class McpServer:
                 for m in custom
                 if isinstance(m, dict) and str(m.get("id", "")).strip()
             ]
-        return list(AVAILABLE_MODELS)
+        prov = self._config.llm.default_provider
+        if prov == "opencode":
+            return list(AVAILABLE_MODELS)
+        if prov in {"openai_compatible", "codex_api"}:
+            return list(OPENAI_COMPAT_DEFAULT_MODELS)
+        if prov == "gemini_api":
+            return list(GEMINI_API_DEFAULT_MODELS)
+        cur = self._active_model_for_provider()
+        return [{"id": cur, "label": cur}] if cur else []
 
     def _build_overview_payload(self) -> dict[str, Any]:
         cfg = self._config
@@ -2522,7 +2554,9 @@ class McpServer:
 
             try:
                 if has_model:
-                    new_model = self._validate_model_ref(str(body["model"]))
+                    new_model = self._validate_model_ref(
+                        str(body["model"]), provider=self._config.llm.default_provider
+                    )
                 if has_voice:
                     new_voice = resolve_edge_voice(str(body["edge_voice"])).id
                 if has_rate:

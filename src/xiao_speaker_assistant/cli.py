@@ -343,6 +343,8 @@ def _resolve_active_model(config: AppConfig, provider_override: str | None = Non
 
 
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
+    if getattr(args, "provider", None):
+        config.llm.default_provider = args.provider
     active_config = config
     confirmations = ConfirmationStore()
     memory_store = MemoryStore(active_config.memory.file_path)
@@ -509,6 +511,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             new_cfg.speech.asr_provider = args.asr
         if getattr(args, "asr_model", None):
             new_cfg.speech.asr_model = args.asr_model
+        if getattr(args, "provider", None):
+            new_cfg.llm.default_provider = args.provider
         active_config = new_cfg
         mcp_server.reload_config(new_cfg)
         await asyncio.to_thread(router.reload_runtime_config, new_cfg)

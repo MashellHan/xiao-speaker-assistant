@@ -116,6 +116,28 @@ class SentenceStreamBuffer:
         return [tail]
 
 
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {"default", "minimum", "maximum", "additionalProperties", "$schema", "minLength", "maxLength", "pattern"}
+)
+
+
+def _sanitize_gemini_schema(schema: Any) -> Any:
+    """Strip JSON Schema keywords rejected by Google Gemini v1beta FunctionDeclaration Schema."""
+    if isinstance(schema, list):
+        return [_sanitize_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    cleaned: dict[str, Any] = {}
+    for k, v in schema.items():
+        if k in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        if k == "properties" and isinstance(v, dict):
+            cleaned[k] = {pk: _sanitize_gemini_schema(pv) for pk, pv in v.items()}
+        else:
+            cleaned[k] = _sanitize_gemini_schema(v)
+    return cleaned
+
+
 def parse_opencode_jsonl(stdout: str) -> str:
     """Extract assistant text parts from `opencode run --format json` output."""
     chunks: list[str] = []
@@ -764,7 +786,7 @@ class LLMRouter:
                         {
                             "name": t.name,
                             "description": t.description,
-                            "parameters": t.parameters,
+                            "parameters": _sanitize_gemini_schema(t.parameters),
                         }
                         for t in tools
                     ]

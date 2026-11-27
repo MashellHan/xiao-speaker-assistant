@@ -2439,6 +2439,10 @@
           spkBadge.className = "badge badge--success";
           const via = spkSt.relay_connections > 0 ? "中继在线" : "局域网在线";
           spkText.textContent = `音箱${via}${spkSt.active_connections > 1 ? ` (${spkSt.active_connections})` : ""}`;
+        } else if (spkSt.relay_connected === true) {
+          spkBadge.hidden = false;
+          spkBadge.className = "badge badge--accent";
+          spkText.textContent = "中继已连 · 等待音箱";
         } else if (spkSt.speaker_connected === false) {
           spkBadge.hidden = false;
           spkBadge.className = "badge badge--warn";
