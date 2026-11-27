@@ -92,6 +92,12 @@ llm:
 
 tools:
   mcp_http_port: 4397
+  search:
+    # auto (prefers TAVILY_API_KEY -> SEARXNG_URL -> Bing HTML) | tavily | searxng | bing
+    provider: auto
+    tavily_api_key_env: TAVILY_API_KEY
+    searxng_url: ""
+    searxng_url_env: SEARXNG_URL
   outlook:
     enabled: false
     client_id_env: OUTLOOK_CLIENT_ID

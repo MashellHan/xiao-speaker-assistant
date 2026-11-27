@@ -76,6 +76,8 @@ class SpeakerSession:
     seen_dialogs: set[str] = field(default_factory=set)
     continuous_mode: bool = False
     query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cloud_asr_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cloud_asr_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     mute_native_until: float = 0.0
     last_audio_at: float = 0.0
     last_chime_at: float = 0.0
@@ -295,9 +297,14 @@ class SpeakerGateway:
         self._connections.discard(conn)
         self._relay_connections.discard(conn)
         sess = self._sessions.pop(conn, None)
-        if sess is not None and sess.active_reply_task is not None and not sess.active_reply_task.done():
-            sess.interrupted = True
-            sess.active_reply_task.cancel()
+        if sess is not None:
+            for t in list(sess.cloud_asr_tasks):
+                if not t.done():
+                    t.cancel()
+            sess.cloud_asr_tasks.clear()
+            if sess.active_reply_task is not None and not sess.active_reply_task.done():
+                sess.interrupted = True
+                sess.active_reply_task.cancel()
         self._playbacks.pop(conn, None)
         conn_rpcs = self._pending_rpc.pop(conn, {})
         for fut in conn_rpcs.values():
@@ -617,17 +624,88 @@ class SpeakerGateway:
             sess.active_voice = self._resolve_voice_for_keyword(keyword)
             loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_barge_in_wakeup(conn)))
 
+        def on_cloud_segment(
+            segment: Any,
+            embedding: list[float] | None,
+            vad_end_mono: float,
+            speaker_id_ms: float | None,
+        ) -> None:
+            def _schedule() -> None:
+                task = loop.create_task(
+                    self._process_cloud_segment(
+                        conn,
+                        segment,
+                        embedding=embedding,
+                        vad_end_mono=vad_end_mono,
+                        speaker_id_ms=speaker_id_ms,
+                    )
+                )
+                sess.cloud_asr_tasks.add(task)
+                task.add_done_callback(sess.cloud_asr_tasks.discard)
+
+            loop.call_soon_threadsafe(_schedule)
+
+        use_async_cloud = bool(getattr(self._pipeline, "has_cloud_asr", False))
         await loop.run_in_executor(
             self._asr_executor,
             lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
                 pcm,
                 on_wakeup=on_wakeup,
                 on_utterance_embedding=on_utterance,
+                **({"on_cloud_segment": on_cloud_segment} if use_async_cloud else {}),
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
                 on_barge_in_wakeup=on_barge_in_wakeup,
             ),
         )
+
+    async def _process_cloud_segment(
+        self,
+        conn: Any,
+        segment: Any,
+        *,
+        embedding: list[float] | None,
+        vad_end_mono: float,
+        speaker_id_ms: float | None,
+    ) -> None:
+        """Run cloud ASR off the KWS/VAD audio thread so barge-in & VAD stay real-time."""
+        if self._pipeline is None:
+            return
+        sess = self._get_session(conn)
+        async with sess.cloud_asr_lock:
+            t_req = time.monotonic()
+            try:
+                text = await self._pipeline.atranscribe_cloud(segment)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Async cloud ASR failed: %s", exc)
+                return
+            asr_ms = round((time.monotonic() - t_req) * 1000.0, 1)
+            resolved = self._pipeline.resolve_transcribed_text(
+                text,
+                vad_end_mono=vad_end_mono,
+                asr_ms=asr_ms,
+                speaker_id_ms=speaker_id_ms,
+            )
+            if resolved is None:
+                return
+            kind, payload, metrics = resolved
+            if kind == "wakeup":
+                logger.info("Cloud ASR wake word detected: %s", payload)
+                sess.active_voice = self._resolve_voice_for_keyword(payload)
+                sess.mute_native_until = time.monotonic() + 8.0
+                asyncio.create_task(self.play_wakeup_chime(conn))
+                return
+            logger.info("Cloud ASR recognized: %s (%.0fms)", payload, asr_ms)
+            asyncio.create_task(
+                self._process_local_utterance(
+                    conn,
+                    payload,
+                    embedding=embedding,
+                    asr_metrics=metrics,
+                )
+            )
 
     async def _handle_barge_in_wakeup(self, conn: Any) -> None:
         sess = self._get_session(conn)

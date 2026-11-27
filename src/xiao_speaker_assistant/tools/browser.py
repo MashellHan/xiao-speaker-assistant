@@ -6,8 +6,10 @@ import html
 import ipaddress
 import json
 import re
+import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
@@ -160,10 +162,20 @@ def validate_http_url(
     return cleaned
 
 
-def build_edge_open_command(url: str) -> list[str]:
-    """Build the macOS `open -a \"Microsoft Edge\" <url>` argv list without shell expansion."""
+def build_edge_open_command(url: str, *, platform: str | None = None) -> list[str]:
+    """Build a cross-platform argv list to open `url` in desktop browser without shell expansion."""
     validated_url = validate_http_url(url)
-    return ["open", "-a", EDGE_APP_NAME, validated_url]
+    plat = (platform or sys.platform).lower()
+    if plat == "darwin":
+        return ["open", "-a", EDGE_APP_NAME, validated_url]
+    if plat.startswith("linux"):
+        for candidate in ("microsoft-edge", "microsoft-edge-stable", "google-chrome", "chromium", "xdg-open"):
+            if shutil.which(candidate):
+                return [candidate, validated_url]
+        return ["xdg-open", validated_url]
+    if plat in {"win32", "cygwin", "msys"}:
+        return ["cmd", "/c", "start", "", validated_url]
+    return ["xdg-open", validated_url]
 
 
 def open_in_edge(

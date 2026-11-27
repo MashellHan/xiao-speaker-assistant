@@ -501,6 +501,67 @@ class LocalSpeechPipeline:
             ):
                 self._speaker_id = self._init_speaker_identifier(models_dir, new_config)
 
+    @property
+    def has_cloud_asr(self) -> bool:
+        return self._cloud_asr is not None
+
+    async def atranscribe_cloud(self, samples: list[float] | np.ndarray) -> str:
+        """Asynchronously transcribe a post-VAD audio segment via the configured cloud ASR."""
+        if self._cloud_asr is None:
+            raise RuntimeError("Cloud ASR is not configured on this pipeline")
+        return await self._cloud_asr.atranscribe(samples)
+
+    def resolve_transcribed_text(
+        self,
+        text: str,
+        *,
+        vad_end_mono: float,
+        asr_ms: float,
+        speaker_id_ms: float | None = None,
+    ) -> tuple[str, str, dict[str, float]] | None:
+        """Apply awake/wake-phrase state transitions for a transcribed segment under `_lock`.
+
+        Returns `("utterance", payload, metrics)`, `("wakeup", wake_label, metrics)`, or `None`.
+        """
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        metrics: dict[str, float] = {
+            "vad_end_mono": vad_end_mono,
+            "asr_ms": round(asr_ms, 1),
+            **({"speaker_id_ms": round(speaker_id_ms, 1)} if speaker_id_ms is not None else {}),
+        }
+        with self._lock:
+            self._last_asr_metrics = metrics
+            if not self.awake:
+                matched = match_wakeup_phrase(cleaned, self._config.local_keywords)
+                if not matched:
+                    logger.info("Idle speech (ignored): %s", cleaned)
+                    return None
+                wake_label, rest = matched
+                logger.info("ASR wake matched (%s): %s", wake_label, cleaned)
+                self.set_awake(True)
+                if rest:
+                    return ("utterance", rest, metrics)
+                return ("wakeup", wake_label, metrics)
+            self._last_active_at = time.monotonic()
+            return ("utterance", cleaned, metrics)
+
+    def _extract_speaker_embedding(
+        self, segment: list[float] | np.ndarray
+    ) -> tuple[list[float] | None, float | None]:
+        if self._speaker_id is None:
+            return None, None
+        t_spk = time.monotonic()
+        emb_list: list[float] | None = None
+        try:
+            emb = self._speaker_id.extract_embedding(segment)
+            if emb is not None:
+                emb_list = [round(float(x), 6) for x in emb.tolist()]
+        except Exception as exc:
+            logger.debug("Voiceprint extraction failed: %s", exc)
+        return emb_list, round((time.monotonic() - t_spk) * 1000.0, 1)
+
     def feed_pcm(
         self,
         pcm_bytes: bytes,
@@ -508,6 +569,7 @@ class LocalSpeechPipeline:
         on_wakeup: Callable[[str], None] | None = None,
         on_utterance: Callable[[str], None] | None = None,
         on_utterance_embedding: Callable[[str, list[float] | None], None] | None = None,
+        on_cloud_segment: Callable[[np.ndarray, list[float] | None, float, float | None], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
         on_barge_in_wakeup: Callable[[str], None] | None = None,
@@ -518,6 +580,7 @@ class LocalSpeechPipeline:
                 on_wakeup=on_wakeup,
                 on_utterance=on_utterance,
                 on_utterance_embedding=on_utterance_embedding,
+                on_cloud_segment=on_cloud_segment,
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
                 on_barge_in_wakeup=on_barge_in_wakeup,
@@ -530,6 +593,7 @@ class LocalSpeechPipeline:
         on_wakeup: Callable[[str], None] | None = None,
         on_utterance: Callable[[str], None] | None = None,
         on_utterance_embedding: Callable[[str, list[float] | None], None] | None = None,
+        on_cloud_segment: Callable[[np.ndarray, list[float] | None, float, float | None], None] | None = None,
         on_sleep: Callable[[], None] | None = None,
         on_interrupt: Callable[[str], None] | None = None,
         on_barge_in_wakeup: Callable[[str], None] | None = None,
@@ -663,50 +727,35 @@ class LocalSpeechPipeline:
             segment = self._vad.front.samples
             self._vad.pop()
             t_seg_end = time.monotonic()
+
+            if self._cloud_asr is not None and on_cloud_segment is not None:
+                seg_arr = np.array(segment, dtype=np.float32, copy=True)
+                emb_list, speaker_id_ms = self._extract_speaker_embedding(seg_arr)
+                on_cloud_segment(seg_arr, emb_list, t_seg_end, speaker_id_ms)
+                continue
+
             text = self._transcribe(segment)
             asr_ms = round((time.monotonic() - t_seg_end) * 1000.0, 1)
             if not text:
                 continue
 
-            emb_list: list[float] | None = None
-            speaker_id_ms: float | None = None
-            if self._speaker_id is not None:
-                t_spk = time.monotonic()
-                try:
-                    emb = self._speaker_id.extract_embedding(segment)
-                    if emb is not None:
-                        emb_list = [round(float(x), 6) for x in emb.tolist()]
-                except Exception as exc:
-                    logger.debug("Voiceprint extraction failed: %s", exc)
-                speaker_id_ms = round((time.monotonic() - t_spk) * 1000.0, 1)
-
-            self._last_asr_metrics = {
-                "vad_end_mono": t_seg_end,
-                "asr_ms": asr_ms,
-                **({"speaker_id_ms": speaker_id_ms} if speaker_id_ms is not None else {}),
-            }
-
-            def _emit_utterance(utterance_text: str) -> None:
-                if on_utterance_embedding is not None:
-                    on_utterance_embedding(utterance_text, emb_list)
-                elif on_utterance is not None:
-                    on_utterance(utterance_text)
-
-            if not self.awake:
-                matched = match_wakeup_phrase(text, self._config.local_keywords)
-                if not matched:
-                    logger.info("Idle speech (ignored): %s", text)
-                    continue
-                wake_label, rest = matched
-                logger.info("ASR wake matched (%s): %s", wake_label, text)
-                self.set_awake(True)
-                if rest:
-                    _emit_utterance(rest)
-                elif on_wakeup:
-                    on_wakeup(wake_label)
-            else:
-                self._last_active_at = time.monotonic()
-                _emit_utterance(text)
+            emb_list, speaker_id_ms = self._extract_speaker_embedding(segment)
+            resolved = self.resolve_transcribed_text(
+                text,
+                vad_end_mono=t_seg_end,
+                asr_ms=asr_ms,
+                speaker_id_ms=speaker_id_ms,
+            )
+            if resolved is None:
+                continue
+            kind, payload, _metrics = resolved
+            if kind == "wakeup":
+                if on_wakeup:
+                    on_wakeup(payload)
+            elif on_utterance_embedding is not None:
+                on_utterance_embedding(payload, emb_list)
+            elif on_utterance is not None:
+                on_utterance(payload)
 
     def _transcribe(self, samples: list[float] | np.ndarray) -> str:
         if self._cloud_asr is not None:

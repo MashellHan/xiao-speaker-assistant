@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+models/
+config.yaml
+*.log
+*.img
+*.bin
+.DS_Store
+data/

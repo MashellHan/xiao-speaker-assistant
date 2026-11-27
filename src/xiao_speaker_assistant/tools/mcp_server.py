@@ -1374,6 +1374,8 @@ class McpServer:
                 await client.aclose()
 
     async def _call_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        from xiao_speaker_assistant.tools.web_search import run_web_search
+
         query = str(args.get("query") or "").strip()
         if not query:
             return self._tool_result(
@@ -1381,46 +1383,19 @@ class McpServer:
                 is_error=True,
             )
         limit = max(1, min(8, int(args.get("limit", 5))))
-        owns_client = self._http_client is None
-        client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
         try:
-            resp = await client.get(
-                "https://www.bing.com/search",
-                params={"q": query, "mkt": "zh-CN"},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                },
+            payload = await run_web_search(
+                query,
+                limit=limit,
+                config=self._config.tools.search,
+                client=self._http_client,
             )
-            resp.raise_for_status()
-            items: list[dict[str, str]] = []
-            for block in resp.text.split('<li class="b_algo"')[1:]:
-                m_link = re.search(
-                    r'<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', block
-                )
-                if not m_link:
-                    continue
-                url = html.unescape(m_link.group(1))
-                title = html.unescape(re.sub(r"<[^>]+>", "", m_link.group(2))).strip()
-                m_snip = re.search(r'<p[^>]*>([\s\S]*?)</p>', block)
-                snippet = (
-                    html.unescape(re.sub(r"<[^>]+>", "", m_snip.group(1))).strip()
-                    if m_snip
-                    else ""
-                )
-                if title:
-                    items.append({"title": title, "snippet": snippet[:240], "url": url})
-                if len(items) >= limit:
-                    break
-            return self._tool_result({"query": query, "results": items, "count": len(items)})
+            return self._tool_result(payload)
         except Exception as exc:
             return self._tool_result(
                 {"error": "web_search_error", "message": str(exc), "query": query},
                 is_error=True,
             )
-        finally:
-            if owns_client:
-                await client.aclose()
 
     async def _call_memory_save(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self._config.memory.enabled:
