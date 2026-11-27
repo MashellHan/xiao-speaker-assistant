@@ -456,6 +456,7 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         on_wakewords_changed=on_wakewords_changed,
         on_reminders_config_changed=on_reminders_config_changed,
         on_capabilities_changed=on_capabilities_changed,
+        on_debug_ask=lambda q: handle_query(q),
         get_speaker_status=lambda: gateway.get_runtime_status() if gateway is not None else {
             "speaker_connected": False,
             "active_connections": 0,

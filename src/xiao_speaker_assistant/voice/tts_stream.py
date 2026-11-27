@@ -265,6 +265,27 @@ async def synthesize_say_pcm(
             pass
 
 
+async def synthesize_edge_mp3_bytes(
+    text: str,
+    *,
+    voice: str = "zh-CN-XiaoxiaoNeural",
+    rate: str = "+0%",
+) -> bytes:
+    """Synthesize text directly to MP3 bytes via Edge-TTS for browser audio preview."""
+    import edge_tts
+
+    comm = edge_tts.Communicate(text, voice, rate=rate)
+    buf = bytearray()
+    async for item in comm.stream():
+        if item.get("type") == "audio":
+            data = item.get("data")
+            if data:
+                buf.extend(data)
+    if not buf:
+        raise RuntimeError("Edge-TTS produced empty audio stream")
+    return bytes(buf)
+
+
 async def stream_edge_tts_pcm(
     text: str,
     *,

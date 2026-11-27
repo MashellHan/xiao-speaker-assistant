@@ -340,7 +340,12 @@ class RelayConsoleClient:
         if not normalized.startswith("/"):
             return False
         # Defense-in-depth on Mac side too: never forward `/mcp` over the remote console tunnel.
-        return normalized == "/" or normalized == "/health" or normalized.startswith("/api/")
+        return (
+            normalized == "/"
+            or normalized == "/health"
+            or normalized.startswith("/api/")
+            or normalized.startswith("/assets/")
+        )
 
     async def _handle_http_request(
         self,
