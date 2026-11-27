@@ -1538,6 +1538,9 @@
       </div>
 
       <div class="header-actions">
+        <span class="badge" id="speakerConnBadge" title="音箱 WebSocket 实时连接状态" hidden>
+          <span id="speakerConnText">音箱未连接</span>
+        </span>
         <span class="badge badge--success" id="serverStatus" role="status">
           <span id="serverStatusText">已连接</span>
         </span>
@@ -1801,7 +1804,7 @@
             <p class="page-subtitle">当前显示最近 <span class="num" id="historyCountLabel">0</span> 轮语音与桥接交互</p>
           </div>
           <div class="toolbar-row">
-            <input id="speakerFilter" class="search-input" type="search" placeholder="按说话人筛选（如：大雄、拳拳）" aria-label="按说话人筛选">
+            <input id="speakerFilter" class="search-input" type="search" placeholder="按说话人筛选（如：主人、小明）" aria-label="按说话人筛选">
             <button type="button" class="btn" id="applyFilterBtn">筛选</button>
             <button type="button" class="btn btn--danger" id="clearHistoryBtn">清空历史</button>
           </div>
@@ -1995,7 +1998,7 @@
               <form id="reminderForm" class="reminder-form">
                 <div class="field">
                   <label for="reminderMessage">播报内容</label>
-                  <input id="reminderMessage" type="text" maxlength="200" placeholder="例如：提醒拳拳喝牛奶 / 北京天气与待办早报" required>
+                  <input id="reminderMessage" type="text" maxlength="200" placeholder="例如：提醒喝水 / 每日天气与待办早报" required>
                 </div>
                 <div class="field">
                   <label for="reminderMode">调度方式</label>
@@ -2428,6 +2431,21 @@
 
         $("configPathLabel").textContent = data.config_path || "config.yaml";
         $("ttsProviderBadge").textContent = `${data.tts_provider || "edge"} · ${data.speaker_model || "OH2P"}`;
+        const spkBadge = $("speakerConnBadge");
+        const spkText = $("speakerConnText");
+        const spkSt = data.speaker_status || {};
+        if (spkSt.speaker_connected === true) {
+          spkBadge.hidden = false;
+          spkBadge.className = "badge badge--success";
+          const via = spkSt.relay_connections > 0 ? "中继在线" : "局域网在线";
+          spkText.textContent = `音箱${via}${spkSt.active_connections > 1 ? ` (${spkSt.active_connections})` : ""}`;
+        } else if (spkSt.speaker_connected === false) {
+          spkBadge.hidden = false;
+          spkBadge.className = "badge badge--warn";
+          spkText.textContent = "音箱离线";
+        } else {
+          spkBadge.hidden = true;
+        }
         $("sidebarModelLabel").textContent = data.model || "—";
         $("sidebarVoiceLabel").textContent = `${data.voice_name || data.voice || "—"} (${data.rate || "+8%"})`;
 

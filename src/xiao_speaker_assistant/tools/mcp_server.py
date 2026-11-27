@@ -106,7 +106,7 @@ MODEL_ALIASES: dict[str, str] = {
     "nano": "raven/gpt-5.4-nano",
     "极速": "raven/gpt-5.4-nano",
 }
-_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:#[A-Za-z0-9._-]+)?$")
+_MODEL_REF_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?(?:#[A-Za-z0-9._-]+)?$")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 _PROXY_HEADER_NAMES = (
@@ -413,14 +413,14 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "speaker_enroll_voiceprint",
         "description": (
             "Save or update a family member's voiceprint from recent speaker audio. "
-            "Use target='previous' when the user says '刚才和你说话的是拳拳', or target='current' "
-            "when the user says '我是大雄，记住我的声音'. Supports extensible role, style_hint, "
+            "Use target='previous' when the user says '刚才和你说话的是小明/XXX', or target='current' "
+            "when the user says '我是XXX，记住我的声音'. Supports extensible role, style_hint, "
             "capabilities (e.g. ['storytelling', 'kid_safe_only']), notes, and preferred_voice."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Member name, e.g. 拳拳, 大雄, 爱人, 爷爷"},
+                "name": {"type": "string", "description": "Member name, e.g. 主人, 小明, 爱人, 爷爷"},
                 "role": {
                     "type": "string",
                     "default": "family",
@@ -529,6 +529,7 @@ class McpServer:
         on_wakewords_changed: Callable[[list[str], list[str], bool], None] | None = None,
         on_reminders_config_changed: Callable[[bool, str, str], None] | None = None,
         on_capabilities_changed: Callable[[], None] | None = None,
+        get_speaker_status: Callable[[], dict[str, Any]] | None = None,
         config_path: str | Path | None = None,
         speakers_path: str | Path | None = None,
         reminders_path: str | Path | None = None,
@@ -564,6 +565,7 @@ class McpServer:
         self._on_wakewords_changed = on_wakewords_changed
         self._on_reminders_config_changed = on_reminders_config_changed
         self._on_capabilities_changed = on_capabilities_changed
+        self._get_speaker_status = get_speaker_status
         self._config_path = config_path
         self._speakers_path = Path(speakers_path).expanduser() if speakers_path is not None else None
         self._http_client = http_client
@@ -1253,7 +1255,7 @@ class McpServer:
                 "latitude": lat,
                 "longitude": lon,
                 "daily": "temperature_2m_max,temperature_2m_min",
-                "timezone": "Asia/Shanghai",
+                "timezone": self._config.persona.timezone or "auto",
             },
         )
         fc.raise_for_status()
@@ -1485,7 +1487,7 @@ class McpServer:
         persisted = False
         if persist and self._config_path is not None:
             await asyncio.to_thread(
-                persist_speaker_voice_config,
+                persist_runtime_settings,
                 self._config_path,
                 edge_voice=new_voice,
                 edge_rate=new_rate,
@@ -1696,8 +1698,9 @@ class McpServer:
     def _call_speaker_list_models(self) -> dict[str, Any]:
         return self._tool_result(
             {
-                "current_model": self._config.llm.providers.opencode.model,
-                "models": list(AVAILABLE_MODELS),
+                "current_model": self._active_model_for_provider(),
+                "default_provider": self._config.llm.default_provider,
+                "models": self._available_models_list(),
             }
         )
 
@@ -1712,18 +1715,19 @@ class McpServer:
                 is_error=True,
             )
 
-        self._config.llm.providers.opencode.model = new_model
+        self._set_active_model_for_provider(new_model)
         persisted = False
         if persist and self._config_path is not None:
             await asyncio.to_thread(
                 persist_runtime_settings,
                 self._config_path,
                 model=new_model,
+                model_provider=self._config.llm.default_provider,
             )
             persisted = True
         if self._on_model_changed is not None:
             self._on_model_changed(new_model)
-        label = next((m["label"] for m in AVAILABLE_MODELS if m["id"] == new_model), new_model)
+        label = next((m["label"] for m in self._available_models_list() if m["id"] == new_model), new_model)
         return self._tool_result(
             {
                 "status": "updated",
@@ -1750,6 +1754,33 @@ class McpServer:
                     return left.strip()[:80], right.strip(), category
         derived_key = re.sub(r"\s+", " ", fact)[:24].strip() or "偏好"
         return derived_key, fact, category
+
+    async def get_tool_definitions_for_llm(self) -> list[dict[str, Any]]:
+        """Return enabled MCP tool schemas in-process for OpenAI-compatible / Gemini LLM backends."""
+        resp = await self.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        if not isinstance(resp, dict):
+            return []
+        result = resp.get("result") or {}
+        tools = result.get("tools") or []
+        return [t for t in tools if isinstance(t, dict) and t.get("name")]
+
+    async def execute_tool_in_process(self, name: str, args: dict[str, Any]) -> str:
+        """Execute any registered MCP tool in-process with identical security guards as `/mcp`."""
+        resp = await self.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": args},
+            }
+        )
+        if not isinstance(resp, dict):
+            return json.dumps({"error": "empty_response", "tool": name}, ensure_ascii=False)
+        if "error" in resp:
+            return json.dumps({"error": resp["error"], "tool": name}, ensure_ascii=False)
+        content = (resp.get("result") or {}).get("content") or []
+        texts = [str(c.get("text") or "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        return "\n".join(texts).strip() or json.dumps(resp.get("result") or {}, ensure_ascii=False)
 
     def _build_capabilities(self) -> list[dict[str, Any]]:
         cfg = self._config
@@ -1841,15 +1872,59 @@ class McpServer:
             },
         ]
 
+    def _active_model_for_provider(self) -> str:
+        cfg = self._config.llm
+        p = cfg.default_provider
+        if p == "opencode":
+            return cfg.providers.opencode.model
+        if p in {"codex_api", "openai_compatible"}:
+            return cfg.providers.codex_api.model
+        if p == "gemini_api":
+            return cfg.providers.gemini_api.model
+        return cfg.providers.codex.model or "codex"
+
+    def _set_active_model_for_provider(self, new_model: str) -> None:
+        cfg = self._config.llm
+        p = cfg.default_provider
+        if p == "opencode":
+            cfg.providers.opencode.model = new_model
+        elif p in {"codex_api", "openai_compatible"}:
+            cfg.providers.codex_api.model = new_model
+        elif p == "gemini_api":
+            cfg.providers.gemini_api.model = new_model
+        else:
+            cfg.providers.codex.model = new_model
+
+    def _available_models_list(self) -> list[dict[str, str]]:
+        custom = self._config.llm.available_models
+        if custom:
+            return [
+                {"id": str(m.get("id", "")).strip(), "label": str(m.get("label") or m.get("id") or "").strip()}
+                for m in custom
+                if isinstance(m, dict) and str(m.get("id", "")).strip()
+            ]
+        return list(AVAILABLE_MODELS)
+
     def _build_overview_payload(self) -> dict[str, Any]:
         cfg = self._config
-        current_model = cfg.llm.providers.opencode.model
-        models = list(AVAILABLE_MODELS)
+        current_model = self._active_model_for_provider()
+        models = self._available_models_list()
         if current_model and all(m["id"] != current_model for m in models):
             models.insert(0, {"id": current_model, "label": f"{current_model} (当前)"})
         voice_name = next(
             (v.name for v in EDGE_ZH_VOICES if v.id == cfg.speaker.edge_voice),
             cfg.speaker.edge_voice,
+        )
+        speaker_status = (
+            self._get_speaker_status()
+            if self._get_speaker_status is not None
+            else {
+                "speaker_connected": None,
+                "active_connections": 0,
+                "relay_connections": 0,
+                "lan_connections": 0,
+                "pipeline_awake": False,
+            }
         )
         return {
             "assistant_name": cfg.persona.assistant_name,
@@ -1862,6 +1937,7 @@ class McpServer:
             "available_voices": list_voice_profiles_dicts(),
             "tts_provider": cfg.speaker.tts_provider,
             "speaker_model": cfg.speaker.model,
+            "speaker_status": speaker_status,
             "asr_provider": cfg.speech.asr_provider,
             "asr_model": cfg.speech.asr_model,
             "asr_language": cfg.speech.asr_language,
@@ -2415,7 +2491,7 @@ class McpServer:
                     status=400,
                 )
 
-            new_model = self._config.llm.providers.opencode.model
+            new_model = self._active_model_for_provider()
             new_voice = self._config.speaker.edge_voice
             new_rate = self._config.speaker.edge_rate
             new_local_kw = list(self._config.speech.local_keywords)
@@ -2474,6 +2550,7 @@ class McpServer:
                         persist_runtime_settings,
                         self._config_path,
                         model=new_model if has_model else None,
+                        model_provider=self._config.llm.default_provider if has_model else None,
                         edge_voice=new_voice if has_voice else None,
                         edge_rate=new_rate if has_rate else None,
                         local_keywords=new_local_kw if has_local_kw else None,
@@ -2487,7 +2564,8 @@ class McpServer:
                         status=500,
                     )
 
-            self._config.llm.providers.opencode.model = new_model
+            if has_model:
+                self._set_active_model_for_provider(new_model)
             self._config.speaker.edge_voice = new_voice
             self._config.speaker.edge_rate = new_rate
             self._config.speech.local_keywords = new_local_kw

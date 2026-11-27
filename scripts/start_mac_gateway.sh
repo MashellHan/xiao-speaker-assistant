@@ -43,15 +43,19 @@ if [ -z "$LOCAL_BRIDGE" ]; then
 fi
 
 if [ "$LOCAL_BRIDGE" = "1" ]; then
-  uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
+  uv run --no-sync xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
   SRV_PID=$!
   cleanup() {
     kill "$SRV_PID" ${MCP_PID:+"$MCP_PID"} >/dev/null 2>&1 || true
   }
   trap cleanup EXIT INT TERM
-  /usr/bin/python3 scripts/tcp_bridge.py --listen-port 4399 --target-port 4398
+  if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/python3 ]; then
+    /usr/bin/python3 scripts/tcp_bridge.py --listen-port 4399 --target-port 4398
+  else
+    python3 scripts/tcp_bridge.py --listen-port 4399 --target-port 4398
+  fi
 else
-  uv run xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
+  uv run --no-sync xsa serve --host 127.0.0.1 --port 4398 ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} &
   SRV_PID=$!
   cleanup() {
     kill "$SRV_PID" ${MCP_PID:+"$MCP_PID"} >/dev/null 2>&1 || true

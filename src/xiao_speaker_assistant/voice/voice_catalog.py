@@ -102,27 +102,10 @@ def persist_speaker_voice_config(
     edge_voice: str | None = None,
     edge_rate: str | None = None,
 ) -> Path:
-    """Update `speaker.edge_voice` / `speaker.edge_rate` in `config.yaml` while preserving other fields."""
-    target = Path(config_path) if config_path else Path("config.yaml")
-    data: dict[str, Any] = {}
-    if target.exists():
-        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            data = loaded
-    speaker = data.setdefault("speaker", {})
-    if not isinstance(speaker, dict):
-        speaker = {}
-        data["speaker"] = speaker
-    if edge_voice is not None:
-        speaker["edge_voice"] = edge_voice
-    if edge_rate is not None:
-        speaker["edge_rate"] = edge_rate
+    """Update `speaker.edge_voice` / `speaker.edge_rate` atomically via `persist_runtime_settings`."""
+    from xiao_speaker_assistant.config import persist_runtime_settings
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".yaml.tmp")
-    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    os.replace(tmp, target)
-    return target
+    return persist_runtime_settings(config_path, edge_voice=edge_voice, edge_rate=edge_rate)
 
 
 def list_voice_profiles_dicts() -> list[dict[str, str]]:

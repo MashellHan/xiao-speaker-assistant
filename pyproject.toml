@@ -27,10 +27,6 @@ dev = [
 [project.scripts]
 xsa = "xiao_speaker_assistant.cli:main"
 
-[[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple"
-default = true
-
 [build-system]
 requires = ["setuptools>=69.0"]
 build-backend = "setuptools.build_meta"

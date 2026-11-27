@@ -1174,3 +1174,86 @@ def test_speaker_gateway_records_turn_trace_with_stage_breakdown(tmp_path: Path)
     assert "tts_first_chunk_ms" not in err_tr.breakdown_ms
     assert "start_play_ms" not in err_tr.breakdown_ms
     assert "ttfa_ms" not in err_tr.breakdown_ms
+
+
+def test_p0_oss_readiness_init_doctor_openai_tools_and_speaker_status(tmp_path: Path, monkeypatch) -> None:
+    from xiao_speaker_assistant.llm.router import LLMRouter
+    from xiao_speaker_assistant.tools import TurnTraceStore
+    from xiao_speaker_assistant.voice.speaker_id import default_style_hint_for_role
+
+    # 1. Generic host role hint does not hardcode personal nicknames
+    host_hint = default_style_hint_for_role("Alice", "host")
+    assert "主人" in host_hint
+    assert "大雄" not in host_hint
+
+    # 2. xsa init generates config.yaml without overwriting unless --force
+    init_cfg = tmp_path / "config.yaml"
+    assert cli.main(["--config", str(init_cfg), "init"]) == 0
+    assert init_cfg.is_file()
+    loaded = load_config(init_cfg)
+    assert loaded.llm.default_provider == "openai_compatible"
+    assert "HI NOMI" in loaded.speech.en_keywords
+    assert loaded.speech.vad_min_silence_ms == 450
+
+    # 3. xsa doctor runs cleanly for openai_compatible without requiring opencode CLI
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    assert cli.main(["--config", str(init_cfg), "doctor"]) == 0
+
+    # 4. In-process MCP tool bridge exposes full tool catalog to openai_compatible / gemini_api
+    #    and overview exposes real speaker_status + custom available_models + provider-aware model update
+    cfg = AppConfig()
+    cfg.llm.default_provider = "openai_compatible"
+    cfg.llm.providers.codex_api.model = "gpt-4o-mini"
+    cfg.llm.available_models = [
+        {"id": "gpt-4o-mini", "label": "GPT-4o Mini"},
+        {"id": "deepseek-chat", "label": "DeepSeek Chat"},
+    ]
+    srv = McpServer(
+        cfg,
+        memory_store=MemoryStore(tmp_path / "mem.json"),
+        history_store=ConversationHistoryStore(tmp_path / "hist.json"),
+        trace_store=TurnTraceStore(tmp_path / "traces.json"),
+        config_path=init_cfg,
+        get_speaker_status=lambda: {
+            "speaker_connected": True,
+            "active_connections": 1,
+            "relay_connections": 1,
+            "lan_connections": 0,
+            "pipeline_awake": False,
+        },
+        include_local_tools=True,
+    )
+
+    async def run() -> None:
+        tools_list = await srv.get_tool_definitions_for_llm()
+        tool_names = {t["name"] for t in tools_list}
+        assert {"weather_query", "memory_save", "reminder_set", "speaker_list_voices"}.issubset(tool_names)
+
+        # In-process execution works identically to /mcp
+        res_text = await srv.execute_tool_in_process("speaker_list_voices", {})
+        assert "zh-CN-XiaoyiNeural" in res_text
+
+        runner, port = await srv.start_http_server(host="127.0.0.1", port=0)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                ov = (await client.get(f"{base}/api/overview")).json()
+                assert ov["speaker_status"]["speaker_connected"] is True
+                assert ov["speaker_status"]["relay_connections"] == 1
+                assert ov["model"] == "gpt-4o-mini"
+                assert [m["id"] for m in ov["available_models"]] == ["gpt-4o-mini", "deepseek-chat"]
+
+                upd = await client.post(f"{base}/api/settings", json={"model": "deepseek-chat"})
+                assert upd.status_code == 200
+                assert cfg.llm.providers.codex_api.model == "deepseek-chat"
+                assert load_config(init_cfg).llm.providers.codex_api.model == "deepseek-chat"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+    # 5. LLMRouter logger is defined and never raises NameError on startup prewarm failure
+    import xiao_speaker_assistant.llm.router as router_mod
+
+    assert hasattr(router_mod, "logger")
+    assert isinstance(LLMRouter(cfg.llm)._build_system_prompt(), str)

@@ -1,13 +1,14 @@
-# Copy to config.yaml (ignored by git) and customize.
-# Uses local `opencode` (raven proxy / Gemini) and `codex` CLI — no API keys needed.
+# Copy to config.yaml (ignored by git) via `uv run xsa init` and customize.
+# Supports OpenAI-compatible APIs (OpenAI / DeepSeek / SiliconFlow / Ollama), Gemini API,
+# or local `opencode` / `codex` CLI.
 
 speaker:
   model: OH2P
   ws_host: 0.0.0.0
   ws_port: 4399
   auth_token_env: XSA_SPEAKER_TOKEN
-  tts_provider: edge # edge | say | xiaoai | openai | mlx_audio
-  edge_voice: zh-CN-XiaoxiaoNeural
+  tts_provider: edge # edge | say | xiaoai
+  edge_voice: zh-CN-XiaoyiNeural
   edge_rate: "+8%"
   # Optional per-wake-word voice routing:
   # voice_routes:
@@ -15,6 +16,8 @@ speaker:
   #   hi_nomi: zh-CN-XiaoyiNeural
   say_voice: Tingting
   tts_sample_rate: 24000
+  tool_ack_enabled: true
+  tool_ack_delay_sec: 3.5
 
 speech:
   local_keywords:
@@ -25,6 +28,10 @@ speech:
     - HEY NOMI
     - HEY NOUMI
     - HEY NAOMI
+    - HI NOMI
+    - HI NUOMI
+    - HI NAOMI
+    - NI NAOMI
   speaker_id_enabled: true
   speaker_id_threshold: 0.45
   speaker_profiles_file: ~/.local/share/xiao-speaker-assistant/speakers.json
@@ -48,16 +55,32 @@ speech:
   kws_threshold: 0.20
   aec_enabled: false
   models_dir: models
-  vad_min_silence_ms: 550
+  vad_min_silence_ms: 450
 
 llm:
-  default_provider: opencode # opencode | codex | codex_api | gemini_api
+  # Recommended for new users: `openai_compatible` (works with OpenAI, DeepSeek, Ollama, etc.)
+  # or `gemini_api` / `opencode` / `codex`.
+  default_provider: openai_compatible # openai_compatible | gemini_api | opencode | codex
   spoken_max_chars: 220
+  # Optional custom model dropdown options shown in the Web Console:
+  # available_models:
+  #   - id: gpt-4o-mini
+  #     label: GPT-4o Mini
+  #   - id: deepseek-chat
+  #     label: DeepSeek Chat
   providers:
+    codex_api:
+      # Used by `openai_compatible` (and legacy `codex_api`)
+      base_url: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+      model: gpt-4o-mini
+    gemini_api:
+      api_key_env: GEMINI_API_KEY
+      model: gemini-2.5-flash
     opencode:
       binary: opencode
-      model: raven/gemini-4-hydrogen#low
-      timeout_sec: 120
+      model: openai/gpt-4o-mini
+      timeout_sec: 45
       auto_approve: true
       server_url: http://127.0.0.1:4396
       agent_home: ~/.local/share/xiao-speaker-assistant/agent-home
@@ -70,7 +93,7 @@ llm:
 tools:
   mcp_http_port: 4397
   outlook:
-    enabled: true
+    enabled: false
     client_id_env: OUTLOOK_CLIENT_ID
     tenant_id: consumers
     token_cache_file: ~/.config/xiao-speaker-assistant/outlook_token_cache.json
@@ -88,6 +111,9 @@ persona:
   address_user_as: ""
   style: 亲切自然、简短口语化、直接给出核心结论
   extra_instructions: ""
+  default_city: 北京
+  timezone: Asia/Shanghai
+  reply_language: zh-CN # zh-CN | en | auto
 
 memory:
   enabled: true
