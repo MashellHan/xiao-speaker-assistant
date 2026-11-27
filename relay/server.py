@@ -621,7 +621,7 @@ class RelayServer:
                 "body_b64": base64.b64encode(raw_body).decode("ascii") if raw_body else "",
             }
             await conn.send(json.dumps(frame, ensure_ascii=False))
-            resp_payload = await asyncio.wait_for(fut, timeout=25.0)
+            resp_payload = await asyncio.wait_for(fut, timeout=60.0)
         except TimeoutError:
             return aiohttp_web.json_response(
                 {"error": "gateway_timeout", "message": "Mac 控制台响应超时"},

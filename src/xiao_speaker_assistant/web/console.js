@@ -987,6 +987,10 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: clean.slice(0, 120), voice, rate }),
       });
+      if (res.status === 401) {
+        showLoginGate("登录状态已过期，请重新验证");
+        return;
+      }
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try {

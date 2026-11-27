@@ -270,6 +270,7 @@ async def synthesize_edge_mp3_bytes(
     *,
     voice: str = "zh-CN-XiaoxiaoNeural",
     rate: str = "+0%",
+    max_bytes: int = 1_500_000,
 ) -> bytes:
     """Synthesize text directly to MP3 bytes via Edge-TTS for browser audio preview."""
     import edge_tts
@@ -280,6 +281,8 @@ async def synthesize_edge_mp3_bytes(
         if item.get("type") == "audio":
             data = item.get("data")
             if data:
+                if len(buf) + len(data) > max_bytes:
+                    raise RuntimeError("Edge-TTS audio exceeded maximum preview size")
                 buf.extend(data)
     if not buf:
         raise RuntimeError("Edge-TTS produced empty audio stream")

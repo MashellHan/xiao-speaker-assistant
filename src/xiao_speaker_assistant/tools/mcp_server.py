@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import html
 import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -21,7 +18,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import quote, urlparse
 
 import httpx
 from aiohttp import web
@@ -119,16 +115,6 @@ GEMINI_API_DEFAULT_MODELS: tuple[dict[str, str], ...] = (
     {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
     {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
 )
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
-_PROXY_HEADER_NAMES = (
-    "CF-Connecting-IP",
-    "CF-Ray",
-    "X-Forwarded-For",
-    "X-Forwarded-Host",
-    "Forwarded",
-)
-_CONSOLE_COOKIE_NAME = "xsa_console_session"
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -593,6 +579,10 @@ class McpServer:
         # Fail closed: sensitive tools are allowed ONLY when at least one active turn exists,
         # EVERY concurrent active turn is an authenticated host speaker, and none is expired.
         self._active_voice_turns: dict[str, tuple[SpeakerMatch | None, float]] = {}
+
+    def set_debug_ask_handler(self, handler: Callable[[str], Awaitable[str]] | None) -> None:
+        """Attach or replace the `/api/debug/ask` handler once the LLM router is initialized."""
+        self._on_debug_ask = handler
 
     def begin_voice_turn(self, speaker: SpeakerMatch | None) -> str:
         """Register an in-flight spoken/query turn and return a token for `end_voice_turn`."""
@@ -2073,15 +2063,15 @@ class McpServer:
             )
 
         async def handle_api_login(request: web.Request) -> web.Response:
+            pre_err = guard.check_login_preconditions(request)
+            if pre_err is not None:
+                return pre_err
             try:
                 body = await request.json()
             except Exception:
-                origin_err = guard.check_same_origin(request, message="Cross-origin login is not allowed")
-                if origin_err is not None:
-                    return origin_err
                 return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
             supplied = str(body.get("password") or "").strip() if isinstance(body, dict) else ""
-            ok, err_resp = guard.check_and_record_login(request, supplied)
+            ok, err_resp = guard.verify_and_record_login(request, supplied)
             if not ok and err_resp is not None:
                 return err_resp
             resp = web.json_response({"authenticated": True})
@@ -2564,13 +2554,16 @@ class McpServer:
                 }
             )
 
+        debug_ask_sem = asyncio.Semaphore(1)
+        debug_tts_sem = asyncio.Semaphore(2)
+
         async def handle_api_debug_ask(request: web.Request) -> web.Response:
             denied = _check_console_write_security(request)
             if denied is not None:
                 return denied
             if self._on_debug_ask is None:
                 return web.json_response(
-                    {"error": "debug_unavailable", "message": "在线调试对话未启用"},
+                    {"error": "debug_unavailable", "message": "在线调试对话尚未就绪"},
                     status=503,
                 )
             try:
@@ -2590,21 +2583,27 @@ class McpServer:
                     {"error": "invalid_arguments", "message": "测试问题长度不能超过 400 字"},
                     status=400,
                 )
-            t0 = time.monotonic()
-            try:
-                reply = await asyncio.wait_for(self._on_debug_ask(query), timeout=60.0)
-            except asyncio.TimeoutError:
+            if debug_ask_sem.locked():
                 return web.json_response(
-                    {"error": "timeout", "message": "模型响应超时，请稍后再试"},
-                    status=504,
+                    {"error": "busy", "message": "当前已有调试对话正在执行，请稍候再试"},
+                    status=429,
                 )
-            except Exception as exc:
-                logger.exception("Web Console debug ask failed")
-                return web.json_response(
-                    {"error": "debug_ask_failed", "message": str(exc)},
-                    status=500,
-                )
-            latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            async with debug_ask_sem:
+                t0 = time.monotonic()
+                try:
+                    reply = await asyncio.wait_for(self._on_debug_ask(query), timeout=45.0)
+                except asyncio.TimeoutError:
+                    return web.json_response(
+                        {"error": "timeout", "message": "模型响应超时，请稍后再试"},
+                        status=504,
+                    )
+                except Exception:
+                    logger.exception("Web Console debug ask failed")
+                    return web.json_response(
+                        {"error": "debug_ask_failed", "message": "模型调用失败，请检查后端日志或稍后再试"},
+                        status=500,
+                    )
+                latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
             return web.json_response(
                 {
                     "query": query,
@@ -2648,28 +2647,34 @@ class McpServer:
                     {"error": "invalid_voice_or_rate", "message": str(exc)},
                     status=400,
                 )
-            try:
-                if self._on_debug_tts is not None:
-                    mp3_bytes = await asyncio.wait_for(
-                        self._on_debug_tts(text, voice_id, rate),
-                        timeout=20.0,
-                    )
-                else:
-                    mp3_bytes = await asyncio.wait_for(
-                        synthesize_edge_mp3_bytes(text, voice=voice_id, rate=rate),
-                        timeout=20.0,
-                    )
-            except asyncio.TimeoutError:
+            if debug_tts_sem.locked():
                 return web.json_response(
-                    {"error": "timeout", "message": "TTS 合成超时，请稍后再试"},
-                    status=504,
+                    {"error": "busy", "message": "试听合成请求较多，请稍候再试"},
+                    status=429,
                 )
-            except Exception as exc:
-                logger.warning("Web Console debug TTS failed: %s", exc)
-                return web.json_response(
-                    {"error": "tts_failed", "message": f"音色合成失败：{exc}"},
-                    status=502,
-                )
+            async with debug_tts_sem:
+                try:
+                    if self._on_debug_tts is not None:
+                        mp3_bytes = await asyncio.wait_for(
+                            self._on_debug_tts(text, voice_id, rate),
+                            timeout=20.0,
+                        )
+                    else:
+                        mp3_bytes = await asyncio.wait_for(
+                            synthesize_edge_mp3_bytes(text, voice=voice_id, rate=rate),
+                            timeout=20.0,
+                        )
+                except asyncio.TimeoutError:
+                    return web.json_response(
+                        {"error": "timeout", "message": "TTS 合成超时，请稍后再试"},
+                        status=504,
+                    )
+                except Exception as exc:
+                    logger.warning("Web Console debug TTS failed: %s", exc)
+                    return web.json_response(
+                        {"error": "tts_failed", "message": "音色合成失败，请检查网络或稍后再试"},
+                        status=502,
+                    )
             return web.Response(
                 body=mp3_bytes,
                 content_type="audio/mpeg",

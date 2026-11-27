@@ -116,33 +116,37 @@ async def query_city_weather(
 
         result: dict[str, Any] = {"city": city}
         if isinstance(wttr_res, httpx.Response) and wttr_res.status_code < 400:
-            data = wttr_res.json()
-            cur = (data.get("current_condition") or [{}])[0]
-            weather_days = data.get("weather") or []
-            lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get(
-                "value", ""
-            )
-            result.update(
-                {
-                    "current_temp_c": cur.get("temp_C"),
-                    "feels_like_c": cur.get("FeelsLikeC"),
-                    "condition": lang_desc,
-                    "humidity_pct": cur.get("humidity"),
-                    "wind_kmph": cur.get("windspeedKmph"),
-                }
-            )
-            for day in weather_days:
-                d_str = str(day.get("date") or "")
-                hourly = day.get("hourly") or []
-                mid = hourly[len(hourly) // 2] if hourly else {}
-                cond = (mid.get("lang_zh") or mid.get("weatherDesc") or [{}])[0].get(
+            try:
+                data = wttr_res.json()
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                cur = (data.get("current_condition") or [{}])[0]
+                weather_days = data.get("weather") or []
+                lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get(
                     "value", ""
                 )
-                entry = forecast_by_date.setdefault(d_str, {"date": d_str})
-                entry.setdefault("min_c", day.get("mintempC"))
-                entry.setdefault("max_c", day.get("maxtempC"))
-                if cond:
-                    entry["condition"] = cond
+                result.update(
+                    {
+                        "current_temp_c": cur.get("temp_C"),
+                        "feels_like_c": cur.get("FeelsLikeC"),
+                        "condition": lang_desc,
+                        "humidity_pct": cur.get("humidity"),
+                        "wind_kmph": cur.get("windspeedKmph"),
+                    }
+                )
+                for day in weather_days:
+                    d_str = str(day.get("date") or "")
+                    hourly = day.get("hourly") or []
+                    mid = hourly[len(hourly) // 2] if hourly else {}
+                    cond = (mid.get("lang_zh") or mid.get("weatherDesc") or [{}])[0].get(
+                        "value", ""
+                    )
+                    entry = forecast_by_date.setdefault(d_str, {"date": d_str})
+                    entry.setdefault("min_c", day.get("mintempC"))
+                    entry.setdefault("max_c", day.get("maxtempC"))
+                    if cond:
+                        entry["condition"] = cond
 
         if not forecast_by_date and isinstance(wttr_res, Exception):
             raise wttr_res

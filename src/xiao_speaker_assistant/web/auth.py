@@ -151,45 +151,63 @@ class ConsoleAuthGuard:
             )
         return None
 
-    def check_and_record_login(self, request: web.Request, supplied_password: str) -> tuple[bool, web.Response | None]:
-        """Validate remote console password with bounded sliding-window rate limiting."""
-        origin_err = self.check_same_origin(request, message="Cross-origin login is not allowed")
-        if origin_err is not None:
-            return False, origin_err
-        if not self.console_password:
-            return False, web.json_response(
-                {"error": "auth_unavailable", "message": "Console remote password is not configured"},
-                status=503,
-            )
-        client_key = (
+    def _resolve_login_client_key(self, request: web.Request) -> str:
+        return (
             request.headers.get("CF-Connecting-IP")
             or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
             or (request.remote or "unknown")
         )
-        now = time.monotonic()
+
+    def _prune_login_failures(self, now: float) -> None:
+        if len(self._login_failures) < 4096:
+            return
+        stale_keys = [
+            k
+            for k, ts_list in self._login_failures.items()
+            if not ts_list or (now - ts_list[-1]) >= 60.0
+        ]
+        for k in stale_keys:
+            self._login_failures.pop(k, None)
         if len(self._login_failures) >= 4096:
-            stale_keys = [
-                k
-                for k, ts_list in self._login_failures.items()
-                if not ts_list or (now - ts_list[-1]) >= 60.0
-            ]
-            for k in stale_keys:
+            overflow = len(self._login_failures) - 4096 + 1
+            for k, _ in sorted(
+                self._login_failures.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
+            )[:overflow]:
                 self._login_failures.pop(k, None)
-            if len(self._login_failures) >= 4096:
-                overflow = len(self._login_failures) - 4096 + 1
-                for k, _ in sorted(
-                    self._login_failures.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
-                )[:overflow]:
-                    self._login_failures.pop(k, None)
+
+    def check_login_preconditions(self, request: web.Request) -> web.Response | None:
+        """Run same-origin, password-configured, and rate-limit checks BEFORE reading JSON body."""
+        origin_err = self.check_same_origin(request, message="Cross-origin login is not allowed")
+        if origin_err is not None:
+            return origin_err
+        if not self.console_password:
+            return web.json_response(
+                {"error": "auth_unavailable", "message": "Console remote password is not configured"},
+                status=503,
+            )
+        client_key = self._resolve_login_client_key(request)
+        now = time.monotonic()
+        self._prune_login_failures(now)
         recent = [t for t in self._login_failures.get(client_key, []) if (now - t) < 60.0]
         if not recent:
             self._login_failures.pop(client_key, None)
         if len(recent) >= 5:
             self._login_failures[client_key] = recent
-            return False, web.json_response(
+            return web.json_response(
                 {"error": "rate_limited", "message": "尝试次数过多，请 1 分钟后再试"},
                 status=429,
             )
+        return None
+
+    def verify_and_record_login(self, request: web.Request, supplied_password: str) -> tuple[bool, web.Response | None]:
+        """Verify supplied password and update sliding-window failure tracker."""
+        pre_err = self.check_login_preconditions(request)
+        if pre_err is not None:
+            return False, pre_err
+        assert self.console_password is not None
+        client_key = self._resolve_login_client_key(request)
+        now = time.monotonic()
+        recent = [t for t in self._login_failures.get(client_key, []) if (now - t) < 60.0]
         if not supplied_password or not hmac.compare_digest(supplied_password, self.console_password):
             recent.append(now)
             self._login_failures[client_key] = recent

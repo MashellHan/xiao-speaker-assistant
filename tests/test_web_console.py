@@ -1395,6 +1395,31 @@ def test_split_console_assets_debug_bench_and_extracted_auth_weather(tmp_path: P
                 assert ask_data["latency_ms"] >= 0
                 assert asked == ["今天北京天气"]
 
+                # Login preconditions (rate limit / origin) run BEFORE JSON parsing
+                for _ in range(5):
+                    r_bad = await client.post(
+                        f"{base}/api/login",
+                        headers={"X-Forwarded-For": "198.51.100.77"},
+                        json={"password": "wrong"},
+                    )
+                    assert r_bad.status_code == 401
+                r_malformed_limited = await client.post(
+                    f"{base}/api/login",
+                    headers={"X-Forwarded-For": "198.51.100.77", "Content-Type": "application/json"},
+                    content=b"{not-valid-json",
+                )
+                assert r_malformed_limited.status_code == 429
+
+                # /api/debug/ask does not leak raw internal exception details
+                async def failing_ask(_q: str) -> str:
+                    raise RuntimeError("SECRET_INTERNAL_TOKEN_LEAK")
+
+                srv.set_debug_ask_handler(failing_ask)
+                err_ask = await client.post(f"{base}/api/debug/ask", json={"query": "boom"})
+                assert err_ask.status_code == 500
+                assert "SECRET_INTERNAL_TOKEN_LEAK" not in err_ask.text
+                srv.set_debug_ask_handler(fake_ask)
+
                 # 3. /api/debug/tts returns audio/mpeg and enforces 120-char limit & voice validation
                 too_long_tts = await client.post(f"{base}/api/debug/tts", json={"text": "测" * 121})
                 assert too_long_tts.status_code == 400
