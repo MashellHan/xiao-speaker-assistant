@@ -1305,3 +1305,167 @@ def test_p0_oss_readiness_init_doctor_openai_tools_and_speaker_status(tmp_path: 
     gw._get_session(fake_conn).last_audio_at = time.monotonic()
     st_live = gw.get_runtime_status()
     assert st_live["speaker_connected"] is True
+
+
+def test_split_console_assets_debug_bench_and_extracted_auth_weather(tmp_path: Path) -> None:
+    """Verify modularized web assets, /api/debug/ask & /api/debug/tts security/behavior, and weather module."""
+    from xiao_speaker_assistant.tools.history import TurnTraceStore
+    from xiao_speaker_assistant.tools.weather import query_city_weather
+    from xiao_speaker_assistant.voice.relay_client import RelayConsoleClient
+
+    # Relay console path allowlist exposes /assets/* while still blocking /mcp
+    assert RelayConsoleClient._is_path_allowed("/assets/console.css") is True
+    assert RelayConsoleClient._is_path_allowed("/assets/console.js") is True
+    assert RelayConsoleClient._is_path_allowed("/mcp") is False
+    assert RelayConsoleClient._is_path_allowed("/assets/../mcp") is False
+
+    asked: list[str] = []
+    tts_calls: list[tuple[str, str, str]] = []
+
+    async def fake_ask(q: str) -> str:
+        asked.append(q)
+        return f"已收到：{q}"
+
+    async def fake_tts(text: str, voice: str, rate: str) -> bytes:
+        tts_calls.append((text, voice, rate))
+        return b"ID3FAKE_MP3_PAYLOAD"
+
+    cfg = AppConfig()
+    srv = McpServer(
+        cfg,
+        memory_store=MemoryStore(tmp_path / "mem.json"),
+        history_store=ConversationHistoryStore(tmp_path / "hist.json"),
+        trace_store=TurnTraceStore(tmp_path / "traces.json"),
+        console_password="console-secret-pass",
+        on_debug_ask=fake_ask,
+        on_debug_tts=fake_tts,
+        include_local_tools=True,
+    )
+
+    async def run() -> None:
+        runner, port = await srv.start_http_server(
+            host="127.0.0.1",
+            port=0,
+            auth_token="mcp-secret",
+            console_password="console-secret-pass",
+        )
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                # 1. Split static assets are served cleanly alongside composed /
+                idx = await client.get(f"{base}/")
+                assert idx.status_code == 200
+                assert "debugAskForm" in idx.text
+                assert "debugTtsBtn" in idx.text
+
+                css = await client.get(f"{base}/assets/console.css")
+                assert css.status_code == 200
+                assert "text/css" in css.headers["content-type"]
+                assert "--color-paper" in css.text
+                assert ".debug-result" in css.text
+
+                js = await client.get(f"{base}/assets/console.js")
+                assert js.status_code == 200
+                assert "javascript" in js.headers["content-type"]
+                assert "/api/debug/ask" in js.text
+                assert "/api/debug/tts" in js.text
+
+                # 2. /api/debug/ask works locally, enforces validation, and blocks cross-origin/unauth remote
+                bad_empty = await client.post(f"{base}/api/debug/ask", json={"query": "   "})
+                assert bad_empty.status_code == 400
+                bad_long = await client.post(f"{base}/api/debug/ask", json={"query": "a" * 401})
+                assert bad_long.status_code == 400
+                csrf_ask = await client.post(
+                    f"{base}/api/debug/ask",
+                    headers={"Origin": "https://evil.example"},
+                    json={"query": "hi"},
+                )
+                assert csrf_ask.status_code == 403
+                remote_unauth = await client.post(
+                    f"{base}/api/debug/ask",
+                    headers={"X-Forwarded-For": "203.0.113.5"},
+                    json={"query": "hi"},
+                )
+                assert remote_unauth.status_code == 401
+
+                ok_ask = await client.post(f"{base}/api/debug/ask", json={"query": "今天北京天气"})
+                assert ok_ask.status_code == 200
+                ask_data = ok_ask.json()
+                assert ask_data["reply"] == "已收到：今天北京天气"
+                assert ask_data["latency_ms"] >= 0
+                assert asked == ["今天北京天气"]
+
+                # Login preconditions (rate limit / origin) run BEFORE JSON parsing
+                for _ in range(5):
+                    r_bad = await client.post(
+                        f"{base}/api/login",
+                        headers={"X-Forwarded-For": "198.51.100.77"},
+                        json={"password": "wrong"},
+                    )
+                    assert r_bad.status_code == 401
+                r_malformed_limited = await client.post(
+                    f"{base}/api/login",
+                    headers={"X-Forwarded-For": "198.51.100.77", "Content-Type": "application/json"},
+                    content=b"{not-valid-json",
+                )
+                assert r_malformed_limited.status_code == 429
+
+                # /api/debug/ask does not leak raw internal exception details
+                async def failing_ask(_q: str) -> str:
+                    raise RuntimeError("SECRET_INTERNAL_TOKEN_LEAK")
+
+                srv.set_debug_ask_handler(failing_ask)
+                err_ask = await client.post(f"{base}/api/debug/ask", json={"query": "boom"})
+                assert err_ask.status_code == 500
+                assert "SECRET_INTERNAL_TOKEN_LEAK" not in err_ask.text
+                srv.set_debug_ask_handler(fake_ask)
+
+                # 3. /api/debug/tts returns audio/mpeg and enforces 120-char limit & voice validation
+                too_long_tts = await client.post(f"{base}/api/debug/tts", json={"text": "测" * 121})
+                assert too_long_tts.status_code == 400
+                bad_rate_tts = await client.post(
+                    f"{base}/api/debug/tts",
+                    json={"text": "你好", "rate": "not-a-rate"},
+                )
+                assert bad_rate_tts.status_code == 400
+                ok_tts = await client.post(
+                    f"{base}/api/debug/tts",
+                    json={"text": "你好世界", "voice": "zh-CN-XiaoyiNeural", "rate": "+8%"},
+                )
+                assert ok_tts.status_code == 200
+                assert "audio/mpeg" in ok_tts.headers["content-type"]
+                assert ok_tts.content == b"ID3FAKE_MP3_PAYLOAD"
+                assert tts_calls == [("你好世界", "zh-CN-XiaoyiNeural", "+8%")]
+        finally:
+            await runner.cleanup()
+
+        # 4. Extracted weather module caches cleanly
+        call_count = 0
+
+        def weather_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if "wttr.in" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={
+                        "current_condition": [{"temp_C": "18", "FeelsLikeC": "17", "humidity": "40", "windspeedKmph": "10", "lang_zh": [{"value": "晴"}]}],
+                        "weather": [{"date": "2026-11-27", "mintempC": "8", "maxtempC": "20", "hourly": [{"lang_zh": [{"value": "晴"}]}]}],
+                    },
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={"daily": {"time": ["2026-11-27"], "temperature_2m_min": [8.0], "temperature_2m_max": [20.0]}},
+                request=request,
+            )
+
+        cache: dict[str, tuple[float, dict]] = {}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(weather_handler)) as wclient:
+            r1 = await query_city_weather("北京", client=wclient, cache=cache)
+            r2 = await query_city_weather("北京", client=wclient, cache=cache)
+            assert r1["current_temp_c"] == "18"
+            assert r2["current_temp_c"] == "18"
+            assert call_count == 2  # second call served from cache
+
+    asyncio.run(run())

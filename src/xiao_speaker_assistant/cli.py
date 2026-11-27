@@ -544,21 +544,28 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
     history_source = "bridge" if args.command == "openai-bridge" else "voice"
 
-    def _record_turn(query: str, reply: str, started_at: float) -> None:
+    def _record_turn(
+        query: str,
+        reply: str,
+        started_at: float,
+        *,
+        source_override: str | None = None,
+    ) -> None:
         latency_ms = round((time.monotonic() - started_at) * 1000.0, 1)
         spk = CURRENT_SPEAKER.get()
         active_model = _resolve_active_model(active_config, args.provider)
+        turn_source = source_override or history_source
         history_store.record(
             query=query,
             reply=reply,
             latency_ms=latency_ms,
             model=active_model,
             voice=active_config.speaker.edge_voice,
-            speaker_name=spk.name if spk is not None else "未知",
+            speaker_name=spk.name if spk is not None else ("控制台调试" if source_override == "console_debug" else "未知"),
             speaker_role=spk.role if spk is not None else "",
-            source=history_source,
+            source=turn_source,
         )
-        # If invoked outside SpeakerGateway (e.g. openai-bridge), still persist a bounded trace.
+        # If invoked outside SpeakerGateway (e.g. openai-bridge / console_debug), still persist a bounded trace.
         if CURRENT_TURN_TRACE.get() is None:
             trace_store.record(
                 query=query,
@@ -566,9 +573,9 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
                 breakdown_ms={"llm_total_ms": latency_ms, "total_ms": latency_ms},
                 model=active_model,
                 voice=active_config.speaker.edge_voice,
-                speaker_name=spk.name if spk is not None else "未知",
+                speaker_name=spk.name if spk is not None else ("控制台调试" if source_override == "console_debug" else "未知"),
                 speaker_role=spk.role if spk is not None else "",
-                transport=history_source,
+                transport=turn_source,
                 sample_rate=active_config.speaker.tts_sample_rate,
                 sentence_count=1 if reply.strip() else 0,
                 status="ok",
@@ -630,6 +637,38 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             mcp_server.end_voice_turn(turn_id)
         _record_turn(query, reply, t0)
         return reply
+
+    async def handle_debug_ask(query: str) -> str:
+        """Isolated Web Console test bench query: skips voice email confirmations & tags source=`console_debug`."""
+        t0 = time.monotonic()
+        chosen_prov = args.provider or active_config.llm.default_provider
+        llm_tools = (
+            await _build_in_process_mcp_tools()
+            if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+            else tools
+        )
+        llm_executor = (
+            mcp_server.execute_tool_in_process
+            if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+            else (
+                lambda name, t_args: execute_tool(
+                    clients,
+                    name,
+                    t_args,
+                    require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
+                )
+            )
+        )
+        reply = await router.ask(
+            query,
+            provider=args.provider,
+            tools=llm_tools,
+            executor=llm_executor,
+        )
+        _record_turn(query, reply, t0, source_override="console_debug")
+        return reply
+
+    mcp_server.set_debug_ask_handler(handle_debug_ask)
 
     async def stream_query(query: str):
         t0 = time.monotonic()

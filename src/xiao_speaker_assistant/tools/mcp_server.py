@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import html
 import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import quote, urlparse
 
 import httpx
 from aiohttp import web
@@ -63,7 +59,8 @@ from xiao_speaker_assistant.voice.voice_catalog import (
     normalize_edge_rate,
     resolve_edge_voice,
 )
-from xiao_speaker_assistant.web import load_console_html
+from xiao_speaker_assistant.web import load_console_css, load_console_html, load_console_js
+from xiao_speaker_assistant.web.auth import CONSOLE_COOKIE_NAME, ConsoleAuthGuard
 
 logger = logging.getLogger(__name__)
 
@@ -118,16 +115,6 @@ GEMINI_API_DEFAULT_MODELS: tuple[dict[str, str], ...] = (
     {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
     {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
 )
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
-_PROXY_HEADER_NAMES = (
-    "CF-Connecting-IP",
-    "CF-Ray",
-    "X-Forwarded-For",
-    "X-Forwarded-Host",
-    "Forwarded",
-)
-_CONSOLE_COOKIE_NAME = "xsa_console_session"
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -540,6 +527,8 @@ class McpServer:
         on_wakewords_changed: Callable[[list[str], list[str], bool], None] | None = None,
         on_reminders_config_changed: Callable[[bool, str, str], None] | None = None,
         on_capabilities_changed: Callable[[], None] | None = None,
+        on_debug_ask: Callable[[str], Awaitable[str]] | None = None,
+        on_debug_tts: Callable[[str, str, str], Awaitable[bytes]] | None = None,
         get_speaker_status: Callable[[], dict[str, Any]] | None = None,
         config_path: str | Path | None = None,
         speakers_path: str | Path | None = None,
@@ -576,6 +565,8 @@ class McpServer:
         self._on_wakewords_changed = on_wakewords_changed
         self._on_reminders_config_changed = on_reminders_config_changed
         self._on_capabilities_changed = on_capabilities_changed
+        self._on_debug_ask = on_debug_ask
+        self._on_debug_tts = on_debug_tts
         self._get_speaker_status = get_speaker_status
         self._config_path = config_path
         self._speakers_path = Path(speakers_path).expanduser() if speakers_path is not None else None
@@ -588,6 +579,10 @@ class McpServer:
         # Fail closed: sensitive tools are allowed ONLY when at least one active turn exists,
         # EVERY concurrent active turn is an authenticated host speaker, and none is expired.
         self._active_voice_turns: dict[str, tuple[SpeakerMatch | None, float]] = {}
+
+    def set_debug_ask_handler(self, handler: Callable[[str], Awaitable[str]] | None) -> None:
+        """Attach or replace the `/api/debug/ask` handler once the LLM router is initialized."""
+        self._on_debug_ask = handler
 
     def begin_voice_turn(self, speaker: SpeakerMatch | None) -> str:
         """Register an in-flight spoken/query turn and return a token for `end_voice_turn`."""
@@ -1218,160 +1213,32 @@ class McpServer:
             except OSError:
                 pass
 
-    _WEATHER_CITY_COORDS: dict[str, tuple[float, float]] = {
-        "北京": (39.9042, 116.4074),
-        "海淀": (39.9593, 116.2981),
-        "朝阳区": (39.9219, 116.4436),
-        "北京朝阳": (39.9219, 116.4436),
-        "延庆": (40.4567, 115.9749),
-        "上海": (31.2304, 121.4737),
-        "广州": (23.1291, 113.2644),
-        "深圳": (22.5431, 114.0579),
-        "杭州": (30.2741, 120.1551),
-        "南京": (32.0603, 118.7969),
-        "成都": (30.5728, 104.0668),
-        "重庆": (29.5630, 106.5516),
-        "武汉": (30.5928, 114.3055),
-        "西安": (34.3416, 108.9398),
-        "天津": (39.3434, 117.3616),
-        "苏州": (31.2989, 120.5853),
-        "长沙": (28.2282, 112.9388),
-        "郑州": (34.7466, 113.6253),
-        "青岛": (36.0671, 120.3826),
-        "厦门": (24.4798, 118.0894),
-        "三亚": (18.2528, 109.5119),
-    }
-
-    async def _fetch_open_meteo_7d(
-        self, client: httpx.AsyncClient, city: str
-    ) -> list[dict[str, Any]]:
-        clean = city.strip().rstrip("市区县")
-        coords = self._WEATHER_CITY_COORDS.get(city.strip()) or self._WEATHER_CITY_COORDS.get(clean)
-        if coords is not None:
-            lat, lon = coords
-        else:
-            geo = await client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": city, "count": 1, "language": "zh"},
-            )
-            geo.raise_for_status()
-            results = geo.json().get("results") or []
-            if not results:
-                return []
-            lat = results[0]["latitude"]
-            lon = results[0]["longitude"]
-        fc = await client.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min",
-                "timezone": self._config.persona.timezone or "auto",
-            },
-        )
-        fc.raise_for_status()
-        daily = fc.json().get("daily") or {}
-        dates = daily.get("time") or []
-        mins = daily.get("temperature_2m_min") or []
-        maxs = daily.get("temperature_2m_max") or []
-        return [
-            {"date": d, "min_c": lo, "max_c": hi}
-            for d, lo, hi in zip(dates, mins, maxs)
-        ]
-
     async def _call_weather_query(self, args: dict[str, Any]) -> dict[str, Any]:
+        from xiao_speaker_assistant.tools.weather import query_city_weather
+
         city = str(args.get("city") or "").strip()
         if not city:
             return self._tool_result(
                 {"error": "invalid_arguments", "message": "Argument 'city' is required."},
                 is_error=True,
             )
-        cache_key = (city.rstrip("市区县") or city).lower()
         cache = getattr(self, "_weather_cache", None)
         if cache is None:
             cache = {}
             self._weather_cache = cache
-        cached = cache.get(cache_key)
-        if cached is not None and (time.monotonic() - cached[0]) < 300.0:
-            return self._tool_result(dict(cached[1]))
-        owns_client = self._http_client is None
-        client = self._http_client or httpx.AsyncClient(timeout=6.0, follow_redirects=True)
         try:
-            wttr_task = client.get(
-                f"https://wttr.in/{quote(city, safe='')}",
-                params={"format": "j1", "lang": "zh"},
-                headers={"User-Agent": "curl/8.5.0"},
+            result = await query_city_weather(
+                city,
+                timezone=self._config.persona.timezone or "auto",
+                client=self._http_client,
+                cache=cache,
             )
-            meteo_task = self._fetch_open_meteo_7d(client, city)
-            wttr_res, meteo_res = await asyncio.gather(
-                wttr_task, meteo_task, return_exceptions=True
-            )
-
-            forecast_by_date: dict[str, dict[str, Any]] = {}
-            if isinstance(meteo_res, list):
-                for day in meteo_res:
-                    d_str = str(day.get("date") or "")
-                    if d_str:
-                        forecast_by_date[d_str] = {
-                            "date": d_str,
-                            "min_c": day.get("min_c"),
-                            "max_c": day.get("max_c"),
-                        }
-
-            result: dict[str, Any] = {"city": city}
-            if isinstance(wttr_res, httpx.Response) and wttr_res.status_code < 400:
-                data = wttr_res.json()
-                cur = (data.get("current_condition") or [{}])[0]
-                weather_days = data.get("weather") or []
-                lang_desc = (cur.get("lang_zh") or cur.get("weatherDesc") or [{}])[0].get(
-                    "value", ""
-                )
-                result.update(
-                    {
-                        "current_temp_c": cur.get("temp_C"),
-                        "feels_like_c": cur.get("FeelsLikeC"),
-                        "condition": lang_desc,
-                        "humidity_pct": cur.get("humidity"),
-                        "wind_kmph": cur.get("windspeedKmph"),
-                    }
-                )
-                for day in weather_days:
-                    d_str = str(day.get("date") or "")
-                    hourly = day.get("hourly") or []
-                    mid = hourly[len(hourly) // 2] if hourly else {}
-                    cond = (mid.get("lang_zh") or mid.get("weatherDesc") or [{}])[0].get(
-                        "value", ""
-                    )
-                    entry = forecast_by_date.setdefault(d_str, {"date": d_str})
-                    entry.setdefault("min_c", day.get("mintempC"))
-                    entry.setdefault("max_c", day.get("maxtempC"))
-                    if cond:
-                        entry["condition"] = cond
-
-            if not forecast_by_date and isinstance(wttr_res, Exception):
-                raise wttr_res
-
-            ordered = [forecast_by_date[k] for k in sorted(forecast_by_date)]
-            result["forecast"] = ordered
-            if len(ordered) > 0:
-                result["today_min_c"] = ordered[0].get("min_c")
-                result["today_max_c"] = ordered[0].get("max_c")
-            if len(ordered) > 1:
-                result["tomorrow_min_c"] = ordered[1].get("min_c")
-                result["tomorrow_max_c"] = ordered[1].get("max_c")
-            if result.get("current_temp_c") is not None and ordered:
-                if len(cache) >= 64:
-                    cache.clear()
-                cache[cache_key] = (time.monotonic(), dict(result))
             return self._tool_result(result)
         except Exception as exc:
             return self._tool_result(
                 {"error": "weather_error", "message": str(exc), "city": city},
                 is_error=True,
             )
-        finally:
-            if owns_client:
-                await client.aclose()
 
     async def _call_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         from xiao_speaker_assistant.tools.web_search import run_web_search
@@ -2111,119 +1978,13 @@ class McpServer:
         effective_console_password = (
             console_password if console_password is not None else self._console_password
         )
-        session_secret = hashlib.sha256(
-            (effective_console_password or auth_token or secrets.token_hex(32)).encode("utf-8")
-        ).digest()
-        login_failures: dict[str, list[float]] = {}
-
-        def _extract_hostname(host_header: str) -> str:
-            val = host_header.strip().lower()
-            if val.startswith("["):
-                end = val.find("]")
-                return val[1:end] if end != -1 else val
-            return val.split(":", 1)[0]
-
-        def _is_direct_local_request(request: web.Request) -> bool:
-            remote = (request.remote or "").strip()
-            if remote not in _LOOPBACK_REMOTES:
-                return False
-            if any(h in request.headers for h in _PROXY_HEADER_NAMES):
-                return False
-            host_header = request.headers.get("Host", "")
-            if host_header and _extract_hostname(host_header) not in _LOOPBACK_HOSTS:
-                return False
-            return True
-
-        def _make_session_cookie(ttl_sec: int = 7 * 86400) -> str:
-            exp = str(int(time.time()) + ttl_sec)
-            sig = hmac.new(session_secret, exp.encode("ascii"), hashlib.sha256).hexdigest()
-            return f"{exp}.{sig}"
-
-        def _verify_session_cookie(raw_cookie: str) -> bool:
-            if "." not in raw_cookie:
-                return False
-            exp_str, sig = raw_cookie.split(".", 1)
-            if not exp_str.isdigit():
-                return False
-            if int(exp_str) < int(time.time()):
-                return False
-            expected = hmac.new(session_secret, exp_str.encode("ascii"), hashlib.sha256).hexdigest()
-            return hmac.compare_digest(sig, expected)
-
-        def _has_valid_console_auth(request: web.Request) -> bool:
-            if _is_direct_local_request(request):
-                return True
-            cookies = getattr(request, "cookies", {}) or {}
-            cookie_val = cookies.get(_CONSOLE_COOKIE_NAME, "")
-            if cookie_val and _verify_session_cookie(cookie_val):
-                return True
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                supplied = auth_header[7:].strip()
-                if effective_console_password and hmac.compare_digest(
-                    supplied, effective_console_password
-                ):
-                    return True
-                if auth_token and hmac.compare_digest(supplied, auth_token):
-                    return True
-            return False
-
-        def _check_security(request: web.Request) -> web.Response | None:
-            # Reject proxy-forwarded or non-loopback requests on /mcp so tunnels (e.g. cloudflared)
-            # exposing the Web Console never expose internal MCP tool execution.
-            if not _is_direct_local_request(request):
-                return web.json_response(
-                    {"error": "forbidden", "message": "MCP endpoint is local-only"},
-                    status=403,
-                )
-            # Reject any browser cross-origin / no-cors simple requests immediately.
-            if request.headers.get("Origin"):
-                return web.json_response(
-                    {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
-                    status=403,
-                )
-            if auth_token:
-                auth_header = request.headers.get("Authorization", "")
-                if not auth_header.startswith("Bearer "):
-                    return web.json_response(
-                        {"error": "unauthorized", "message": "Missing Bearer token"},
-                        status=401,
-                    )
-                supplied = auth_header[7:].strip()
-                if not hmac.compare_digest(supplied, auth_token):
-                    return web.json_response(
-                        {"error": "unauthorized", "message": "Invalid Bearer token"},
-                        status=401,
-                    )
-            return None
-
-        def _check_console_read_security(request: web.Request) -> web.Response | None:
-            if not _has_valid_console_auth(request):
-                return web.json_response(
-                    {"error": "unauthorized", "message": "Console login required"},
-                    status=401,
-                )
-            return None
-
-        def _check_console_write_security(request: web.Request) -> web.Response | None:
-            origin = request.headers.get("Origin")
-            if origin:
-                origin_host = (urlparse(origin).hostname or "").lower()
-                req_host = _extract_hostname(request.headers.get("Host", ""))
-                allowed_hosts = set(_LOOPBACK_HOSTS)
-                if req_host:
-                    allowed_hosts.add(req_host)
-                if origin_host not in allowed_hosts:
-                    return web.json_response(
-                        {"error": "forbidden", "message": "Cross-origin requests are not allowed"},
-                        status=403,
-                    )
-            if not _has_valid_console_auth(request):
-                return web.json_response(
-                    {"error": "unauthorized", "message": "Console login required"},
-                    status=401,
-                )
-            return None
+        guard = ConsoleAuthGuard(
+            console_password=effective_console_password,
+            mcp_auth_token=auth_token,
+        )
+        _check_security = guard.check_mcp_security
+        _check_console_read_security = guard.check_console_read_security
+        _check_console_write_security = guard.check_console_write_security
 
         async def handle_mcp_post(request: web.Request) -> web.Response:
             denied = _check_security(request)
@@ -2274,9 +2035,25 @@ class McpServer:
                 headers={"Cache-Control": "no-store"},
             )
 
+        async def handle_console_css(_request: web.Request) -> web.Response:
+            return web.Response(
+                text=load_console_css(),
+                content_type="text/css",
+                charset="utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        async def handle_console_js(_request: web.Request) -> web.Response:
+            return web.Response(
+                text=load_console_js(),
+                content_type="application/javascript",
+                charset="utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
+
         async def handle_api_auth_status(request: web.Request) -> web.Response:
-            is_local = _is_direct_local_request(request)
-            authed = _has_valid_console_auth(request)
+            is_local = guard.is_direct_local_request(request)
+            authed = guard.has_valid_console_auth(request)
             return web.json_response(
                 {
                     "authenticated": authed,
@@ -2286,73 +2063,25 @@ class McpServer:
             )
 
         async def handle_api_login(request: web.Request) -> web.Response:
-            origin = request.headers.get("Origin")
-            if origin:
-                origin_host = (urlparse(origin).hostname or "").lower()
-                req_host = _extract_hostname(request.headers.get("Host", ""))
-                allowed_hosts = set(_LOOPBACK_HOSTS)
-                if req_host:
-                    allowed_hosts.add(req_host)
-                if origin_host not in allowed_hosts:
-                    return web.json_response(
-                        {"error": "forbidden", "message": "Cross-origin login is not allowed"},
-                        status=403,
-                    )
-            if not effective_console_password:
-                return web.json_response(
-                    {"error": "auth_unavailable", "message": "Console remote password is not configured"},
-                    status=503,
-                )
-            client_key = (
-                request.headers.get("CF-Connecting-IP")
-                or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-                or (request.remote or "unknown")
-            )
-            now = time.monotonic()
-            if len(login_failures) >= 4096:
-                stale_keys = [
-                    k
-                    for k, ts_list in login_failures.items()
-                    if not ts_list or (now - ts_list[-1]) >= 60.0
-                ]
-                for k in stale_keys:
-                    login_failures.pop(k, None)
-                if len(login_failures) >= 4096:
-                    overflow = len(login_failures) - 4096 + 1
-                    for k, _ in sorted(
-                        login_failures.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
-                    )[:overflow]:
-                        login_failures.pop(k, None)
-            recent = [t for t in login_failures.get(client_key, []) if (now - t) < 60.0]
-            if not recent:
-                login_failures.pop(client_key, None)
-            if len(recent) >= 5:
-                login_failures[client_key] = recent
-                return web.json_response(
-                    {"error": "rate_limited", "message": "尝试次数过多，请 1 分钟后再试"},
-                    status=429,
-                )
+            pre_err = guard.check_login_preconditions(request)
+            if pre_err is not None:
+                return pre_err
             try:
                 body = await request.json()
             except Exception:
                 return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
             supplied = str(body.get("password") or "").strip() if isinstance(body, dict) else ""
-            if not supplied or not hmac.compare_digest(supplied, effective_console_password):
-                recent.append(now)
-                login_failures[client_key] = recent
-                return web.json_response(
-                    {"error": "invalid_password", "message": "访问口令错误"},
-                    status=401,
-                )
-            login_failures.pop(client_key, None)
+            ok, err_resp = guard.verify_and_record_login(request, supplied)
+            if not ok and err_resp is not None:
+                return err_resp
             resp = web.json_response({"authenticated": True})
             is_https = (
                 request.secure
                 or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
             )
             resp.set_cookie(
-                _CONSOLE_COOKIE_NAME,
-                _make_session_cookie(),
+                CONSOLE_COOKIE_NAME,
+                guard.make_session_cookie(),
                 max_age=7 * 86400,
                 path="/",
                 httponly=True,
@@ -2363,7 +2092,7 @@ class McpServer:
 
         async def handle_api_logout(_request: web.Request) -> web.Response:
             resp = web.json_response({"authenticated": False})
-            resp.del_cookie(_CONSOLE_COOKIE_NAME, path="/")
+            resp.del_cookie(CONSOLE_COOKIE_NAME, path="/")
             return resp
 
         async def handle_api_overview(request: web.Request) -> web.Response:
@@ -2825,6 +2554,133 @@ class McpServer:
                 }
             )
 
+        debug_ask_sem = asyncio.Semaphore(1)
+        debug_tts_sem = asyncio.Semaphore(2)
+
+        async def handle_api_debug_ask(request: web.Request) -> web.Response:
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            if self._on_debug_ask is None:
+                return web.json_response(
+                    {"error": "debug_unavailable", "message": "在线调试对话尚未就绪"},
+                    status=503,
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+            query = str(body.get("query") or "").strip()
+            if not query:
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "请输入测试问题"},
+                    status=400,
+                )
+            if len(query) > 400:
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "测试问题长度不能超过 400 字"},
+                    status=400,
+                )
+            if debug_ask_sem.locked():
+                return web.json_response(
+                    {"error": "busy", "message": "当前已有调试对话正在执行，请稍候再试"},
+                    status=429,
+                )
+            async with debug_ask_sem:
+                t0 = time.monotonic()
+                try:
+                    reply = await asyncio.wait_for(self._on_debug_ask(query), timeout=45.0)
+                except asyncio.TimeoutError:
+                    return web.json_response(
+                        {"error": "timeout", "message": "模型响应超时，请稍后再试"},
+                        status=504,
+                    )
+                except Exception:
+                    logger.exception("Web Console debug ask failed")
+                    return web.json_response(
+                        {"error": "debug_ask_failed", "message": "模型调用失败，请检查后端日志或稍后再试"},
+                        status=500,
+                    )
+                latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            return web.json_response(
+                {
+                    "query": query,
+                    "reply": reply,
+                    "latency_ms": latency_ms,
+                    "model": self._active_model_for_provider(),
+                    "provider": self._config.llm.default_provider,
+                }
+            )
+
+        async def handle_api_debug_tts(request: web.Request) -> web.Response:
+            from xiao_speaker_assistant.voice.tts_stream import synthesize_edge_mp3_bytes
+
+            denied = _check_console_write_security(request)
+            if denied is not None:
+                return denied
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid_json", "message": "Invalid JSON body"}, status=400)
+            if not isinstance(body, dict):
+                return web.json_response({"error": "invalid_json", "message": "Expected JSON object"}, status=400)
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "请输入试听文本"},
+                    status=400,
+                )
+            if len(text) > 120:
+                return web.json_response(
+                    {"error": "invalid_arguments", "message": "试听文本不能超过 120 字"},
+                    status=400,
+                )
+            raw_voice = str(body.get("voice") or self._config.speaker.edge_voice).strip()
+            raw_rate = str(body.get("rate") or self._config.speaker.edge_rate).strip()
+            try:
+                voice_id = resolve_edge_voice(raw_voice).id
+                rate = normalize_edge_rate(raw_rate)
+            except ValueError as exc:
+                return web.json_response(
+                    {"error": "invalid_voice_or_rate", "message": str(exc)},
+                    status=400,
+                )
+            if debug_tts_sem.locked():
+                return web.json_response(
+                    {"error": "busy", "message": "试听合成请求较多，请稍候再试"},
+                    status=429,
+                )
+            async with debug_tts_sem:
+                try:
+                    if self._on_debug_tts is not None:
+                        mp3_bytes = await asyncio.wait_for(
+                            self._on_debug_tts(text, voice_id, rate),
+                            timeout=20.0,
+                        )
+                    else:
+                        mp3_bytes = await asyncio.wait_for(
+                            synthesize_edge_mp3_bytes(text, voice=voice_id, rate=rate),
+                            timeout=20.0,
+                        )
+                except asyncio.TimeoutError:
+                    return web.json_response(
+                        {"error": "timeout", "message": "TTS 合成超时，请稍后再试"},
+                        status=504,
+                    )
+                except Exception as exc:
+                    logger.warning("Web Console debug TTS failed: %s", exc)
+                    return web.json_response(
+                        {"error": "tts_failed", "message": "音色合成失败，请检查网络或稍后再试"},
+                        status=502,
+                    )
+            return web.Response(
+                body=mp3_bytes,
+                content_type="audio/mpeg",
+                headers={"Cache-Control": "no-store"},
+            )
+
         app = web.Application()
         app.router.add_post("/mcp", handle_mcp_post)
         app.router.add_get("/mcp", handle_mcp_get)
@@ -2832,6 +2688,8 @@ class McpServer:
         app.router.add_get("/health", handle_health)
 
         app.router.add_get("/", handle_console_index)
+        app.router.add_get("/assets/console.css", handle_console_css)
+        app.router.add_get("/assets/console.js", handle_console_js)
         app.router.add_get("/api/auth/status", handle_api_auth_status)
         app.router.add_post("/api/login", handle_api_login)
         app.router.add_post("/api/logout", handle_api_logout)
@@ -2845,6 +2703,8 @@ class McpServer:
         app.router.add_delete("/api/memories/{id}", handle_api_memories_delete)
         app.router.add_post("/api/settings", handle_api_settings_post)
         app.router.add_post("/api/capabilities", handle_api_capabilities_post)
+        app.router.add_post("/api/debug/ask", handle_api_debug_ask)
+        app.router.add_post("/api/debug/tts", handle_api_debug_tts)
         app.router.add_get("/api/voiceprints", handle_api_voiceprints_get)
         app.router.add_delete("/api/voiceprints/{id}", handle_api_voiceprints_delete)
         app.router.add_get("/api/reminders", handle_api_reminders_get)

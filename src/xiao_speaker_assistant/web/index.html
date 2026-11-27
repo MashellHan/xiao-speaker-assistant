@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Xiao Speaker Assistant Nomi 控制台：对话历史、实时统计、模型与音色切换、工具能力与家庭声纹记忆管理。">
+  <title>Nomi 控制台 · Xiao Speaker Assistant</title>
+  <style>
+/* INLINE_CSS_PLACEHOLDER */
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-header-inner">
+      <div class="brand-cluster">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/>
+            <path d="M19 10v1a7 7 0 0 1-14 0v-1"/>
+            <line x1="12" y1="18" x2="12" y2="21"/>
+          </svg>
+        </div>
+        <div class="brand-copy">
+          <span class="brand-title" id="assistantTitle">Nomi 控制台</span>
+          <span class="brand-sub">Xiao Speaker Assistant</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <span class="badge" id="speakerConnBadge" title="音箱 WebSocket 实时连接状态" hidden>
+          <span id="speakerConnText">音箱未连接</span>
+        </span>
+        <span class="badge badge--success" id="serverStatus" role="status">
+          <span id="serverStatusText">已连接</span>
+        </span>
+        <button type="button" class="btn btn--sm" id="refreshBtn">刷新</button>
+        <button type="button" class="btn btn--sm btn--danger" id="logoutBtn" hidden>退出</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Mobile Navigation -->
+  <nav class="mobile-tabs" id="mobileTabsBar" role="tablist" aria-label="控制台导航" hidden>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview">概览与配置</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-history" aria-selected="false" data-tab="history">对话历史</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">能力与服务</button>
+    <button type="button" class="mobile-tab" role="tab" aria-controls="panel-memory" aria-selected="false" data-tab="memory">记忆与成员</button>
+  </nav>
+
+  <!-- Remote Login Gate -->
+  <section id="loginGate" class="login-gate" hidden>
+    <article class="login-card">
+      <div>
+        <h1>远端访问验证</h1>
+        <p class="page-subtitle">检测到通过域名或反向代理访问控制台，请输入访问口令（Mac 本机保存在 console.token 或 XSA_CONSOLE_PASSWORD）。</p>
+      </div>
+      <div id="loginError" class="login-error" hidden></div>
+      <form id="loginForm" class="stack" style="gap: var(--spacing-3);">
+        <div class="field">
+          <label for="loginPassword">访问口令</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="输入访问口令" required>
+        </div>
+        <button type="submit" class="btn btn--primary" id="loginSubmitBtn">验证并进入</button>
+      </form>
+    </article>
+  </section>
+
+  <!-- Main App Shell -->
+  <div class="app-shell" id="mainApp" hidden>
+    <aside class="sidebar" id="tabsBar" aria-label="主导航">
+      <div class="sidebar-section-label">工作台</div>
+      <nav class="nav-list" role="tablist" aria-orientation="vertical">
+        <button type="button" class="nav-item" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" data-tab="overview">
+          <span class="nav-item-main">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+            <span>概览与配置</span>
+          </span>
+        </button>
+
+        <button type="button" class="nav-item" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" data-tab="history">
+          <span class="nav-item-main">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <span>对话历史</span>
+          </span>
+          <span class="nav-count" id="navHistoryCount">0</span>
+        </button>
+
+        <button type="button" class="nav-item" role="tab" id="tab-capabilities" aria-controls="panel-capabilities" aria-selected="false" data-tab="capabilities">
+          <span class="nav-item-main">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg>
+            <span>能力与服务</span>
+          </span>
+          <span class="nav-count" id="navCapsCount">0</span>
+        </button>
+
+        <button type="button" class="nav-item" role="tab" id="tab-memory" aria-controls="panel-memory" aria-selected="false" data-tab="memory">
+          <span class="nav-item-main">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span>记忆与成员</span>
+          </span>
+          <span class="nav-count" id="navMemoryCount">0</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-divider"></div>
+
+      <div class="sidebar-footer">
+        <strong>当前节点</strong>
+        <span id="sidebarModelLabel" class="num">未加载</span>
+        <span id="sidebarVoiceLabel">等待连接</span>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <!-- 1. Overview & Settings -->
+      <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
+        <div class="page-header">
+          <div>
+            <h1>概览与配置</h1>
+            <p class="page-subtitle">实时查看对话统计、热切换推理模型与播报音色，并核对声学链路参数</p>
+          </div>
+          <span class="badge badge--accent" id="ttsProviderBadge">edge · OH2P</span>
+        </div>
+
+        <div class="metrics-grid">
+          <div class="stat-card">
+            <span class="stat-label">总对话轮次</span>
+            <div class="stat-value"><span class="num" id="statTotalTurns">0</span><span class="stat-unit">轮</span></div>
+            <span class="stat-sub">今日 <span class="num" id="statTurnsTodayInline">0</span> 轮</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">今日对话</span>
+            <div class="stat-value"><span class="num" id="statTurnsToday">0</span><span class="stat-unit">轮</span></div>
+            <span class="stat-sub">近 14 日实时记录</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">平均 / P95 延迟</span>
+            <div class="stat-value"><span class="num" id="statAvgLatency">0</span><span class="stat-unit">ms</span></div>
+            <span class="stat-sub">P95 <span class="num" id="statP95Latency">0</span> ms</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">本地模型总 Token</span>
+            <div class="stat-value"><span class="num" id="statTotalTokens">0</span></div>
+            <span class="stat-sub" id="statTokensSub">今日 0 · 输入 0 / 输出 0</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">本地模型估算花费</span>
+            <div class="stat-value"><span class="num" id="statTotalCost">$0.00</span></div>
+            <span class="stat-sub" id="statCostSub">今日 $0.0000 · 共 0 次调用</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">缓存命中 Token</span>
+            <div class="stat-value"><span class="num" id="statCacheTokens">0</span></div>
+            <span class="stat-sub" id="statReasoningSub">思考 Token 0</span>
+          </div>
+        </div>
+
+        <section class="card" aria-labelledby="heading-trends">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-trends">近 14 日用量与趋势</h2>
+                <span class="card-meta">按日统计本地对话轮次、平均延迟、OpenCode 模型 Token 消耗与估算花费</span>
+              </div>
+            </div>
+            <div class="trend-controls" role="group" aria-label="趋势指标切换">
+              <button type="button" class="trend-seg" data-trend-metric="tokens" aria-pressed="true">Token 趋势</button>
+              <button type="button" class="trend-seg" data-trend-metric="cost" aria-pressed="false">花费趋势</button>
+              <button type="button" class="trend-seg" data-trend-metric="turns" aria-pressed="false">对话轮次</button>
+              <button type="button" class="trend-seg" data-trend-metric="latency" aria-pressed="false">延迟趋势</button>
+            </div>
+          </div>
+          <div class="trend-chart-wrap" id="trendChartContainer"></div>
+        </section>
+
+        <section class="card" aria-labelledby="heading-traces">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-traces">最近 10 次对话 Trace 与延迟拆解</h2>
+                <span class="card-meta">记录每次对话的 ASR、声纹、LLM 首句、start_play 与 TTS 首块耗时（仅保留最近 10 条）</span>
+              </div>
+            </div>
+            <div class="toolbar-row">
+              <span class="badge" id="traceCountBadge"><span class="num">0</span> / 10</span>
+              <button type="button" class="btn btn--ghost btn--sm" id="clearTracesBtn">清空 Trace</button>
+            </div>
+          </div>
+          <div class="trace-legend" aria-hidden="true">
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--asr"></span>ASR + 声纹</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--llm"></span>LLM 首句 (TTFT)</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--tts"></span>TTS 首块 / start_play</span>
+            <span class="trace-legend-item"><span class="trace-dot trace-dot--rest"></span>后续流式播报</span>
+          </div>
+          <div id="recentTracesContainer"></div>
+        </section>
+
+        <div class="two-col">
+          <div class="stack">
+            <section class="card" aria-labelledby="heading-settings">
+              <div class="card-header">
+                <div class="card-header-title">
+                  <div class="icon-box" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                  </div>
+                  <h2 id="heading-settings">模型、播报与唤醒词热更新</h2>
+                </div>
+                <span class="card-meta num" id="configPathLabel">config.yaml</span>
+              </div>
+              <div class="card-pad">
+                <form id="settingsForm">
+                  <div class="form-grid">
+                    <div class="field field--full">
+                      <label for="modelSelect">推理模型</label>
+                      <select id="modelSelect" name="model"></select>
+                    </div>
+                    <div class="field">
+                      <label for="voiceSelect">TTS 音色</label>
+                      <select id="voiceSelect" name="edge_voice"></select>
+                    </div>
+                    <div class="field">
+                      <label for="rateSelect">播报语速（5 档）</label>
+                      <select id="rateSelect" name="edge_rate">
+                        <option value="-15%">较慢 (-15%)</option>
+                        <option value="-5%">略慢 (-5%)</option>
+                        <option value="+0%">标准 (0%)</option>
+                        <option value="+8%">轻快 (+8% · 默认)</option>
+                        <option value="+20%">快速 (+20%)</option>
+                      </select>
+                    </div>
+                    <div class="field field--full">
+                      <label for="localKeywordsInput">中文唤醒词（逗号分隔）</label>
+                      <input id="localKeywordsInput" name="local_keywords" type="text" placeholder="糯米糯米, 诺米诺米" autocomplete="off">
+                    </div>
+                    <div class="field field--full">
+                      <div style="display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-2); flex-wrap: wrap;">
+                        <label for="enKeywordsInput">英文唤醒词（逗号分隔，自动大写）</label>
+                        <label class="wake-inline-check">
+                          <input id="enKwsEnabledCheck" type="checkbox" checked>
+                          <span>启用英文 KWS</span>
+                        </label>
+                      </div>
+                      <input id="enKeywordsInput" name="en_keywords" type="text" placeholder="HEY NUOMI, HEY NOMI, HI NOMI, HI NUOMI, HI NAOMI, NI NAOMI" autocomplete="off">
+                    </div>
+                  </div>
+                  <div class="form-footer">
+                    <span class="card-meta">保存后原子写入配置文件并热重载本地 KWS，也可以直接语音切换模型和音色</span>
+                    <button type="submit" class="btn btn--primary" id="saveSettingsBtn">保存并热更新</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="heading-breakdown">
+              <div class="card-header">
+                <div class="card-header-title">
+                  <div class="icon-box" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+                  </div>
+                  <h2 id="heading-breakdown">成员与模型分布</h2>
+                </div>
+                <span class="card-meta">基于本地历史记录</span>
+              </div>
+              <div id="statsBreakdown"></div>
+            </section>
+          </div>
+
+          <div class="stack">
+            <section class="card" aria-labelledby="heading-debug-bench">
+              <div class="card-header">
+                <div class="card-header-title">
+                  <div class="icon-box" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </div>
+                  <div>
+                    <h2 id="heading-debug-bench">在线对话调试与音色试听</h2>
+                    <span class="card-meta">无需物理音箱，直接在浏览器验证大模型对话、MCP 工具与当前音色</span>
+                  </div>
+                </div>
+              </div>
+              <div class="card-pad">
+                <form id="debugAskForm" class="debug-form">
+                  <div class="field field--full">
+                    <label for="debugQueryInput">输入测试问题（走当前模型与全量 MCP 工具）</label>
+                    <div class="debug-input-row">
+                      <input id="debugQueryInput" type="text" maxlength="400" placeholder="例如：今天北京天气怎么样 / 帮我设一个 1 分钟后提醒" autocomplete="off">
+                      <button type="submit" class="btn btn--primary" id="debugAskBtn">发送测试</button>
+                      <button type="button" class="btn" id="debugTtsBtn">试听当前音色</button>
+                    </div>
+                  </div>
+                </form>
+                <div id="debugResultBox" class="debug-result" hidden>
+                  <div class="debug-result-meta">
+                    <span id="debugResultModel" class="badge"></span>
+                    <span id="debugResultLatency" class="num"></span>
+                    <button type="button" class="btn btn--ghost btn--sm" id="debugPlayReplyBtn" hidden>朗读此回复</button>
+                  </div>
+                  <p id="debugResultText" class="debug-result-text"></p>
+                </div>
+                <div id="debugAudioWrap" class="debug-audio-wrap" hidden>
+                  <audio id="debugAudioPlayer" controls preload="none"></audio>
+                </div>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="heading-runtime">
+              <div class="card-header">
+                <div class="card-header-title">
+                  <div class="icon-box" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                  </div>
+                  <h2 id="heading-runtime">运行链路与声学参数</h2>
+                </div>
+              </div>
+              <div class="info-list" id="runtimeSpecList"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Chat History -->
+      <section id="panel-history" class="panel" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="page-header">
+          <div>
+            <h1>对话历史</h1>
+            <p class="page-subtitle">当前显示最近 <span class="num" id="historyCountLabel">0</span> 轮语音与桥接交互</p>
+          </div>
+          <div class="toolbar-row">
+            <input id="speakerFilter" class="search-input" type="search" placeholder="按说话人筛选（如：主人、小明）" aria-label="按说话人筛选">
+            <button type="button" class="btn" id="applyFilterBtn">筛选</button>
+            <button type="button" class="btn btn--danger" id="clearHistoryBtn">清空历史</button>
+          </div>
+        </div>
+        <section class="card">
+          <div id="historyList"></div>
+        </section>
+      </section>
+
+      <!-- 3. Capabilities -->
+      <section id="panel-capabilities" class="panel" role="tabpanel" aria-labelledby="tab-capabilities" hidden>
+        <div class="page-header">
+          <div>
+            <h1>能力与服务</h1>
+            <p class="page-subtitle">实时开关核心能力、配置夜间免打扰时段，并查看各插件与 MCP 运行状态</p>
+          </div>
+        </div>
+
+        <section class="card" aria-labelledby="heading-cap-switches">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-cap-switches">能力开关与免打扰时段</h2>
+                <span class="card-meta">变更会原子写入 config.yaml 并即时热更新</span>
+              </div>
+            </div>
+          </div>
+          <div class="info-list">
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">主动定时提醒与每日早报</span>
+                <span class="info-row-sub">允许音箱到点响提示音并主动语音播报倒计时、定时提醒与早报</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleReminders" data-cap-toggle="reminders_enabled" aria-checked="true" aria-label="开关主动定时提醒"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">长期记忆</span>
+                <span class="info-row-sub">在对话中记住常住城市、称呼与个人偏好（0600 隔离保存）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleMemory" data-cap-toggle="memory_enabled" aria-checked="true" aria-label="开关长期记忆"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">小红书 MCP 搜索</span>
+                <span class="info-row-sub">通过本机 :18060 小红书 MCP 搜索笔记与详情（需先扫码登录）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleXiaohongshu" data-cap-toggle="xiaohongshu_enabled" aria-checked="false" aria-label="开关小红书 MCP"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">Playwright Edge 浏览器 MCP</span>
+                <span class="info-row-sub">启用 :8931 浏览器 MCP 深度抓取与页面交互（关闭时仍可使用内置网页摘要与打开 Edge）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleBrowser" data-cap-toggle="browser_enabled" aria-checked="false" aria-label="开关浏览器 MCP"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">Outlook 邮件助手</span>
+                <span class="info-row-sub">读邮件并在语音二次确认后发邮件（需先配置客户端编号与离线登录凭证）</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleOutlook" data-cap-toggle="outlook_enabled" aria-checked="true" aria-label="开关 Outlook 邮件助手"></button>
+            </div>
+            <div class="toggle-row">
+              <div class="info-row-main">
+                <span class="info-row-label">敏感工具主人声纹鉴权</span>
+                <span class="info-row-sub">开启后，仅已注册为 host 角色的主人声纹可调用本机文件读取、Codex 分析与 Outlook 邮件</span>
+              </div>
+              <button type="button" class="cap-switch" role="switch" id="toggleHostVoiceprint" data-cap-toggle="require_host_voiceprint" aria-checked="false" aria-label="开关敏感工具主人声纹鉴权"></button>
+            </div>
+          </div>
+          <div class="card-pad" style="border-top: 1px solid var(--color-border);">
+            <form id="quietHoursForm" class="quiet-form">
+              <div class="field">
+                <label for="quietStartInput">每日免打扰开始（24h）</label>
+                <input id="quietStartInput" type="time" step="60" value="23:00" required>
+              </div>
+              <div class="field">
+                <label for="quietEndInput">每日免打扰结束（24h）</label>
+                <input id="quietEndInput" type="time" step="60" value="07:00" required>
+              </div>
+              <button type="submit" class="btn btn--primary" id="saveQuietBtn">保存免打扰</button>
+            </form>
+          </div>
+        </section>
+
+        <div class="caps-grid" id="capabilitiesGrid"></div>
+      </section>
+
+      <!-- 4. Memories, Voiceprints & Reminders (Astryx ConnectedAccounts collapsible cards) -->
+      <section id="panel-memory" class="panel" role="tabpanel" aria-labelledby="tab-memory" hidden>
+        <div class="page-header">
+          <div>
+            <h1>记忆、声纹与提醒</h1>
+            <p class="page-subtitle">共保存 <span class="num" id="memoryCountLabel">0</span> 条长期记忆、<span class="num" id="voiceprintCountLabel">0</span> 位声纹成员与 <span class="num" id="reminderCountLabel">0</span> 条提醒</p>
+          </div>
+          <div class="toolbar-row">
+            <span class="badge badge--success" id="memoryStatusChip">已启用</span>
+            <button type="button" class="btn btn--ghost btn--sm" id="toggleAllGroupsBtn">全部收起</button>
+          </div>
+        </div>
+
+        <!-- Collapsible Group 1: Memories -->
+        <section class="card" aria-labelledby="heading-memories">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-memories">长期记忆</h2>
+                <span class="card-meta">0600 私有隔离存储，自动拦截密钥与密码</span>
+              </div>
+            </div>
+            <div class="group-trigger-right">
+              <div class="group-summary">
+                <span class="group-summary-label">条目数</span>
+                <span class="group-summary-value num" id="groupMemoriesSummary">0</span>
+              </div>
+              <button type="button" class="btn btn--ghost btn--sm" data-group-toggle="memories" aria-expanded="true" aria-controls="group-body-memories">收起</button>
+            </div>
+          </div>
+          <div class="group-body" id="group-body-memories">
+            <div class="card-pad" style="border-bottom: 1px solid var(--color-border);">
+              <form id="memoryForm" class="inline-form">
+                <div class="field">
+                  <label for="memoryKey">主题 Key</label>
+                  <input id="memoryKey" type="text" maxlength="80" placeholder="例如：常住城市">
+                </div>
+                <div class="field">
+                  <label for="memoryValue">记忆内容</label>
+                  <input id="memoryValue" type="text" maxlength="300" placeholder="例如：北京市海淀区">
+                </div>
+                <button type="submit" class="btn btn--primary">添加记忆</button>
+              </form>
+            </div>
+            <div id="memoryList"></div>
+          </div>
+        </section>
+
+        <!-- Collapsible Group 2: Family Voiceprints -->
+        <section class="card" aria-labelledby="heading-voiceprints">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-voiceprints">家庭声纹成员</h2>
+                <span class="card-meta">成员说完话后，对音箱说“记住刚才说话的是…”即可自动录入</span>
+              </div>
+            </div>
+            <div class="group-trigger-right">
+              <div class="group-summary">
+                <span class="group-summary-label">已注册</span>
+                <span class="group-summary-value num" id="groupVoiceprintsSummary">0</span>
+              </div>
+              <button type="button" class="btn btn--ghost btn--sm" data-group-toggle="voiceprints" aria-expanded="true" aria-controls="group-body-voiceprints">收起</button>
+            </div>
+          </div>
+          <div class="group-body" id="group-body-voiceprints">
+            <div id="voiceprintList"></div>
+          </div>
+        </section>
+
+        <!-- Collapsible Group 3: Proactive Reminders -->
+        <section class="card" aria-labelledby="heading-reminders">
+          <div class="card-header">
+            <div class="card-header-title">
+              <div class="icon-box" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+              </div>
+              <div>
+                <h2 id="heading-reminders">主动提醒与早报</h2>
+                <span class="card-meta">倒计时提醒、每日早报与定时播报任务</span>
+              </div>
+            </div>
+            <div class="group-trigger-right">
+              <div class="group-summary">
+                <span class="group-summary-label">任务数</span>
+                <span class="group-summary-value num" id="groupRemindersSummary">0</span>
+              </div>
+              <button type="button" class="btn btn--ghost btn--sm" data-group-toggle="reminders" aria-expanded="true" aria-controls="group-body-reminders">收起</button>
+            </div>
+          </div>
+          <div class="group-body" id="group-body-reminders">
+            <div class="card-pad" style="border-bottom: 1px solid var(--color-border);">
+              <form id="reminderForm" class="reminder-form">
+                <div class="field">
+                  <label for="reminderMessage">播报内容</label>
+                  <input id="reminderMessage" type="text" maxlength="200" placeholder="例如：提醒喝水 / 每日天气与待办早报" required>
+                </div>
+                <div class="field">
+                  <label for="reminderMode">调度方式</label>
+                  <select id="reminderMode">
+                    <option value="delay">倒计时（分钟）</option>
+                    <option value="daily">每日定时（HH:MM）</option>
+                    <option value="once">指定时间</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="reminderKind">播报类型</label>
+                  <select id="reminderKind">
+                    <option value="reminder">普通提醒</option>
+                    <option value="morning_briefing">智能早报（含天气/待办）</option>
+                  </select>
+                </div>
+                <div class="field" id="reminderDelayField">
+                  <label for="reminderMinutes">倒计时分钟</label>
+                  <input id="reminderMinutes" type="number" min="1" max="43200" value="10">
+                </div>
+                <div class="field" id="reminderDailyField" hidden>
+                  <label for="reminderDailyTime">每日时间</label>
+                  <input id="reminderDailyTime" type="time" value="08:30">
+                </div>
+                <div class="field" id="reminderOnceField" hidden>
+                  <label for="reminderOnceTime">触发时间</label>
+                  <input id="reminderOnceTime" type="datetime-local">
+                </div>
+                <button type="submit" class="btn btn--primary" id="addReminderBtn">添加提醒</button>
+              </form>
+            </div>
+            <div id="reminderList"></div>
+          </div>
+        </section>
+
+        <div class="info-banner">
+          <div class="icon-box" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <div>
+            <strong>隐私与数据隔离</strong>
+            对话历史、长期记忆与声纹向量均仅保存在你本机 Mac 的 <span class="num">0600</span> 权限文件中，经由公网代理访问时自动启用口令门禁并拒绝暴露 <span class="num">/mcp</span> 接口。
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+// INLINE_JS_PLACEHOLDER
+  </script>
+</body>
+</html>

@@ -534,7 +534,12 @@ class RelayServer:
         normalized = posixpath.normpath(decoded)
         if not normalized.startswith("/"):
             return False
-        return normalized == "/" or normalized == "/health" or normalized.startswith("/api/")
+        return (
+            normalized == "/"
+            or normalized == "/health"
+            or normalized.startswith("/api/")
+            or normalized.startswith("/assets/")
+        )
 
     async def _handle_console_http(self, request: Any) -> Any:
         assert aiohttp_web is not None
@@ -616,7 +621,7 @@ class RelayServer:
                 "body_b64": base64.b64encode(raw_body).decode("ascii") if raw_body else "",
             }
             await conn.send(json.dumps(frame, ensure_ascii=False))
-            resp_payload = await asyncio.wait_for(fut, timeout=25.0)
+            resp_payload = await asyncio.wait_for(fut, timeout=60.0)
         except TimeoutError:
             return aiohttp_web.json_response(
                 {"error": "gateway_timeout", "message": "Mac 控制台响应超时"},

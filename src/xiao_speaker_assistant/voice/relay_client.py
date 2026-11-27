@@ -340,7 +340,12 @@ class RelayConsoleClient:
         if not normalized.startswith("/"):
             return False
         # Defense-in-depth on Mac side too: never forward `/mcp` over the remote console tunnel.
-        return normalized == "/" or normalized == "/health" or normalized.startswith("/api/")
+        return (
+            normalized == "/"
+            or normalized == "/health"
+            or normalized.startswith("/api/")
+            or normalized.startswith("/assets/")
+        )
 
     async def _handle_http_request(
         self,
@@ -469,7 +474,7 @@ class RelayConsoleClient:
         self._connected_event.set()
         received_any = False
         tasks: set[asyncio.Task[None]] = set()
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as http_client:
+        async with httpx.AsyncClient(timeout=55.0, follow_redirects=False) as http_client:
             try:
                 async for raw in ws:
                     received_any = True
