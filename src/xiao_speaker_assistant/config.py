@@ -156,8 +156,16 @@ class McpEndpointConfig(BaseModel):
     preferred_browser: str | None = None
 
 
+class SearchToolConfig(BaseModel):
+    provider: Literal["auto", "tavily", "searxng", "bing"] = "auto"
+    tavily_api_key_env: str = "TAVILY_API_KEY"
+    searxng_url: str = ""
+    searxng_url_env: str = "SEARXNG_URL"
+
+
 class ToolsConfig(BaseModel):
     outlook: OutlookToolConfig = Field(default_factory=OutlookToolConfig)
+    search: SearchToolConfig = Field(default_factory=SearchToolConfig)
     xiaohongshu: McpEndpointConfig = Field(
         default_factory=lambda: McpEndpointConfig(enabled=False, mcp_url="http://127.0.0.1:18060/mcp")
     )

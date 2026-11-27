@@ -6,8 +6,10 @@ import html
 import ipaddress
 import json
 import re
+import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
@@ -160,10 +162,25 @@ def validate_http_url(
     return cleaned
 
 
-def build_edge_open_command(url: str) -> list[str]:
-    """Build the macOS `open -a \"Microsoft Edge\" <url>` argv list without shell expansion."""
+def build_edge_open_command(url: str, *, platform: str | None = None) -> list[str]:
+    """Build a cross-platform argv list to open `url` in desktop browser without shell expansion."""
     validated_url = validate_http_url(url)
-    return ["open", "-a", EDGE_APP_NAME, validated_url]
+    plat = (platform or sys.platform).lower()
+    if plat == "darwin":
+        return ["open", "-a", EDGE_APP_NAME, validated_url]
+    if plat.startswith("linux"):
+        for candidate in ("microsoft-edge", "microsoft-edge-stable", "google-chrome", "chromium", "xdg-open"):
+            if shutil.which(candidate):
+                return [candidate, validated_url]
+        return ["xdg-open", validated_url]
+    if plat in {"win32", "cygwin", "msys"}:
+        # Never invoke `cmd /c start`, because cmd.exe interprets `&`, `%`, `^` in query strings as
+        # shell operators. Launching the browser binary or `explorer.exe` directly via argv is safe.
+        for candidate in ("msedge", "msedge.exe", "chrome", "chrome.exe", "explorer.exe"):
+            if shutil.which(candidate):
+                return [candidate, validated_url]
+        return ["explorer.exe", validated_url]
+    return ["xdg-open", validated_url]
 
 
 def open_in_edge(
@@ -171,15 +188,17 @@ def open_in_edge(
     *,
     dry_run: bool = False,
     runner: Callable[[list[str]], Any] | None = None,
+    platform: str | None = None,
 ) -> str:
-    """Validate an http/https URL and open it in Microsoft Edge, returning status JSON."""
-    cmd = build_edge_open_command(url)
+    """Validate an http/https URL and open it in the desktop browser, returning status JSON."""
+    cmd = build_edge_open_command(url, platform=platform)
     validated_url = cmd[-1]
+    browser_label = EDGE_APP_NAME if (platform or sys.platform).lower() == "darwin" else cmd[0]
     if dry_run:
         return json.dumps(
             {
                 "status": "dry_run",
-                "browser": EDGE_APP_NAME,
+                "browser": browser_label,
                 "url": validated_url,
                 "command": cmd,
             },
@@ -194,7 +213,7 @@ def open_in_edge(
     return json.dumps(
         {
             "status": "opened",
-            "browser": EDGE_APP_NAME,
+            "browser": browser_label,
             "url": validated_url,
             "command": cmd,
         },

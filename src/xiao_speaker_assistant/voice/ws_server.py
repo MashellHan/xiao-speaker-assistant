@@ -76,6 +76,9 @@ class SpeakerSession:
     seen_dialogs: set[str] = field(default_factory=set)
     continuous_mode: bool = False
     query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cloud_asr_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cloud_asr_tasks: deque[asyncio.Task[None]] = field(default_factory=deque)
+    asr_epoch: int = 0
     mute_native_until: float = 0.0
     last_audio_at: float = 0.0
     last_chime_at: float = 0.0
@@ -84,6 +87,10 @@ class SpeakerSession:
     interrupted: bool = False
     active_voice: str | None = None
     recent_spoken_texts: deque[tuple[float, str]] = field(default_factory=deque)
+
+
+_MAX_PENDING_CLOUD_ASR_TASKS = 2
+_CLOUD_ASR_TIMEOUT_SEC = 25.0
 
 
 _ECHO_STRIP_RE = re.compile(r"[\s，,。.!！？?、；;：:\"'`~～]+")
@@ -291,13 +298,24 @@ class SpeakerGateway:
         self._playbacks[conn] = pb
         return pb
 
+    @staticmethod
+    def _cancel_cloud_asr_tasks(sess: SpeakerSession) -> None:
+        """Invalidate and cancel any in-flight/queued cloud ASR tasks for `sess`."""
+        sess.asr_epoch += 1
+        while sess.cloud_asr_tasks:
+            t = sess.cloud_asr_tasks.popleft()
+            if not t.done():
+                t.cancel()
+
     def _cleanup_connection(self, conn: Any) -> None:
         self._connections.discard(conn)
         self._relay_connections.discard(conn)
         sess = self._sessions.pop(conn, None)
-        if sess is not None and sess.active_reply_task is not None and not sess.active_reply_task.done():
-            sess.interrupted = True
-            sess.active_reply_task.cancel()
+        if sess is not None:
+            self._cancel_cloud_asr_tasks(sess)
+            if sess.active_reply_task is not None and not sess.active_reply_task.done():
+                sess.interrupted = True
+                sess.active_reply_task.cancel()
         self._playbacks.pop(conn, None)
         conn_rpcs = self._pending_rpc.pop(conn, {})
         for fut in conn_rpcs.values():
@@ -605,32 +623,144 @@ class SpeakerGateway:
         def on_sleep() -> None:
             logger.info("Returned silently to wake-word idle")
             sess.active_voice = None
+            loop.call_soon_threadsafe(lambda: self._cancel_cloud_asr_tasks(sess))
             if self._on_session_reset is not None:
                 loop.call_soon_threadsafe(self._on_session_reset)
 
         def on_interrupt(keyword: str) -> None:
             logger.info("Barge-in interrupt triggered (%s)", keyword)
+            loop.call_soon_threadsafe(lambda: self._cancel_cloud_asr_tasks(sess))
             loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_interrupt(conn)))
 
         def on_barge_in_wakeup(keyword: str) -> None:
             logger.info("Barge-in wake word triggered (%s)", keyword)
             sess.active_voice = self._resolve_voice_for_keyword(keyword)
+            loop.call_soon_threadsafe(lambda: self._cancel_cloud_asr_tasks(sess))
             loop.call_soon_threadsafe(lambda: loop.create_task(self._handle_barge_in_wakeup(conn)))
 
+        def on_cloud_segment(
+            segment: Any,
+            embedding: list[float] | None,
+            vad_end_mono: float,
+            speaker_id_ms: float | None,
+        ) -> None:
+            def _schedule() -> None:
+                if conn not in self._connections or self._sessions.get(conn) is not sess:
+                    return
+                # Bound queued cloud ASR tasks so a slow/broken network cannot accumulate stale segments.
+                while len(sess.cloud_asr_tasks) >= _MAX_PENDING_CLOUD_ASR_TASKS:
+                    stale = sess.cloud_asr_tasks.popleft()
+                    if not stale.done():
+                        stale.cancel()
+                epoch = sess.asr_epoch
+                task = loop.create_task(
+                    self._process_cloud_segment(
+                        conn,
+                        sess,
+                        epoch,
+                        segment,
+                        embedding=embedding,
+                        vad_end_mono=vad_end_mono,
+                        speaker_id_ms=speaker_id_ms,
+                    )
+                )
+                sess.cloud_asr_tasks.append(task)
+
+                def _discard_done(done_task: asyncio.Task[None]) -> None:
+                    try:
+                        sess.cloud_asr_tasks.remove(done_task)
+                    except ValueError:
+                        pass
+
+                task.add_done_callback(_discard_done)
+
+            loop.call_soon_threadsafe(_schedule)
+
+        use_async_cloud = bool(getattr(self._pipeline, "has_cloud_asr", False))
         await loop.run_in_executor(
             self._asr_executor,
             lambda: self._pipeline.feed_pcm(  # type: ignore[union-attr]
                 pcm,
                 on_wakeup=on_wakeup,
                 on_utterance_embedding=on_utterance,
+                **({"on_cloud_segment": on_cloud_segment} if use_async_cloud else {}),
                 on_sleep=on_sleep,
                 on_interrupt=on_interrupt,
                 on_barge_in_wakeup=on_barge_in_wakeup,
             ),
         )
 
+    async def _process_cloud_segment(
+        self,
+        conn: Any,
+        sess: SpeakerSession,
+        epoch: int,
+        segment: Any,
+        *,
+        embedding: list[float] | None,
+        vad_end_mono: float,
+        speaker_id_ms: float | None,
+    ) -> None:
+        """Run cloud ASR off the KWS/VAD audio thread so barge-in & VAD stay real-time."""
+        if self._pipeline is None:
+            return
+
+        def _is_still_valid() -> bool:
+            return (
+                conn in self._connections
+                and self._sessions.get(conn) is sess
+                and sess.asr_epoch == epoch
+            )
+
+        async with sess.cloud_asr_lock:
+            if not _is_still_valid():
+                return
+            t_req = time.monotonic()
+            try:
+                text = await asyncio.wait_for(
+                    self._pipeline.atranscribe_cloud(segment),
+                    timeout=_CLOUD_ASR_TIMEOUT_SEC,
+                )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                logger.warning("Async cloud ASR timed out after %.0fs", _CLOUD_ASR_TIMEOUT_SEC)
+                return
+            except Exception as exc:
+                logger.warning("Async cloud ASR failed: %s", exc)
+                return
+            if not _is_still_valid():
+                logger.debug("Dropping stale cloud ASR result after interrupt/disconnect")
+                return
+            asr_ms = round((time.monotonic() - t_req) * 1000.0, 1)
+            resolved = self._pipeline.resolve_transcribed_text(
+                text,
+                vad_end_mono=vad_end_mono,
+                asr_ms=asr_ms,
+                speaker_id_ms=speaker_id_ms,
+            )
+            if resolved is None or not _is_still_valid():
+                return
+            kind, payload, metrics = resolved
+            if kind == "wakeup":
+                logger.info("Cloud ASR wake word detected: %s", payload)
+                sess.active_voice = self._resolve_voice_for_keyword(payload)
+                sess.mute_native_until = time.monotonic() + 8.0
+                asyncio.create_task(self.play_wakeup_chime(conn))
+                return
+            logger.info("Cloud ASR recognized: %s (%.0fms)", payload, asr_ms)
+            asyncio.create_task(
+                self._process_local_utterance(
+                    conn,
+                    payload,
+                    embedding=embedding,
+                    asr_metrics=metrics,
+                )
+            )
+
     async def _handle_barge_in_wakeup(self, conn: Any) -> None:
         sess = self._get_session(conn)
+        self._cancel_cloud_asr_tasks(sess)
         sess.interrupted = True
         sess.mute_native_until = time.monotonic() + 8.0
         if sess.active_reply_task is not None and not sess.active_reply_task.done():
@@ -647,6 +777,7 @@ class SpeakerGateway:
 
     async def _handle_interrupt(self, conn: Any) -> None:
         sess = self._get_session(conn)
+        self._cancel_cloud_asr_tasks(sess)
         sess.interrupted = True
         if sess.active_reply_task is not None and not sess.active_reply_task.done():
             sess.active_reply_task.cancel()
@@ -668,6 +799,7 @@ class SpeakerGateway:
     async def _yield_to_native_xiaoai(self, conn: Any) -> None:
         logger.info("Native XiaoAI activated; yielding control cleanly to avoid crosstalk")
         sess = self._get_session(conn)
+        self._cancel_cloud_asr_tasks(sess)
         sess.interrupted = True
         sess.mute_native_until = 0.0
         self._mute_native_until = 0.0

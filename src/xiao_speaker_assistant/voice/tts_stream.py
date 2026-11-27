@@ -381,6 +381,56 @@ async def stream_edge_tts_pcm(
             await proc.wait()
 
 
+async def synthesize_espeak_pcm(
+    text: str,
+    *,
+    sample_rate: int = 24000,
+    voice: str = "cmn",
+) -> bytes:
+    """Offline Linux/cross-platform fallback synthesizer using `espeak-ng` or `espeak`."""
+    espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not espeak_bin:
+        raise RuntimeError("Neither macOS `say` nor Linux `espeak-ng`/`espeak` binary was found")
+    # Pass text via `--stdin` so replies starting with `-` (e.g. `-5度`) are never parsed as flags.
+    candidates = [voice]
+    for fallback_voice in ("cmn", "zh", ""):
+        if fallback_voice not in candidates:
+            candidates.append(fallback_voice)
+    last_err = ""
+    for cand in candidates:
+        argv = [espeak_bin]
+        if cand:
+            argv.extend(["-v", cand])
+        argv.extend(["--stdout", "--stdin"])
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(text.encode("utf-8"))
+        if proc.returncode == 0 and stdout:
+            return await decode_audio_bytes_to_pcm(stdout, input_format="wav", sample_rate=sample_rate)
+        last_err = stderr.decode(errors="replace").strip()
+    raise RuntimeError(f"`{Path(espeak_bin).name}` failed: {last_err}")
+
+
+async def synthesize_local_fallback_pcm(
+    text: str,
+    *,
+    voice: str = "Tingting",
+    sample_rate: int = 24000,
+) -> bytes:
+    """Cross-platform offline TTS fallback: macOS `say` -> Linux `espeak-ng`/`espeak`."""
+    if shutil.which("say"):
+        return await synthesize_say_pcm(text, voice=voice, sample_rate=sample_rate)
+    if shutil.which("espeak-ng") or shutil.which("espeak"):
+        return await synthesize_espeak_pcm(text, sample_rate=sample_rate)
+    raise RuntimeError(
+        "Offline TTS fallback unavailable: install `espeak-ng` on Linux or check Edge-TTS connectivity."
+    )
+
+
 async def synthesize_tts_pcm_stream(
     text: str,
     config: SpeakerConfig,
@@ -390,7 +440,7 @@ async def synthesize_tts_pcm_stream(
     sample_rate_override: int | None = None,
     prewarmed: PrewarmedEdgeTTS | None = None,
 ) -> AsyncIterator[bytes]:
-    """Stream PCM chunks using configured TTS provider with offline macOS `say` fallback."""
+    """Stream PCM chunks using configured TTS provider with cross-platform offline fallback."""
     effective_sr = sample_rate_override or config.tts_sample_rate
     if config.tts_provider == "edge":
         try:
@@ -411,9 +461,9 @@ async def synthesize_tts_pcm_stream(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("edge-tts failed (%s); falling back to macOS `say`", exc)
+            logger.warning("edge-tts failed (%s); falling back to local offline TTS", exc)
 
-    pcm = await synthesize_say_pcm(
+    pcm = await synthesize_local_fallback_pcm(
         text,
         voice=config.say_voice,
         sample_rate=effective_sr,

@@ -75,9 +75,25 @@ uv run xsa serve --asr sense_voice
   python3 scripts/install_launchagent.py --asr sense_voice --relay wss://<你的中继域名> --keep-awake --install
   ```
 
-### 5. 可选能力（Outlook / MCP Server）
+### 5. Docker 一键部署（Linux / NAS / 服务器）
 
 ```bash
+mkdir -p data models
+cp config.example.yaml data/config.yaml
+# 注意：在 Linux 宿主机如非 UID 1000，确保 data/ 与 models/ 对容器内 UID 1000 可写
+# 在 data/config.yaml 中配置 llm.default_provider（默认模板已配置 openai_compatible）
+# 并设置 XSA_CONSOLE_PASSWORD（Docker 桥接访问 Web 控制台时启用口令登录；/mcp 保持本地隔离）
+docker compose run --rm xiao-speaker-assistant --config /data/config.yaml download-models
+OPENAI_API_KEY="sk-..." XSA_CONSOLE_PASSWORD="your-strong-password" docker compose up -d
+```
+
+### 6. 可选能力（Outlook / MCP Server / 搜索源）
+
+```bash
+# 可选：启用高质量联网搜索（默认自动回退 Bing）
+export TAVILY_API_KEY="tvly-..."
+# 或自建 SearXNG：export SEARXNG_URL="http://127.0.0.1:8080"
+
 # Outlook 设备码登录（凭据 0600 私有文件存储，不碰登录钥匙串）
 export OUTLOOK_CLIENT_ID="你的Azure应用ClientID"
 uv run xsa outlook-login
