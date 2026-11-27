@@ -1,5 +1,7 @@
 .git
 .venv
+.env
+.env.*
 __pycache__
 *.pyc
 .pytest_cache
@@ -10,3 +12,7 @@ config.yaml
 *.bin
 .DS_Store
 data/
+tests/
+docs/
+relay/
+scripts/

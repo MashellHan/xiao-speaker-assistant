@@ -1,7 +1,7 @@
 [project]
 name = "xiao-speaker-assistant"
 version = "0.1.0"
-description = "Voice AI assistant bridge for Xiaomi Smart Speaker Pro (OH2P) running on macOS with Codex, Gemini, Outlook, Browser, and Xiaohongshu MCP."
+description = "Voice AI assistant bridge for Xiaomi Smart Speaker Pro (OH2P) on macOS/Linux/Docker with OpenAI-compatible/Gemini/OpenCode LLMs, local KWS/AEC/voiceprint, Web Console, and MCP tools."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

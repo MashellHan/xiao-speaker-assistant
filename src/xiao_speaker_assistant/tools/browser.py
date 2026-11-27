@@ -174,7 +174,12 @@ def build_edge_open_command(url: str, *, platform: str | None = None) -> list[st
                 return [candidate, validated_url]
         return ["xdg-open", validated_url]
     if plat in {"win32", "cygwin", "msys"}:
-        return ["cmd", "/c", "start", "", validated_url]
+        # Never invoke `cmd /c start`, because cmd.exe interprets `&`, `%`, `^` in query strings as
+        # shell operators. Launching the browser binary or `explorer.exe` directly via argv is safe.
+        for candidate in ("msedge", "msedge.exe", "chrome", "chrome.exe", "explorer.exe"):
+            if shutil.which(candidate):
+                return [candidate, validated_url]
+        return ["explorer.exe", validated_url]
     return ["xdg-open", validated_url]
 
 
@@ -183,15 +188,17 @@ def open_in_edge(
     *,
     dry_run: bool = False,
     runner: Callable[[list[str]], Any] | None = None,
+    platform: str | None = None,
 ) -> str:
-    """Validate an http/https URL and open it in Microsoft Edge, returning status JSON."""
-    cmd = build_edge_open_command(url)
+    """Validate an http/https URL and open it in the desktop browser, returning status JSON."""
+    cmd = build_edge_open_command(url, platform=platform)
     validated_url = cmd[-1]
+    browser_label = EDGE_APP_NAME if (platform or sys.platform).lower() == "darwin" else cmd[0]
     if dry_run:
         return json.dumps(
             {
                 "status": "dry_run",
-                "browser": EDGE_APP_NAME,
+                "browser": browser_label,
                 "url": validated_url,
                 "command": cmd,
             },
@@ -206,7 +213,7 @@ def open_in_edge(
     return json.dumps(
         {
             "status": "opened",
-            "browser": EDGE_APP_NAME,
+            "browser": browser_label,
             "url": validated_url,
             "command": cmd,
         },

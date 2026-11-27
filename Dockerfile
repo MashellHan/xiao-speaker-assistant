@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    XSA_HOME=/data
+    HOME=/data
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg espeak-ng ca-certificates \
@@ -10,7 +10,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE config.example.yaml ./
 COPY src ./src
 
 RUN pip install --no-cache-dir . \
@@ -25,4 +25,4 @@ VOLUME ["/data", "/app/models"]
 EXPOSE 4397 4399
 
 ENTRYPOINT ["xsa"]
-CMD ["serve", "--config", "/data/config.yaml"]
+CMD ["--config", "/data/config.yaml", "serve", "--mcp-host", "0.0.0.0"]

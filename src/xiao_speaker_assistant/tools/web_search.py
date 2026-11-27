@@ -22,21 +22,27 @@ _BING_CAPTCHA_MARKERS = (
     "验证您不是机器人",
     "人机验证",
 )
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@]+@")
+
+
+def _redact_error(exc: Exception) -> str:
+    """Strip any embedded URL credentials before surfacing errors to logs or tools."""
+    return _URL_USERINFO_RE.sub(r"\1***@", str(exc))
+
+
+def _resolve_searxng_url(config: SearchToolConfig) -> str:
+    return (config.searxng_url or "").strip() or (read_env_secret(config.searxng_url_env) or "")
 
 
 def resolve_search_provider(config: SearchToolConfig) -> str:
     """Resolve effective search backend (`tavily`, `searxng`, or `bing`)."""
     pref = (config.provider or "auto").strip().lower()
-    if pref == "tavily":
-        return "tavily"
-    if pref == "searxng":
-        return "searxng"
-    if pref == "bing":
-        return "bing"
+    if pref in {"tavily", "searxng", "bing"}:
+        return pref
     # Auto mode: prefer structured JSON APIs when configured, else zero-key Bing fallback.
     if read_env_secret(config.tavily_api_key_env):
         return "tavily"
-    if (config.searxng_url or "").strip() or read_env_secret(config.searxng_url_env):
+    if _resolve_searxng_url(config):
         return "searxng"
     return "bing"
 
@@ -57,12 +63,19 @@ async def _search_tavily(
             "search_depth": "basic",
             "include_answer": False,
         },
+        follow_redirects=False,
     )
     resp.raise_for_status()
-    data = resp.json() if isinstance(resp.json(), dict) else {}
+    try:
+        parsed = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("Tavily returned non-JSON response") from exc
+    data = parsed if isinstance(parsed, dict) else {}
     raw_results = data.get("results") or []
     items: list[dict[str, str]] = []
     for entry in raw_results:
+        if len(items) >= limit:
+            break
         if not isinstance(entry, dict):
             continue
         title = str(entry.get("title") or "").strip()
@@ -76,8 +89,6 @@ async def _search_tavily(
                     "url": url,
                 }
             )
-        if len(items) >= limit:
-            break
     return {"query": query, "provider": "tavily", "results": items, "count": len(items)}
 
 
@@ -92,16 +103,28 @@ async def _search_searxng(
     endpoint = validated.rstrip("/")
     if not endpoint.endswith("/search"):
         endpoint = f"{endpoint}/search"
+    # Disable automatic redirects so a misconfigured/compromised SearXNG cannot redirect to metadata IPs.
     resp = await client.get(
         endpoint,
         params={"q": query, "format": "json", "language": "zh-CN"},
         headers={"Accept": "application/json"},
+        follow_redirects=False,
     )
+    if resp.is_redirect:
+        raise RuntimeError("SearXNG endpoint returned an unexpected redirect")
     resp.raise_for_status()
-    data = resp.json() if isinstance(resp.json(), dict) else {}
+    try:
+        parsed = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "SearXNG returned non-JSON response (ensure `json` format is enabled in settings.yml)"
+        ) from exc
+    data = parsed if isinstance(parsed, dict) else {}
     raw_results = data.get("results") or []
     items: list[dict[str, str]] = []
     for entry in raw_results:
+        if len(items) >= limit:
+            break
         if not isinstance(entry, dict):
             continue
         title = str(entry.get("title") or "").strip()
@@ -115,8 +138,6 @@ async def _search_searxng(
                     "url": url,
                 }
             )
-        if len(items) >= limit:
-            break
     return {"query": query, "provider": "searxng", "results": items, "count": len(items)}
 
 
@@ -133,11 +154,14 @@ async def _search_bing(
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9",
         },
+        follow_redirects=True,
     )
     resp.raise_for_status()
     body = resp.text
     items: list[dict[str, str]] = []
     for block in body.split('<li class="b_algo"')[1:]:
+        if len(items) >= limit:
+            break
         m_link = re.search(
             r'<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', block
         )
@@ -153,8 +177,6 @@ async def _search_bing(
         )
         if title:
             items.append({"title": title, "snippet": snippet[:240], "url": url})
-        if len(items) >= limit:
-            break
 
     result: dict[str, Any] = {
         "query": query,
@@ -186,9 +208,10 @@ async def run_web_search(
 ) -> dict[str, Any]:
     """Execute a web search using Tavily, SearXNG, or Bing HTML fallback."""
     cfg = config or SearchToolConfig()
+    clamped_limit = max(1, min(20, int(limit)))
     provider = resolve_search_provider(cfg)
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+    http = client or httpx.AsyncClient(timeout=8.0, follow_redirects=False)
     try:
         if provider == "tavily":
             api_key = read_env_secret(cfg.tavily_api_key_env)
@@ -197,20 +220,18 @@ async def run_web_search(
                     raise RuntimeError(
                         f"Missing Tavily API key in env {cfg.tavily_api_key_env}"
                     )
-                provider = "bing"
+                provider = "searxng" if _resolve_searxng_url(cfg) else "bing"
             else:
                 try:
-                    return await _search_tavily(http, query, limit=limit, api_key=api_key)
+                    return await _search_tavily(http, query, limit=clamped_limit, api_key=api_key)
                 except Exception as exc:
                     if cfg.provider == "tavily":
-                        raise
-                    logger.warning("Tavily search failed (%s); falling back to Bing", exc)
-                    provider = "bing"
+                        raise RuntimeError(_redact_error(exc)) from exc
+                    logger.warning("Tavily search failed (%s); falling back", _redact_error(exc))
+                    provider = "searxng" if _resolve_searxng_url(cfg) else "bing"
 
         if provider == "searxng":
-            searxng_url = (cfg.searxng_url or "").strip() or (
-                read_env_secret(cfg.searxng_url_env) or ""
-            )
+            searxng_url = _resolve_searxng_url(cfg)
             if not searxng_url:
                 if cfg.provider == "searxng":
                     raise RuntimeError(
@@ -219,14 +240,14 @@ async def run_web_search(
                 provider = "bing"
             else:
                 try:
-                    return await _search_searxng(http, query, limit=limit, base_url=searxng_url)
+                    return await _search_searxng(http, query, limit=clamped_limit, base_url=searxng_url)
                 except Exception as exc:
                     if cfg.provider == "searxng":
-                        raise
-                    logger.warning("SearXNG search failed (%s); falling back to Bing", exc)
+                        raise RuntimeError(_redact_error(exc)) from exc
+                    logger.warning("SearXNG search failed (%s); falling back to Bing", _redact_error(exc))
                     provider = "bing"
 
-        return await _search_bing(http, query, limit=limit)
+        return await _search_bing(http, query, limit=clamped_limit)
     finally:
         if owns_client:
             await http.aclose()

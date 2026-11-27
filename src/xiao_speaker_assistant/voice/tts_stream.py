@@ -385,25 +385,34 @@ async def synthesize_espeak_pcm(
     text: str,
     *,
     sample_rate: int = 24000,
-    voice: str = "zh",
+    voice: str = "cmn",
 ) -> bytes:
     """Offline Linux/cross-platform fallback synthesizer using `espeak-ng` or `espeak`."""
     espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
     if not espeak_bin:
         raise RuntimeError("Neither macOS `say` nor Linux `espeak-ng`/`espeak` binary was found")
-    proc = await asyncio.create_subprocess_exec(
-        espeak_bin,
-        "-v",
-        voice,
-        "--stdout",
-        text,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0 or not stdout:
-        raise RuntimeError(f"`{Path(espeak_bin).name}` failed: {stderr.decode(errors='replace').strip()}")
-    return await decode_audio_bytes_to_pcm(stdout, input_format="wav", sample_rate=sample_rate)
+    # Pass text via `--stdin` so replies starting with `-` (e.g. `-5度`) are never parsed as flags.
+    candidates = [voice]
+    for fallback_voice in ("cmn", "zh", ""):
+        if fallback_voice not in candidates:
+            candidates.append(fallback_voice)
+    last_err = ""
+    for cand in candidates:
+        argv = [espeak_bin]
+        if cand:
+            argv.extend(["-v", cand])
+        argv.extend(["--stdout", "--stdin"])
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(text.encode("utf-8"))
+        if proc.returncode == 0 and stdout:
+            return await decode_audio_bytes_to_pcm(stdout, input_format="wav", sample_rate=sample_rate)
+        last_err = stderr.decode(errors="replace").strip()
+    raise RuntimeError(f"`{Path(espeak_bin).name}` failed: {last_err}")
 
 
 async def synthesize_local_fallback_pcm(

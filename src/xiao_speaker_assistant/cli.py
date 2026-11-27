@@ -466,8 +466,9 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         config_path=effective_config_path,
         include_local_tools=True,
     )
+    mcp_bind_host = getattr(args, "mcp_host", None) or read_env_secret("XSA_MCP_HOST") or "127.0.0.1"
     mcp_runner, mcp_port = await mcp_server.start_http_server(
-        host="127.0.0.1",
+        host=mcp_bind_host,
         port=active_config.tools.mcp_http_port,
         auth_token=mcp_token,
     )
@@ -774,10 +775,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="Path to config.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
     init_p = sub.add_parser("init", help="Generate starter config.yaml from config.example.yaml")
+    init_p.add_argument("--config", default=argparse.SUPPRESS, help="Path to config.yaml")
     init_p.add_argument("--force", action="store_true", help="Overwrite existing config.yaml")
-    sub.add_parser("doctor", help="Check config and local CLI backends")
+    doctor_p = sub.add_parser("doctor", help="Check config and local CLI backends")
+    doctor_p.add_argument("--config", default=argparse.SUPPRESS, help="Path to config.yaml")
     sub.add_parser("outlook-login", help="Sign in to Outlook using device code + private file cache")
-    sub.add_parser("download-models", help="Download VAD + KWS + SenseVoice models for `Hi Nomi` wakeup")
+    dl_p = sub.add_parser("download-models", help="Download VAD + KWS + SenseVoice models for `Hi Nomi` wakeup")
+    dl_p.add_argument("--config", default=argparse.SUPPRESS, help="Path to config.yaml")
     sub.add_parser(
         "mcp-server",
         help="Run stdio JSON-RPC 2.0 MCP server for Outlook, Codex, Xiaohongshu, Browser, and Mac tools",
@@ -785,11 +789,17 @@ def main(argv: list[str] | None = None) -> int:
 
     ask_p = sub.add_parser("ask", help="Test a single question via configured LLM provider")
     ask_p.add_argument("prompt", help="Question text")
+    ask_p.add_argument("--config", default=argparse.SUPPRESS, help="Path to config.yaml")
     ask_p.add_argument("--provider", choices=["opencode", "codex", "codex_api", "openai_compatible", "gemini_api"])
 
     serve_p = sub.add_parser("serve", help="Run the speaker WebSocket gateway")
+    serve_p.add_argument("--config", default=argparse.SUPPRESS, help="Path to config.yaml")
     serve_p.add_argument("--host", help="Override WebSocket listen host")
     serve_p.add_argument("--port", type=int, help="Override WebSocket listen port")
+    serve_p.add_argument(
+        "--mcp-host",
+        help="Bind address for HTTP Web Console / MCP server (default: 127.0.0.1; use 0.0.0.0 in Docker)",
+    )
     serve_p.add_argument(
         "--asr",
         choices=["sense_voice", "xiaoai_asr"],

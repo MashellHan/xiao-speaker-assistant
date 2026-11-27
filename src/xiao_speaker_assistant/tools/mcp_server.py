@@ -202,15 +202,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "browser_open_edge",
-        "description": "Validate an HTTP/HTTPS URL and open it in Microsoft Edge on macOS.",
+        "description": "Validate an HTTP/HTTPS URL and open it in the host desktop browser (Microsoft Edge on macOS, default/Edge browser on Linux/Windows).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "HTTP/HTTPS URL to open in Microsoft Edge"},
+                "url": {"type": "string", "description": "HTTP/HTTPS URL to open in desktop browser"},
                 "dry_run": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Validate and return command without launching Edge",
+                    "description": "Validate and return command without launching browser",
                 },
             },
             "required": ["url"],
@@ -297,7 +297,7 @@ LOCAL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "web_search",
-        "description": "Search the web quickly via Bing China for current facts, news, dates, or prices.",
+        "description": "Search the web via the configured provider (Tavily API, SearXNG, or Bing fallback) for current facts, news, dates, or prices.",
         "inputSchema": {
             "type": "object",
             "properties": {

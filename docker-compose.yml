@@ -13,11 +13,16 @@ services:
       # Optional pluggable web search (Tavily or self-hosted SearXNG)
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - SEARXNG_URL=${SEARXNG_URL:-}
-      # Optional WAN relay & Web Console remote auth
+      # Optional Cloud ASR & Speaker / WAN Relay auth
+      - DOUBAO_ASR_APP_KEY=${DOUBAO_ASR_APP_KEY:-}
+      - DOUBAO_ASR_ACCESS_KEY=${DOUBAO_ASR_ACCESS_KEY:-}
+      - XSA_SPEAKER_TOKEN=${XSA_SPEAKER_TOKEN:-}
+      - XSA_RELAY_TOKEN=${XSA_RELAY_TOKEN:-}
       - XSA_RELAY_HOST_TOKEN=${XSA_RELAY_HOST_TOKEN:-}
-      - XSA_CONSOLE_TOKEN=${XSA_CONSOLE_TOKEN:-}
+      # Remote Web Console login password (required when accessed across Docker bridge)
+      - XSA_CONSOLE_PASSWORD=${XSA_CONSOLE_PASSWORD:-}
       - HOME=/data
     volumes:
       - ./data:/data
       - ./models:/app/models
-    command: ["serve", "--config", "/data/config.yaml", "--asr", "sense_voice"]
+    command: ["--config", "/data/config.yaml", "serve", "--mcp-host", "0.0.0.0", "--asr", "sense_voice"]

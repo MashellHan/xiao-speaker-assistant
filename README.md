@@ -80,10 +80,11 @@ uv run xsa serve --asr sense_voice
 ```bash
 mkdir -p data models
 cp config.example.yaml data/config.yaml
-# 在 data/config.yaml 中配置 llm.default_provider（如 openai_compatible / gemini_api）
-# 并通过环境变量提供 OPENAI_API_KEY（可选 TAVILY_API_KEY / SEARXNG_URL 增强搜索）
-docker compose run --rm xiao-speaker-assistant download-models
-OPENAI_API_KEY="sk-..." docker compose up -d
+# 注意：在 Linux 宿主机如非 UID 1000，确保 data/ 与 models/ 对容器内 UID 1000 可写
+# 在 data/config.yaml 中配置 llm.default_provider（默认模板已配置 openai_compatible）
+# 并设置 XSA_CONSOLE_PASSWORD（Docker 桥接访问 Web 控制台时启用口令登录；/mcp 保持本地隔离）
+docker compose run --rm xiao-speaker-assistant --config /data/config.yaml download-models
+OPENAI_API_KEY="sk-..." XSA_CONSOLE_PASSWORD="your-strong-password" docker compose up -d
 ```
 
 ### 6. 可选能力（Outlook / MCP Server / 搜索源）

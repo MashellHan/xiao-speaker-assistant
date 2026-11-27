@@ -540,7 +540,7 @@ class LocalSpeechPipeline:
                     return None
                 wake_label, rest = matched
                 logger.info("ASR wake matched (%s): %s", wake_label, cleaned)
-                self.set_awake(True)
+                self.set_awake(True, preserve_vad=True)
                 if rest:
                     return ("utterance", rest, metrics)
                 return ("wakeup", wake_label, metrics)

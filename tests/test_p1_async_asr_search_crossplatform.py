@@ -140,8 +140,10 @@ def _make_stub_pipeline(cloud_asr: _SlowCloudASR, segments: list[np.ndarray], kw
 
 
 def test_async_cloud_asr_does_not_block_feed_pcm_or_interrupts() -> None:
-    """Slow cloud ASR (250ms) runs off the audio thread so subsequent frames & interrupts stay instant."""
-    cloud = _SlowCloudASR(delay_sec=0.25, text="帮我查一下上海天气")
+    """Slow cloud ASR (250ms) runs off the audio thread, and interrupt invalidates stale in-flight ASR."""
+    # Even if the stale cloud ASR returns a wake phrase ("糯米糯米帮我查一下上海天气"),
+    # the barge-in interrupt epoch MUST drop/cancel it so it never re-wakes or runs on_query!
+    cloud = _SlowCloudASR(delay_sec=0.25, text="糯米糯米帮我查一下上海天气")
     seg = np.ones(1600, dtype=np.float32) * 0.2
     pipeline = _make_stub_pipeline(cloud, segments=[seg], kws_hits=["", "退出"])
 
@@ -173,9 +175,11 @@ def test_async_cloud_asr_does_not_block_feed_pcm_or_interrupts() -> None:
         t0 = time.monotonic()
         await gw._handle_binary_message(conn, frame)
         first_frame_ms = (time.monotonic() - t0) * 1000.0
-        # Must return well before the 250ms cloud ASR finishes and never call sync transcribe()
         assert first_frame_ms < 120.0
         assert cloud.sync_called is False
+
+        # Yield briefly so the scheduled cloud ASR task starts awaiting atranscribe().
+        await asyncio.sleep(0.02)
 
         # Second frame triggers KWS interrupt immediately while cloud ASR is still in flight!
         t1 = time.monotonic()
@@ -184,11 +188,12 @@ def test_async_cloud_asr_does_not_block_feed_pcm_or_interrupts() -> None:
         assert second_frame_ms < 120.0
         await asyncio.wait_for(interrupt_called.wait(), timeout=0.1)
 
-        # Wait for in-flight cloud ASR task to complete cleanly.
+        # Wait past the 250ms cloud delay and verify stale wake/utterance was cancelled & ignored.
+        await asyncio.sleep(0.05)
         sess = gw._get_session(conn)
-        if sess.cloud_asr_tasks:
-            await asyncio.gather(*list(sess.cloud_asr_tasks), return_exceptions=True)
-        assert cloud.async_called == 1
+        assert len(sess.cloud_asr_tasks) == 0
+        assert pipeline.awake is False
+        assert received_queries == []
 
     asyncio.run(scenario())
 
@@ -230,7 +235,27 @@ def test_pluggable_web_search_tavily_searxng_and_bing_captcha_warning(monkeypatc
 
     asyncio.run(check_tavily())
 
-    # 2. SearXNG JSON provider via config or env
+    # 1b. In auto mode, Tavily failure falls back to SearXNG before Bing!
+    def tavily_fail_searx_ok(request: httpx.Request) -> httpx.Response:
+        if "tavily.com" in str(request.url):
+            return httpx.Response(503, text="overloaded", request=request)
+        assert request.url.path == "/search"
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "SearX Fallback", "content": "OK", "url": "https://example.org"}]},
+            request=request,
+        )
+
+    async def check_tavily_to_searx_fallback() -> None:
+        cfg = SearchToolConfig(provider="auto", searxng_url="http://127.0.0.1:8080")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(tavily_fail_searx_ok)) as client:
+            res = await run_web_search("fallback test", limit=2, config=cfg, client=client)
+        assert res["provider"] == "searxng"
+        assert res["results"][0]["title"] == "SearX Fallback"
+
+    asyncio.run(check_tavily_to_searx_fallback())
+
+    # 2. SearXNG JSON provider via config or env (and blocks unexpected redirect)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     searx_cfg = SearchToolConfig(provider="auto", searxng_url="http://127.0.0.1:8080")
     assert resolve_search_provider(searx_cfg) == "searxng"
@@ -273,6 +298,21 @@ def test_pluggable_web_search_tavily_searxng_and_bing_captcha_warning(monkeypatc
 
     asyncio.run(check_searx())
 
+    def searx_redirect_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"Location": "http://169.254.169.254/latest/meta-data/"},
+            request=request,
+        )
+
+    async def check_searx_blocks_redirect() -> None:
+        cfg = SearchToolConfig(provider="searxng", searxng_url="http://127.0.0.1:8080")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(searx_redirect_handler)) as client:
+            with pytest.raises(RuntimeError, match="redirect"):
+                await run_web_search("test", config=cfg, client=client)
+
+    asyncio.run(check_searx_blocks_redirect())
+
     # 3. Bing HTML fallback surfaces explicit warning on anti-bot captcha page
     def bing_captcha_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -298,13 +338,11 @@ def test_cross_platform_browser_command_and_tts_fallback(monkeypatch: pytest.Mon
         "Microsoft Edge",
         "https://example.com",
     ]
-    assert build_edge_open_command("https://example.com", platform="win32") == [
-        "cmd",
-        "/c",
-        "start",
-        "",
-        "https://example.com",
-    ]
+    # Windows never uses `cmd /c start` so query strings with `&` cannot trigger shell injection!
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    win_cmd = build_edge_open_command("https://example.com/?a=1&b=2", platform="win32")
+    assert win_cmd == ["explorer.exe", "https://example.com/?a=1&b=2"]
+    assert "cmd" not in win_cmd[0].lower()
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None)
     assert build_edge_open_command("https://example.com", platform="linux") == [
@@ -316,3 +354,10 @@ def test_cross_platform_browser_command_and_tts_fallback(monkeypatch: pytest.Mon
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     with pytest.raises(RuntimeError, match="espeak-ng"):
         asyncio.run(synthesize_local_fallback_pcm("你好"))
+
+    # CLI accepts `--config` both before and after subcommand (`xsa serve --config ...` and `xsa --config ... serve`)
+    from xiao_speaker_assistant.cli import main as cli_main
+
+    # Both forms parse cleanly with `doctor`
+    assert cli_main(["--config", "/nonexistent-test-cfg.yaml", "doctor"]) == 0
+    assert cli_main(["doctor", "--config", "/nonexistent-test-cfg.yaml"]) == 0
