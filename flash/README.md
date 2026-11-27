@@ -11,13 +11,13 @@
    - 从当前正在使用的 `system` 分区直接提取原厂 SquashFS rootfs（读取 superblock `bytes_used`），确保 100% 同版本匹配。
 3. **最小化补丁原则**：
    - 仅关闭 Dropbear 密码登录并写入专用 `RSA-4096` 公钥；
-   - 在 `/etc/rc.local` 挂载 `/data/open-xiaoai` 启动脚本；
+   - 在 `/etc/rc.local` 挂载 `/data/xiaoai-agent/boot.sh` 启动脚本；
    - 不改动原厂小爱核心二进制与分区表。
 4. **单次写入 + 读回校验**：
    - 只刷写当前正在使用的 `system` 分区（`boot0->system0` 或 `boot1->system1`）；
    - 按镜像字节长度读回校验 SHA-256 一致后再 reset。
 
-## 准备阶段命令
+## 完整安全刷机流程（6 步）
 
 ```bash
 # 1. 检查 Homebrew 依赖（squashfs、libusb-compat、uv）
@@ -25,6 +25,22 @@ python3 flash/check_mac.py
 
 # 2. 用数据 Type-C 线连接音箱与 Mac（纯只读探测）
 python3 flash/usb_probe.py
+
+# 3. 获取并校验 Amlogic 刷机工具
+python3 flash/get_flash_tool.py
+
+# 4. 捕获 WorldCup 模式并双读备份关键分区（SHA-256 一致性校验）
+python3 flash/usb_connect.py --execute
+python3 flash/backup_partitions.py --execute
+
+# 5. 从本机同版本分区提取 rootfs 并打入最小化 SSH + boot.sh 补丁
+python3 flash/extract_active_rootfs.py
+python3 flash/make_patch.py
+
+# 6. 写入当前活跃 system 分区并读回校验 SHA-256
+python3 flash/flash_system.py --i-accept-brick-risk
 ```
+
+刷机完成后，音箱开机即可通过 SSH 接入，使用 `scripts/deploy_speaker_client.py` 上传 [`open-xiaoai`](https://github.com/idootop/open-xiaoai/releases) ARMv7 静态编译的 `client` 二进制并生成 `/data/xiaoai-agent/boot.sh`。
 
 > 提示：macOS 首次连接新 USB 设备会弹出「允许配件连接」，在刷机抓窗口前可先在「系统设置 → 隐私与安全性」中临时允许，避免 1.6 秒窗口内弹窗拦截。

@@ -13,7 +13,7 @@ Usage:
        XSA_RELAY_HOST_TOKEN="<host-tok>" XSA_RELAY_SPEAKER_TOKEN="<spk-tok>" \
          ./scripts/deploy_azure_relay.sh --vm <user@azure-vm-ip-or-host> \
            [--bind 127.0.0.1] [--port 8765] [--console-port 8766] \
-           [--trusted-proxies "127.0.0.1,::1,172.17.0.1"] [--ssh-key ~/.ssh/omb_azure_relay]
+           [--trusted-proxies "127.0.0.1,::1,172.17.0.1"] [--ssh-key ~/.ssh/id_ed25519]
 
      Set --console-port 0 to disable the remote Web Console HTTP relay listener.
      (Legacy single token XSA_RELAY_TOKEN="<tok>" is still accepted if split tokens are unset.)

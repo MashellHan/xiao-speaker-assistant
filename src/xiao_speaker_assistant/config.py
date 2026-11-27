@@ -20,7 +20,7 @@ class SpeakerConfig(BaseModel):
     ws_host: str = "0.0.0.0"
     ws_port: int = 4399
     auth_token_env: str = "XSA_SPEAKER_TOKEN"
-    tts_provider: Literal["edge", "say", "xiaoai", "openai", "mlx_audio"] = "edge"
+    tts_provider: Literal["edge", "say", "xiaoai"] = "edge"
     edge_voice: str = "zh-CN-XiaoxiaoNeural"
     edge_rate: str = "+8%"
     voice_routes: dict[str, str] = Field(default_factory=dict)
@@ -136,9 +136,10 @@ class LLMProvidersConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    default_provider: Literal["opencode", "codex", "codex_api", "gemini_api"] = "opencode"
+    default_provider: Literal["opencode", "codex", "codex_api", "openai_compatible", "gemini_api"] = "opencode"
     spoken_max_chars: int = 220
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
+    available_models: list[dict[str, str]] = Field(default_factory=list)
 
 
 class OutlookToolConfig(BaseModel):
@@ -174,6 +175,9 @@ class PersonaConfig(BaseModel):
     address_user_as: str = ""
     style: str = "亲切自然、简短口语化、直接给出核心结论"
     extra_instructions: str = ""
+    default_city: str = "北京"
+    timezone: str = "Asia/Shanghai"
+    reply_language: str = "zh-CN"
 
 
 class MemoryConfig(BaseModel):
@@ -211,6 +215,7 @@ def persist_runtime_settings(
     config_path: str | Path | None,
     *,
     model: str | None = None,
+    model_provider: str | None = None,
     edge_voice: str | None = None,
     edge_rate: str | None = None,
     local_keywords: list[str] | None = None,
@@ -251,8 +256,15 @@ def persist_runtime_settings(
         if model is not None:
             llm = _ensure_dict(data, "llm")
             providers = _ensure_dict(llm, "providers")
-            opencode = _ensure_dict(providers, "opencode")
-            opencode["model"] = model
+            target_provider = (model_provider or llm.get("default_provider") or "opencode").strip()
+            if target_provider in {"codex_api", "openai_compatible"}:
+                _ensure_dict(providers, "codex_api")["model"] = model
+            elif target_provider == "gemini_api":
+                _ensure_dict(providers, "gemini_api")["model"] = model
+            elif target_provider == "codex":
+                _ensure_dict(providers, "codex")["model"] = model
+            else:
+                _ensure_dict(providers, "opencode")["model"] = model
 
         if local_keywords is not None or en_keywords is not None or en_kws_enabled is not None:
             speech = _ensure_dict(data, "speech")

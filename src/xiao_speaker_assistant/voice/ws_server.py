@@ -418,6 +418,36 @@ class SpeakerGateway:
     def has_idle_speaker(self) -> bool:
         return any(self._is_conn_idle(conn) for conn in list(self._connections))
 
+    def get_runtime_status(self) -> dict[str, Any]:
+        """Return live speaker connectivity and pipeline state for Web Console telemetry.
+
+        Over WAN relay, the host socket connects to the relay server even when the speaker
+        is powered off; therefore relay speaker presence requires recent audio frames (<15s)
+        when the local speech pipeline is active.
+        """
+        conns = list(self._connections)
+        now = time.monotonic()
+        relay_count = sum(1 for c in conns if c in self._relay_connections)
+        lan_count = len(conns) - relay_count
+        relay_audio_active = False
+        for c in conns:
+            if c in self._relay_connections:
+                sess = self._sessions.get(c)
+                if sess is not None and sess.last_audio_at > 0 and (now - sess.last_audio_at) < 15.0:
+                    relay_audio_active = True
+                    break
+        speaker_connected = lan_count > 0 or (
+            relay_audio_active if self._pipeline is not None else relay_count > 0
+        )
+        return {
+            "speaker_connected": speaker_connected,
+            "relay_connected": relay_count > 0,
+            "active_connections": len(conns),
+            "relay_connections": relay_count,
+            "lan_connections": lan_count,
+            "pipeline_awake": bool(self._pipeline.awake) if self._pipeline is not None else False,
+        }
+
     async def proactive_speak(self, text: str) -> bool:
         """Speak an unsolicited proactive reminder/briefing on an idle connected speaker."""
         if not text.strip():
@@ -953,7 +983,15 @@ class SpeakerGateway:
                 query_started_mono=now_mono,
                 asr_ms=asr_metrics.get("asr_ms") if asr_metrics else None,
                 speaker_id_ms=asr_metrics.get("speaker_id_ms") if asr_metrics else None,
-                model=self._config.llm.providers.opencode.model,
+                model=(
+                    self._config.llm.providers.opencode.model
+                    if self._config.llm.default_provider == "opencode"
+                    else self._config.llm.providers.codex_api.model
+                    if self._config.llm.default_provider in {"codex_api", "openai_compatible"}
+                    else self._config.llm.providers.gemini_api.model
+                    if self._config.llm.default_provider == "gemini_api"
+                    else (self._config.llm.providers.codex.model or "codex")
+                ),
                 voice=active_voice,
                 transport="wan_relay" if conn in self._relay_connections else "lan",
                 sample_rate=pb.effective_sample_rate,
@@ -987,9 +1025,10 @@ class SpeakerGateway:
                 trace.status = "error"
                 logger.exception("Error handling query %r", query)
                 # Detach trace context so the spoken error notice never pollutes turn TTS/TTFA metrics.
+                # Speak a short user-friendly message instead of reading raw Python tracebacks/URLs aloud.
                 err_tok = CURRENT_TURN_TRACE.set(None)
                 try:
-                    await self.speak_sentence(conn, f"处理出错了：{exc}", interrupt=True, wait_response=True)
+                    await self.speak_sentence(conn, "抱歉，刚才处理遇到了一点问题，请稍后再试。", interrupt=True, wait_response=True)
                 finally:
                     CURRENT_TURN_TRACE.reset(err_tok)
             finally:
@@ -1164,7 +1203,7 @@ class SpeakerGateway:
                     trace.status = "error"
                     trace.mark_llm_done()
                 logger.exception("Streaming error for %r", query)
-                await queue.put((f"处理出错了：{exc}", None, "error"))
+                await queue.put(("抱歉，刚才处理遇到了一点问题，请稍后再试。", None, "error"))
             finally:
                 first_llm_ready.set()
                 if ack_task is not None and not ack_task.done():

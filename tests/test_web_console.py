@@ -1174,3 +1174,134 @@ def test_speaker_gateway_records_turn_trace_with_stage_breakdown(tmp_path: Path)
     assert "tts_first_chunk_ms" not in err_tr.breakdown_ms
     assert "start_play_ms" not in err_tr.breakdown_ms
     assert "ttfa_ms" not in err_tr.breakdown_ms
+
+
+def test_p0_oss_readiness_init_doctor_openai_tools_and_speaker_status(tmp_path: Path, monkeypatch) -> None:
+    from xiao_speaker_assistant.llm.router import LLMRouter
+    from xiao_speaker_assistant.tools import TurnTraceStore
+    from xiao_speaker_assistant.voice.speaker_id import default_style_hint_for_role
+
+    # 1. Generic host role hint does not hardcode personal nicknames
+    host_hint = default_style_hint_for_role("Alice", "host")
+    assert "主人" in host_hint
+    assert "大雄" not in host_hint
+
+    # 2. xsa init generates config.yaml without overwriting unless --force
+    init_cfg = tmp_path / "config.yaml"
+    assert cli.main(["--config", str(init_cfg), "init"]) == 0
+    assert init_cfg.is_file()
+    loaded = load_config(init_cfg)
+    assert loaded.llm.default_provider == "openai_compatible"
+    assert "HI NOMI" in loaded.speech.en_keywords
+    assert loaded.speech.vad_min_silence_ms == 450
+
+    # 3. xsa doctor runs cleanly for openai_compatible without requiring opencode CLI
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    assert cli.main(["--config", str(init_cfg), "doctor"]) == 0
+
+    # 4. In-process MCP tool bridge exposes full tool catalog to openai_compatible / gemini_api
+    #    and overview exposes real speaker_status + custom available_models + provider-aware model update
+    cfg = AppConfig()
+    cfg.llm.default_provider = "openai_compatible"
+    cfg.llm.providers.codex_api.model = "gpt-4o-mini"
+    cfg.llm.available_models = [
+        {"id": "gpt-4o-mini", "label": "GPT-4o Mini"},
+        {"id": "deepseek-chat", "label": "DeepSeek Chat"},
+    ]
+    srv = McpServer(
+        cfg,
+        memory_store=MemoryStore(tmp_path / "mem.json"),
+        history_store=ConversationHistoryStore(tmp_path / "hist.json"),
+        trace_store=TurnTraceStore(tmp_path / "traces.json"),
+        config_path=init_cfg,
+        get_speaker_status=lambda: {
+            "speaker_connected": True,
+            "active_connections": 1,
+            "relay_connections": 1,
+            "lan_connections": 0,
+            "pipeline_awake": False,
+        },
+        include_local_tools=True,
+    )
+
+    async def run() -> None:
+        tools_list = await srv.get_tool_definitions_for_llm()
+        tool_names = {t["name"] for t in tools_list}
+        assert {"weather_query", "memory_save", "reminder_set", "speaker_list_voices"}.issubset(tool_names)
+
+        # In-process execution works identically to /mcp
+        res_text = await srv.execute_tool_in_process("speaker_list_voices", {})
+        assert "zh-CN-XiaoyiNeural" in res_text
+
+        runner, port = await srv.start_http_server(host="127.0.0.1", port=0)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with httpx.AsyncClient() as client:
+                ov = (await client.get(f"{base}/api/overview")).json()
+                assert ov["speaker_status"]["speaker_connected"] is True
+                assert ov["speaker_status"]["relay_connections"] == 1
+                assert ov["model"] == "gpt-4o-mini"
+                assert [m["id"] for m in ov["available_models"]] == ["gpt-4o-mini", "deepseek-chat"]
+
+                upd = await client.post(f"{base}/api/settings", json={"model": "deepseek-chat"})
+                assert upd.status_code == 200
+                assert cfg.llm.providers.codex_api.model == "deepseek-chat"
+                assert load_config(init_cfg).llm.providers.codex_api.model == "deepseek-chat"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+    # 5. LLMRouter logger is defined, Gemini schema sanitizer strips unsupported keys,
+    #    model validation is provider-aware, and relay speaker_status distinguishes audio presence
+    import xiao_speaker_assistant.llm.router as router_mod
+    from xiao_speaker_assistant.llm.router import _sanitize_gemini_schema
+    from xiao_speaker_assistant.voice.ws_server import SpeakerGateway
+
+    assert hasattr(router_mod, "logger")
+    assert isinstance(LLMRouter(cfg.llm)._build_system_prompt(), str)
+
+    sanitized = _sanitize_gemini_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+            },
+        }
+    )
+    assert "additionalProperties" not in sanitized
+    assert sanitized["properties"]["limit"] == {"type": "integer"}
+
+    # Provider-aware model validation & default model list
+    with pytest.raises(ValueError):
+        McpServer._validate_model_ref("gpt-4o-mini", provider="opencode")
+    assert McpServer._validate_model_ref("gpt", provider="opencode") == "raven/gpt-6.2-sol#low"
+    assert McpServer._validate_model_ref("qwen2.5:7b", provider="openai_compatible") == "qwen2.5:7b"
+    assert McpServer._validate_model_ref("gpt", provider="openai_compatible") == "gpt"
+
+    cfg_oai = AppConfig()
+    cfg_oai.llm.default_provider = "openai_compatible"
+    cfg_oai.llm.providers.codex_api.model = "gpt-4o-mini"
+    srv_oai = McpServer(
+        cfg_oai,
+        memory_store=MemoryStore(tmp_path / "mem2.json"),
+        history_store=ConversationHistoryStore(tmp_path / "hist2.json"),
+        trace_store=TurnTraceStore(tmp_path / "traces2.json"),
+    )
+    oai_ids = [m["id"] for m in srv_oai._available_models_list()]
+    assert "gpt-4o-mini" in oai_ids
+    assert all(not mid.startswith("raven/") for mid in oai_ids)
+
+    # Relay speaker_connected requires recent audio when pipeline is active
+    gw = SpeakerGateway(AppConfig(), on_query=lambda q: asyncio.sleep(0, result=q))
+    gw._pipeline = type("FakePipeline", (), {"awake": False})()  # type: ignore[assignment]
+    fake_conn = object()
+    gw._connections.add(fake_conn)
+    gw._relay_connections.add(fake_conn)
+    st_waiting = gw.get_runtime_status()
+    assert st_waiting["relay_connected"] is True
+    assert st_waiting["speaker_connected"] is False
+    gw._get_session(fake_conn).last_audio_at = time.monotonic()
+    st_live = gw.get_runtime_status()
+    assert st_live["speaker_connected"] is True

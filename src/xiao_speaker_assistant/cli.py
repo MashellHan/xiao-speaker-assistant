@@ -181,6 +181,30 @@ def _check_http_reachable(url: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def cmd_init(config_path: str | Path | None = None, *, force: bool = False) -> int:
+    """Create a ready-to-edit config.yaml from config.example.yaml if missing."""
+    target = Path(config_path) if config_path else Path("config.yaml")
+    if target.exists() and not force:
+        print(f"Config already exists: {target.resolve()} (pass --force to overwrite)")
+        return 0
+    example = Path(__file__).resolve().parent.parent.parent / "config.example.yaml"
+    if example.is_file():
+        payload = example.read_text(encoding="utf-8")
+    else:
+        import yaml
+
+        payload = yaml.safe_dump(AppConfig().model_dump(mode="json"), allow_unicode=True, sort_keys=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload, encoding="utf-8")
+    print(f"Created {target.resolve()}")
+    print("Next steps:")
+    print("  1. Edit config.yaml (choose `openai_compatible`, `gemini_api`, or `opencode` under `llm.default_provider`).")
+    print("  2. Export your API key if using cloud LLM (e.g. `export OPENAI_API_KEY=...` or `GEMINI_API_KEY=...`).")
+    print("  3. Run `uv run xsa download-models && uv run xsa doctor`.")
+    print("  4. Start gateway + Web Console: `uv run xsa serve` (open http://127.0.0.1:4397/).")
+    return 0
+
+
 def cmd_doctor(config: AppConfig) -> int:
     print("Xiao Speaker Assistant configuration check:")
     print(f"  Speaker model:    {config.speaker.model} (ws://{config.speaker.ws_host}:{config.speaker.ws_port})")
@@ -191,11 +215,21 @@ def cmd_doctor(config: AppConfig) -> int:
     )
     print(f"  Default provider: {config.llm.default_provider}")
 
-    for label, binary in (
-        ("opencode CLI (raven/gemini)", config.llm.providers.opencode.binary),
-        ("codex CLI", config.llm.providers.codex.binary),
-        ("ffmpeg (edge-tts PCM)", "ffmpeg"),
-    ):
+    active_provider = config.llm.default_provider
+    if active_provider == "opencode":
+        cli_checks = [
+            ("opencode CLI", config.llm.providers.opencode.binary),
+            ("ffmpeg (edge-tts PCM)", "ffmpeg"),
+        ]
+    elif active_provider == "codex":
+        cli_checks = [
+            ("codex CLI", config.llm.providers.codex.binary),
+            ("ffmpeg (edge-tts PCM)", "ffmpeg"),
+        ]
+    else:
+        cli_checks = [("ffmpeg (edge-tts PCM)", "ffmpeg")]
+
+    for label, binary in cli_checks:
         try:
             path = resolve_binary(binary)
             extra = ""
@@ -209,29 +243,54 @@ def cmd_doctor(config: AppConfig) -> int:
         except RuntimeError:
             print(f"  [MISSING] {label}: {binary}")
 
-    models_dir = Path(config.speech.models_dir).expanduser()
-    required_files = ["silero_vad.onnx", "tokens.txt", "encoder.onnx", "decoder.onnx", "joiner.onnx"]
-    missing_models = [f for f in required_files if not (models_dir / f).is_file()]
-    if config.speech.asr_model == "paraformer":
-        try:
-            find_paraformer_dir(models_dir)
-        except FileNotFoundError:
-            missing_models.append("paraformer/model.int8.onnx")
-    elif config.speech.asr_model == "sense_voice":
-        try:
-            find_sense_voice_dir(models_dir)
-        except FileNotFoundError:
-            missing_models.append("sense-voice/model.int8.onnx")
-    if missing_models:
-        print(f"  [MISSING] Speech models in {models_dir}: {', '.join(missing_models)}")
-    else:
-        en_dir = find_english_kws_dir(models_dir) if config.speech.en_kws_enabled else None
-        en_status = f"enabled ({en_dir.name})" if en_dir else "not installed (ASR fallback)"
-        print(f"  [OK] Speech models ready in {models_dir} (en_kws={en_status}, lang={config.speech.asr_language})")
+    if active_provider in {"codex_api", "openai_compatible"}:
+        oai_cfg = config.llm.providers.codex_api
+        key_ok = bool(read_env_secret(oai_cfg.api_key_env))
+        tag = "OK" if key_ok else "MISSING"
+        print(
+            f"  [{tag}] OpenAI-compatible API: base_url={oai_cfg.base_url}, "
+            f"model={oai_cfg.model}, env={oai_cfg.api_key_env}"
+        )
+    elif active_provider == "gemini_api":
+        gem_cfg = config.llm.providers.gemini_api
+        key_ok = bool(read_env_secret(gem_cfg.api_key_env))
+        tag = "OK" if key_ok else "MISSING"
+        print(f"  [{tag}] Gemini API: model={gem_cfg.model}, env={gem_cfg.api_key_env}")
 
-    print(f"  OpenCode model:   {config.llm.providers.opencode.model}")
-    print(f"  OpenCode V2 URL:  {config.llm.providers.opencode.server_url}")
-    print(f"  OpenCode home:    {config.llm.providers.opencode.agent_home}")
+    if config.speech.asr_provider == "sense_voice":
+        models_dir = Path(config.speech.models_dir).expanduser()
+        required_files = ["silero_vad.onnx", "tokens.txt", "encoder.onnx", "decoder.onnx", "joiner.onnx"]
+        missing_models = [f for f in required_files if not (models_dir / f).is_file()]
+        if config.speech.asr_model == "paraformer":
+            try:
+                find_paraformer_dir(models_dir)
+            except FileNotFoundError:
+                missing_models.append("paraformer/model.int8.onnx")
+        elif config.speech.asr_model == "sense_voice":
+            try:
+                find_sense_voice_dir(models_dir)
+            except FileNotFoundError:
+                missing_models.append("sense-voice/model.int8.onnx")
+        elif config.speech.asr_model == "doubao_flash":
+            db_ok = bool(read_env_secret("DOUBAO_ASR_APP_KEY") and read_env_secret("DOUBAO_ASR_ACCESS_KEY"))
+            print(f"  [{'OK' if db_ok else 'MISSING'}] Doubao Flash ASR env (DOUBAO_ASR_APP_KEY / DOUBAO_ASR_ACCESS_KEY)")
+        elif config.speech.asr_model == "openai_whisper":
+            w_env = config.speech.whisper_api_key_env or "OPENAI_API_KEY"
+            w_ok = bool(read_env_secret(w_env))
+            print(f"  [{'OK' if w_ok else 'MISSING'}] Whisper ASR env ({w_env})")
+        if missing_models:
+            print(f"  [MISSING] Speech models in {models_dir}: {', '.join(missing_models)}")
+        else:
+            en_dir = find_english_kws_dir(models_dir) if config.speech.en_kws_enabled else None
+            en_status = f"enabled ({en_dir.name})" if en_dir else "not installed (ASR fallback)"
+            print(f"  [OK] Speech models ready in {models_dir} (en_kws={en_status}, lang={config.speech.asr_language})")
+    else:
+        print("  [OK] Speech models: not required for asr_provider=xiaoai_asr")
+
+    print(f"  Active model:     {_resolve_active_model(config)}")
+    if active_provider == "opencode":
+        print(f"  OpenCode V2 URL:  {config.llm.providers.opencode.server_url}")
+        print(f"  OpenCode home:    {config.llm.providers.opencode.agent_home}")
     print(f"  Unified MCP HTTP: http://127.0.0.1:{config.tools.mcp_http_port}/mcp")
 
     client_id_present = bool(read_env_secret(config.tools.outlook.client_id_env))
@@ -245,7 +304,9 @@ def cmd_doctor(config: AppConfig) -> int:
         f"(client_id={'set' if client_id_present else 'unset'}, cache={cache_path} [{cache_status}])"
     )
 
-    xhs_bin = Path("~/.local/bin/xiaohongshu-mcp-darwin-arm64").expanduser().is_file()
+    xhs_bin = shutil.which("xiaohongshu-mcp") is not None or Path(
+        "~/.local/bin/xiaohongshu-mcp-darwin-arm64"
+    ).expanduser().is_file()
     if config.tools.xiaohongshu.enabled:
         ok, detail = _check_http_reachable(config.tools.xiaohongshu.mcp_url)
         tag = "OK" if ok else "UNREACHABLE"
@@ -274,7 +335,7 @@ def _resolve_active_model(config: AppConfig, provider_override: str | None = Non
         return config.llm.providers.opencode.model
     if chosen == "codex":
         return config.llm.providers.codex.model or "codex"
-    if chosen == "codex_api":
+    if chosen in {"codex_api", "openai_compatible"}:
         return config.llm.providers.codex_api.model
     if chosen == "gemini_api":
         return config.llm.providers.gemini_api.model
@@ -282,6 +343,8 @@ def _resolve_active_model(config: AppConfig, provider_override: str | None = Non
 
 
 async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
+    if getattr(args, "provider", None):
+        config.llm.default_provider = args.provider
     active_config = config
     confirmations = ConfirmationStore()
     memory_store = MemoryStore(active_config.memory.file_path)
@@ -308,7 +371,15 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             bridge._speaker_config.edge_rate = rate
 
     def on_model_changed(new_model: str) -> None:
-        active_config.llm.providers.opencode.model = new_model
+        prov = active_config.llm.default_provider
+        if prov == "opencode":
+            active_config.llm.providers.opencode.model = new_model
+        elif prov in {"codex_api", "openai_compatible"}:
+            active_config.llm.providers.codex_api.model = new_model
+        elif prov == "gemini_api":
+            active_config.llm.providers.gemini_api.model = new_model
+        elif prov == "codex":
+            active_config.llm.providers.codex.model = new_model
         if router is not None:
             router.reload_runtime_config(active_config)
             router.opencode_session_id = None
@@ -385,6 +456,13 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         on_wakewords_changed=on_wakewords_changed,
         on_reminders_config_changed=on_reminders_config_changed,
         on_capabilities_changed=on_capabilities_changed,
+        get_speaker_status=lambda: gateway.get_runtime_status() if gateway is not None else {
+            "speaker_connected": False,
+            "active_connections": 0,
+            "relay_connections": 0,
+            "lan_connections": 0,
+            "pipeline_awake": False,
+        },
         config_path=effective_config_path,
         include_local_tools=True,
     )
@@ -408,6 +486,17 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
     if effective_provider == "opencode":
         await router.start(mcp_url=mcp_url, mcp_auth_token=mcp_token)
 
+    async def _build_in_process_mcp_tools() -> list[ToolDefinition]:
+        raw_tools = await mcp_server.get_tool_definitions_for_llm()
+        return [
+            ToolDefinition(
+                name=str(t["name"]),
+                description=str(t.get("description") or ""),
+                parameters=t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {"type": "object", "properties": {}},
+            )
+            for t in raw_tools
+        ]
+
     tools, clients = build_tool_registry(active_config, confirmation_store=confirmations)
     outlook_client = clients.get("outlook") or OutlookClient(active_config.tools.outlook)
 
@@ -422,6 +511,8 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
             new_cfg.speech.asr_provider = args.asr
         if getattr(args, "asr_model", None):
             new_cfg.speech.asr_model = args.asr_model
+        if getattr(args, "provider", None):
+            new_cfg.llm.default_provider = args.provider
         active_config = new_cfg
         mcp_server.reload_config(new_cfg)
         await asyncio.to_thread(router.reload_runtime_config, new_cfg)
@@ -509,16 +600,29 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
 
         turn_id = mcp_server.begin_voice_turn(spk)
         try:
+            chosen_prov = args.provider or active_config.llm.default_provider
+            llm_tools = (
+                await _build_in_process_mcp_tools()
+                if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+                else tools
+            )
+            llm_executor = (
+                mcp_server.execute_tool_in_process
+                if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+                else (
+                    lambda name, t_args: execute_tool(
+                        clients,
+                        name,
+                        t_args,
+                        require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
+                    )
+                )
+            )
             reply = await router.ask(
                 query,
                 provider=args.provider,
-                tools=tools,
-                executor=lambda name, t_args: execute_tool(
-                    clients,
-                    name,
-                    t_args,
-                    require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
-                ),
+                tools=llm_tools,
+                executor=llm_executor,
                 speaker_context=spk.format_context_prefix() if spk is not None else None,
             )
         finally:
@@ -556,16 +660,29 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         completed = False
         turn_id = mcp_server.begin_voice_turn(spk)
         try:
+            chosen_prov = args.provider or active_config.llm.default_provider
+            llm_tools = (
+                await _build_in_process_mcp_tools()
+                if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+                else tools
+            )
+            llm_executor = (
+                mcp_server.execute_tool_in_process
+                if chosen_prov in {"codex_api", "openai_compatible", "gemini_api"}
+                else (
+                    lambda name, t_args: execute_tool(
+                        clients,
+                        name,
+                        t_args,
+                        require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
+                    )
+                )
+            )
             async for sentence in router.stream_ask(
                 query,
                 provider=args.provider,
-                tools=tools,
-                executor=lambda name, t_args: execute_tool(
-                    clients,
-                    name,
-                    t_args,
-                    require_host_voiceprint=active_config.tools.require_host_voiceprint_for_sensitive_tools,
-                ),
+                tools=llm_tools,
+                executor=llm_executor,
                 speaker_context=spk.format_context_prefix() if spk is not None else None,
             ):
                 chunks.append(sentence)
@@ -586,9 +703,10 @@ async def _serve_async(config: AppConfig, args: argparse.Namespace) -> None:
         if gateway is None or not gateway.has_idle_speaker():
             return False
         if entry.kind == "morning_briefing":
+            default_city = active_config.persona.default_city.strip() or "北京"
             briefing_prompt = (
                 f"现在到了每日早报时间，主题是“{entry.message}”。"
-                "请先查一下用户常住城市（若记忆里没有则查北京）今天的天气，"
+                f"请先查一下用户常住城市（若记忆里没有则查{default_city}）今天的天气，"
                 "再列出今天已设置的待办提醒；如果配置了 Outlook 则顺便简要汇报未读重要邮件。"
                 "整理成一段不超过150字的口语早报。"
             )
@@ -655,6 +773,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="xsa", description="Xiao Speaker Assistant CLI")
     parser.add_argument("--config", help="Path to config.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
+    init_p = sub.add_parser("init", help="Generate starter config.yaml from config.example.yaml")
+    init_p.add_argument("--force", action="store_true", help="Overwrite existing config.yaml")
     sub.add_parser("doctor", help="Check config and local CLI backends")
     sub.add_parser("outlook-login", help="Sign in to Outlook using device code + private file cache")
     sub.add_parser("download-models", help="Download VAD + KWS + SenseVoice models for `Hi Nomi` wakeup")
@@ -663,9 +783,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Run stdio JSON-RPC 2.0 MCP server for Outlook, Codex, Xiaohongshu, Browser, and Mac tools",
     )
 
-    ask_p = sub.add_parser("ask", help="Test a single question via opencode or codex CLI")
+    ask_p = sub.add_parser("ask", help="Test a single question via configured LLM provider")
     ask_p.add_argument("prompt", help="Question text")
-    ask_p.add_argument("--provider", choices=["opencode", "codex", "codex_api", "gemini_api"])
+    ask_p.add_argument("--provider", choices=["opencode", "codex", "codex_api", "openai_compatible", "gemini_api"])
 
     serve_p = sub.add_parser("serve", help="Run the speaker WebSocket gateway")
     serve_p.add_argument("--host", help="Override WebSocket listen host")
@@ -691,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve_p.add_argument(
         "--provider",
-        choices=["opencode", "codex", "codex_api", "gemini_api"],
+        choices=["opencode", "codex", "codex_api", "openai_compatible", "gemini_api"],
         help="Override default LLM provider",
     )
 
@@ -703,7 +823,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge_p.add_argument("--port", type=int, default=4395)
     bridge_p.add_argument(
         "--provider",
-        choices=["opencode", "codex", "codex_api", "gemini_api"],
+        choices=["opencode", "codex", "codex_api", "openai_compatible", "gemini_api"],
         help="Override default LLM provider",
     )
     bridge_p.add_argument(
@@ -714,6 +834,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.command == "init":
+        return cmd_init(args.config, force=args.force)
     config = load_config(args.config)
 
     if args.command == "doctor":

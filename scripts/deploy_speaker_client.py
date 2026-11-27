@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tunnel-host",
-        help="Configure encrypted Dropbear SSH tunnel to Azure VM host (e.g. relay.mxhan.com).",
+        help="Configure encrypted Dropbear SSH tunnel to relay VM host (e.g. relay.example.com).",
     )
     parser.add_argument(
         "--tunnel-port",
